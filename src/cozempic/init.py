@@ -206,11 +206,11 @@ def _save_settings(path: Path, settings: dict) -> None:
                 pass
             # Restore original file mode BEFORE replace so the target
             # inherits the right permissions atomically.
-            if orig_mode is not None:
+            if orig_mode is not None and hasattr(_os, "fchmod"):
                 try:
                     _os.fchmod(f.fileno(), orig_mode)
                 except OSError:
-                    pass  # fchmod unsupported (rare)
+                    pass
         _os.replace(tmp_path, path)
     except Exception:
         try:
