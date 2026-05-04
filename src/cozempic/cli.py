@@ -424,15 +424,37 @@ def cmd_reload(args):
         print("Use 'cozempic list' to find the session ID.", file=sys.stderr)
         sys.exit(1)
 
-    # Prefer sidecar cwd (exact path, handles hyphens and special chars).
-    # Fall back to slug reversal for sessions predating the sidecar.
-    sidecar_cwd = get_session_cwd(sess["session_id"])
-    if sidecar_cwd and os.path.isdir(sidecar_cwd):
-        cwd = sidecar_cwd
+    # Resolve the project root directory for the resume cd target.
+    # The critical invariant: `claude --resume <id>` must be run from the
+    # SAME CWD where the session was originally created, because Claude Code
+    # resolves sessions by CWD → project-slug mapping. cd'ing into a
+    # subdirectory produces a different slug → "No conversation found."
+    #
+    # Priority:
+    #   1. Sidecar CWD (exact path, recorded by the guard daemon — most
+    #      reliable when available)
+    #   2. Slug reversal from the session's project directory name. The
+    #      JSONL lives at ~/.claude/projects/<slug>/<uuid>.jsonl — the slug
+    #      IS the authoritative project identifier. Reversing it gives the
+    #      original CWD. This MUST take priority over os.getcwd() because
+    #      the user (or Claude) may have cd'd into a subdirectory during
+    #      the session. (Known limitation: hyphens in the original path are
+    #      ambiguous with separator hyphens in the slug.)
+    #   3. os.getcwd() as last resort — only when sidecar is empty AND
+    #      slug reversal produces a non-existent directory (hyphen ambiguity).
+    # First try: slug reversal from the session's actual project directory.
+    # This is the most reliable source because the JSONL path directly
+    # encodes where the session was created. It only fails when the original
+    # path contained hyphens (ambiguous with the slug separator).
+    slug_cwd = project_slug_to_path(sess["project"])
+    if os.path.isdir(slug_cwd):
+        cwd = slug_cwd
     else:
-        legacy = project_slug_to_path(sess["project"])
-        if os.path.isdir(legacy):
-            cwd = legacy
+        # Slug reversal failed (hyphens in path) — try sidecar
+        sidecar_cwd = get_session_cwd(sess["session_id"])
+        if sidecar_cwd and os.path.isdir(sidecar_cwd):
+            cwd = sidecar_cwd
+        # else: cwd stays as os.getcwd() — last resort
 
     rx_name = args.rx or "standard"
     if rx_name not in PRESCRIPTIONS:
