@@ -487,13 +487,12 @@ def admit_rule(rule: DigestRule, store: DigestStore) -> str:
     rule.id = store.next_id()
     store.strategy_rules.append(rule)
 
-    # Cap enforcement
+    # Cap enforcement — loop until under cap to handle burst admissions.
     active = store.active_rules()
-    if len(active) > MAX_ACTIVE_RULES:
-        # Demote lowest-scored active rule
-        scored = [(score_rule(r), r) for r in active]
-        scored.sort(key=lambda x: x[0])
+    while len(active) > MAX_ACTIVE_RULES:
+        scored = sorted(((score_rule(r), r) for r in active), key=lambda x: x[0])
         scored[0][1].status = "pending"
+        active = store.active_rules()
 
     return "added"
 
@@ -517,6 +516,13 @@ def load_digest_store(project_dir: str = "") -> DigestStore:
         )
         for rd in data.get("strategy_rules", []):
             store.strategy_rules.append(DigestRule(**rd))
+        # Retroactive cap sweep — a pre-polluted store must be trimmed on load,
+        # otherwise the per-admit cap never converges when no new rules arrive.
+        active = store.active_rules()
+        while len(active) > MAX_ACTIVE_RULES:
+            scored = sorted(((score_rule(r), r) for r in active), key=lambda x: x[0])
+            scored[0][1].status = "pending"
+            active = store.active_rules()
         return store
     except (json.JSONDecodeError, TypeError, KeyError):
         return DigestStore(project=project_dir)
