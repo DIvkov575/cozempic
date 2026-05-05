@@ -1153,5 +1153,405 @@ class TestMemdirHonorsConfigDir(unittest.TestCase):
                 "under CLAUDE_CONFIG_DIR, ~/.claude must NOT receive a cross-profile write")
 
 
+# ===========================================================================
+# RED TESTS — Phase 2b round 2 — Phase 2d adversarial findings (2026-05-05)
+# ===========================================================================
+#
+# Post-fix adversarial review (team `cozempic-digest-fix`, devils-advocate)
+# surfaced one CRITICAL and one HIGH that the Phase 2b/2c cycle did NOT
+# close. These RED tests must fail against commit range
+# `86f6c4d..HEAD (7a0dc27)` and flip GREEN only after Phase 2c-r2 lands the
+# fixes.
+#
+# Source: .claude/worktrees/fix-digest-noise-filter/ADVERSARIAL_REPORT.md
+#
+# Mapping:
+#   A9/A10/A14 (CRITICAL) → TestLoadNoiseEvidencePurge
+#   A6         (HIGH)     → TestAtomicSave
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# A9/A10/A14 — load_digest_store must purge noise-evidence rules, not merely cap
+# ---------------------------------------------------------------------------
+
+class TestLoadNoiseEvidencePurge(unittest.TestCase):
+    """The retroactive sweep added in Phase 2c trims active count to
+    MAX_ACTIVE_RULES but does NOT clean pollution. On the real poisoned
+    backup, 17 of the 20 survivors are still `Do not <teammate-message ...`
+    rules because all polluted rules share identical scoring inputs and
+    the stable sort simply keeps the latest-inserted.
+
+    Expected behavior (post Phase 2c-r2): on load, any rule whose
+    `evidence` field is flagged by `_is_system_noise` MUST be dropped (or
+    forcibly demoted to pending and excluded from active_rules) BEFORE
+    the cap sweep runs — so genuine corrections fill the 20-active budget.
+    """
+
+    def _build_polluted_rule(self, rid: int, evidence: str, rule: str,
+                             status: str = "active") -> dict:
+        return {
+            "id": f"R{rid:03d}",
+            "rule": rule,
+            "priority": "hard",
+            "scope": "general",
+            "trigger": "",
+            "decision_step": "",
+            "before": "",
+            "after": "",
+            "signal": "EXPLICIT_CORRECTION",
+            "evidence": evidence,
+            "importance": 1,
+            "source_reliability": 1.0,
+            "type_prior": 0.8,
+            "status": status,
+            "occurrence_count": 1,
+            "first_seen": "2026-05-01T00:00:00+00:00",
+            "last_reinforced": "2026-05-01T00:00:00+00:00",
+            "last_injection": None,
+        }
+
+    def _write_store(self, tmp_path: Path, rules: list[dict]) -> Path:
+        digest_file = tmp_path / "behavioral-digest.json"
+        data = {
+            "version": "1",
+            "project": "/test",
+            "updated": "2026-05-05T00:00:00+00:00",
+            "session_id": "sess-x",
+            "strategy_rules": rules,
+            "failure_patterns": [],
+        }
+        digest_file.write_text(json.dumps(data), encoding="utf-8")
+        return digest_file
+
+    def test_load_drops_noise_evidence_tag_prefixed(self):
+        """Pre-populated store: 30 tag-prefixed pollution + 20 clean rules.
+        After load, the active list must be EXCLUSIVELY clean rules."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            noise_evidences = [
+                "<teammate-message teammate_id=\"x\" summary=\"y\">anything</teammate-message>",
+                "<local-command-caveat>The user ran /compact</local-command-caveat>",
+                "<task-notification>task complete</task-notification>",
+                "<function_calls><invoke name=\"Read\"></invoke></function_calls>",
+                "<system-reminder>do something</system-reminder>",
+                "<command-name>/init</command-name>",
+            ]
+            rules = []
+            # 30 polluted rules — cycle through noise evidence types
+            for i in range(30):
+                ev = noise_evidences[i % len(noise_evidences)]
+                rules.append(self._build_polluted_rule(
+                    i + 1, evidence=ev, rule=f"Do not {ev[:60]}"))
+            # 20 clean rules
+            for j in range(20):
+                rules.append(self._build_polluted_rule(
+                    100 + j,
+                    evidence=f"don't push to main in project {j}",
+                    rule=f"Do not push to main in project {j}"))
+            digest_file = self._write_store(tmp_path, rules)
+
+            with patch("cozempic.digest.DIGEST_FILE", digest_file):
+                store = load_digest_store("/test")
+                active = store.active_rules()
+                # All surviving active rules must have CLEAN evidence
+                for r in active:
+                    self.assertFalse(
+                        r.evidence.lstrip().startswith("<") or
+                        r.evidence.lstrip().startswith("/"),
+                        f"noise-evidence rule survived as active: "
+                        f"id={r.id} evidence={r.evidence[:80]!r}")
+                # At least some clean rules survived
+                self.assertGreater(
+                    len(active), 0,
+                    "expected some clean rules to remain active after purge")
+
+    def test_load_demotes_all_four_noise_tag_shapes(self):
+        """Verify each of the documented noise-evidence shapes is purged."""
+        shapes = {
+            "local-command-caveat": "<local-command-caveat>x</local-command-caveat>",
+            "teammate-message":      "<teammate-message teammate_id=\"a\">y</teammate-message>",
+            "task-notification":     "<task-notification>z</task-notification>",
+            "function_calls":        "<function_calls><invoke name=\"R\"></invoke></function_calls>",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            rules = []
+            for i, (name, ev) in enumerate(shapes.items()):
+                rules.append(self._build_polluted_rule(
+                    i + 1, evidence=ev, rule=f"Do not {name} thing"))
+            # One clean rule so the store isn't all noise
+            rules.append(self._build_polluted_rule(
+                99, evidence="never push to main", rule="Do not ever push to main"))
+            digest_file = self._write_store(tmp_path, rules)
+
+            with patch("cozempic.digest.DIGEST_FILE", digest_file):
+                store = load_digest_store("/test")
+                active_ids = {r.id for r in store.active_rules()}
+                # All 4 noise-tagged rules must be out of active
+                for i, name in enumerate(shapes.keys()):
+                    rid = f"R{i + 1:03d}"
+                    self.assertNotIn(
+                        rid, active_ids,
+                        f"{name}-tagged noise rule ({rid}) must not remain active")
+
+    def test_load_572_pollution_replay_leaves_no_noise_active(self):
+        """Synthetic replay of the real poisoned backup shape (572 rules, mostly
+        tag-prefixed noise). Post-load active list must contain NO noise-
+        evidence rules."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            rules = []
+            # 552 polluted rules: various tag-prefixed evidences
+            pollution_template = [
+                "<teammate-message teammate_id=\"x{i}\" color=\"orange\">do y{i}</teammate-message>",
+                "<local-command-caveat>The user ran /cmd-{i}</local-command-caveat>",
+                "<task-notification>task {i} complete</task-notification>",
+            ]
+            for i in range(552):
+                ev = pollution_template[i % 3].format(i=i)
+                rules.append(self._build_polluted_rule(
+                    i + 1, evidence=ev, rule=f"Do not {ev[:60]}"))
+            # 20 clean rules at the end — these should be the active survivors
+            for j in range(20):
+                rules.append(self._build_polluted_rule(
+                    600 + j,
+                    evidence=f"never commit without running tests, rule {j}",
+                    rule=f"Do not ever commit without running tests rule {j}",
+                ))
+            digest_file = self._write_store(tmp_path, rules)
+
+            with patch("cozempic.digest.DIGEST_FILE", digest_file):
+                store = load_digest_store("/test")
+                active = store.active_rules()
+                # Cap must hold
+                self.assertLessEqual(len(active), MAX_ACTIVE_RULES)
+                # NONE of the survivors may have tag-prefixed evidence
+                polluted_survivors = [
+                    r for r in active
+                    if r.evidence.lstrip().startswith("<")
+                    or r.evidence.lstrip().startswith("/")
+                ]
+                self.assertEqual(
+                    polluted_survivors, [],
+                    f"expected zero tag-prefixed survivors, got "
+                    f"{len(polluted_survivors)}: "
+                    f"{[(r.id, r.evidence[:60]) for r in polluted_survivors[:3]]}")
+
+    def test_load_preserves_clean_rules_when_under_cap(self):
+        """Sanity: a mixed store with 10 clean + 10 noise rules, all active.
+        Post-load: clean rules remain active (up to cap), noise rules purged."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            rules = []
+            # 10 noise-evidence rules
+            for i in range(10):
+                rules.append(self._build_polluted_rule(
+                    i + 1,
+                    evidence=f"<teammate-message teammate_id=\"t{i}\">msg</teammate-message>",
+                    rule=f"Do not <teammate-message thing {i}"))
+            # 10 clean rules
+            for j in range(10):
+                rules.append(self._build_polluted_rule(
+                    100 + j,
+                    evidence=f"don't add Co-Authored-By to commit {j}",
+                    rule=f"Do not add Co-Authored-By to commit {j}"))
+            digest_file = self._write_store(tmp_path, rules)
+
+            with patch("cozempic.digest.DIGEST_FILE", digest_file):
+                store = load_digest_store("/test")
+                active = store.active_rules()
+                # All 10 clean rules should survive as active
+                clean_active = [r for r in active
+                                if not r.evidence.lstrip().startswith("<")]
+                self.assertEqual(
+                    len(clean_active), 10,
+                    f"all 10 clean rules must remain active; got "
+                    f"{len(clean_active)}")
+                # Zero noise rules survive as active
+                noise_active = [r for r in active
+                                if r.evidence.lstrip().startswith("<")]
+                self.assertEqual(
+                    noise_active, [],
+                    f"zero noise-evidence rules must remain active; got "
+                    f"{len(noise_active)}")
+
+
+# ---------------------------------------------------------------------------
+# A6 — save_digest_store must be atomic (tmp + os.replace)
+# ---------------------------------------------------------------------------
+
+class TestAtomicSave(unittest.TestCase):
+    """`save_digest_store` currently calls `DIGEST_FILE.write_text(...)`
+    directly — a non-atomic sequence of `open(w) → write → close` that
+    leaves a partial (or empty) file if the process is killed mid-write.
+    Two CC hooks firing near-simultaneously (PreCompact + Stop) can also
+    interleave and silently clobber one another's save (lost-update).
+
+    Expected behavior: use tempfile + `os.replace` so the target file is
+    either fully-old or fully-new — never partially written — AND one
+    process's save cannot clobber another's concurrent in-flight save.
+    """
+
+    def test_save_atomic_under_mid_write_crash(self):
+        """Simulate a crash: patch `Path.write_text` to raise on the first
+        call. The pre-existing digest file must survive unchanged."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            digest_file = tmp_path / "behavioral-digest.json"
+            digest_md = tmp_path / "behavioral-digest.md"
+
+            # Pre-populate a valid store on disk
+            baseline = {
+                "version": "1",
+                "project": "/test",
+                "updated": "2026-05-01T00:00:00+00:00",
+                "session_id": "baseline",
+                "strategy_rules": [{
+                    "id": "R001", "rule": "Do not touch me",
+                    "priority": "hard", "scope": "general",
+                    "trigger": "", "decision_step": "",
+                    "before": "", "after": "",
+                    "signal": "EXPLICIT_CORRECTION",
+                    "evidence": "don't touch me",
+                    "importance": 1, "source_reliability": 1.0, "type_prior": 0.8,
+                    "status": "active", "occurrence_count": 5,
+                    "first_seen": "2026-05-01T00:00:00+00:00",
+                    "last_reinforced": "2026-05-01T00:00:00+00:00",
+                    "last_injection": None,
+                }],
+                "failure_patterns": [],
+            }
+            baseline_json = json.dumps(baseline, indent=2)
+            digest_file.write_text(baseline_json, encoding="utf-8")
+            original_mtime = digest_file.stat().st_mtime_ns
+            original_bytes = digest_file.read_bytes()
+
+            # Build a NEW store with different content and try to save it,
+            # injecting a crash mid-write.
+            new_store = DigestStore(project="/test")
+            new_store.strategy_rules.append(DigestRule(
+                id="R999", rule="Do not NEW RULE that must not land",
+                priority="hard", scope="general",
+                source_reliability=1.0, type_prior=0.8,
+                occurrence_count=1, status="active",
+                evidence="don't add this",
+            ))
+
+            real_write_text = Path.write_text
+
+            def exploding_write_text(self, data, *args, **kwargs):
+                # Simulate a real mid-write crash: open the target file in
+                # truncate mode (destroys the on-disk content), write a
+                # PARTIAL prefix, then raise. This is what happens when a
+                # process is killed between `open(mode="w")` and the final
+                # `close`.
+                #
+                # The ONLY defence against this is atomic-replace — writing
+                # to a `.tmp` sibling and then `os.replace`'ing it, so the
+                # target file either contains the old bytes or the new
+                # bytes, never a truncated partial.
+                target = str(self)
+                if target.endswith("behavioral-digest.json"):
+                    # Open-truncate with partial write, then crash
+                    with open(self, "w", encoding="utf-8") as f:
+                        f.write(data[:64])  # partial write
+                    raise IOError("simulated mid-write crash after partial write")
+                return real_write_text(self, data, *args, **kwargs)
+
+            with patch("cozempic.digest.DIGEST_DIR", tmp_path), \
+                 patch("cozempic.digest.DIGEST_FILE", digest_file), \
+                 patch("cozempic.digest.DIGEST_MD_FILE", digest_md), \
+                 patch.object(Path, "write_text", exploding_write_text):
+                # Save may raise — that's expected when the crash hits.
+                try:
+                    save_digest_store(new_store)
+                except (IOError, OSError):
+                    pass
+
+            # ORIGINAL file must be intact after the crash — atomic semantics.
+            self.assertTrue(digest_file.exists(),
+                            "digest file must still exist after crash")
+            self.assertEqual(
+                digest_file.read_bytes(), original_bytes,
+                "original digest file must be byte-for-byte unchanged after "
+                "a mid-write crash (atomic save via tmp+os.replace required)")
+
+    def test_concurrent_save_no_lost_update(self):
+        """Simulate two CC hooks (PreCompact + Stop) running concurrently:
+        each loads the store, mutates it, saves it. Without file locking
+        the second save CLOBBERS the first — the rule added by P1 is
+        silently lost because P2 loaded the pre-P1 state.
+
+        Expected behavior (post Phase 2c-r2): read-modify-write must be
+        protected by `fcntl.flock` (or equivalent) so P2's load blocks
+        until P1's save commits. Final disk state must contain BOTH rules.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            digest_file = tmp_path / "behavioral-digest.json"
+            digest_md = tmp_path / "behavioral-digest.md"
+
+            # Pre-existing empty-but-valid store on disk
+            initial = {
+                "version": "1", "project": "/test",
+                "updated": "2026-05-01T00:00:00+00:00",
+                "session_id": "initial",
+                "strategy_rules": [], "failure_patterns": [],
+            }
+            digest_file.write_text(json.dumps(initial), encoding="utf-8")
+
+            with patch("cozempic.digest.DIGEST_DIR", tmp_path), \
+                 patch("cozempic.digest.DIGEST_FILE", digest_file), \
+                 patch("cozempic.digest.DIGEST_MD_FILE", digest_md):
+                # Simulate the interleaving that causes lost updates:
+                #   P1.load → P2.load (BEFORE P1.save) → P1.mutate+save → P2.mutate+save
+                # Without locking, P2 overwrites P1's save with the pre-P1
+                # state plus P2's mutation — P1's rule is lost.
+                p1_store = load_digest_store("/test")
+                p2_store = load_digest_store("/test")  # P2 loads BEFORE P1 saves
+
+                p1_store.strategy_rules.append(DigestRule(
+                    id="R001", rule="Do not P1-RULE",
+                    priority="hard", scope="general",
+                    source_reliability=1.0, type_prior=0.8,
+                    occurrence_count=1, status="active",
+                    evidence="don't P1", first_seen="2026-05-05",
+                    last_reinforced="2026-05-05",
+                ))
+                save_digest_store(p1_store)  # P1 commits
+
+                # P2 mutates its (stale) copy and saves → should DETECT the
+                # intervening P1 save and either retry or merge. With
+                # fcntl.flock + stat(mtime) re-check, P2's save must either
+                # (a) fail and caller retries, or (b) re-load and include
+                # P1's rule before saving. Without locking, P2 silently
+                # clobbers P1's addition.
+                p2_store.strategy_rules.append(DigestRule(
+                    id="R001", rule="Do not P2-RULE",
+                    priority="hard", scope="general",
+                    source_reliability=1.0, type_prior=0.8,
+                    occurrence_count=1, status="active",
+                    evidence="don't P2", first_seen="2026-05-05",
+                    last_reinforced="2026-05-05",
+                ))
+                try:
+                    save_digest_store(p2_store)
+                except Exception:
+                    # A properly-locked save may raise to force caller retry;
+                    # that's an acceptable post-fix behavior.
+                    pass
+
+                # Final state on disk must contain BOTH rules (or the save
+                # must have failed loudly). A silent lost-update is the bug.
+                final = json.loads(digest_file.read_text(encoding="utf-8"))
+                rule_texts = [r["rule"] for r in final["strategy_rules"]]
+                self.assertIn(
+                    "Do not P1-RULE", rule_texts,
+                    f"P1's rule silently lost under concurrent save — "
+                    f"final rules: {rule_texts}. Atomic save + file lock "
+                    f"(fcntl.flock) required to prevent lost-update.")
+
+
 if __name__ == "__main__":
     unittest.main()
