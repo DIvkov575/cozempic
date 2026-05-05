@@ -599,7 +599,9 @@ def load_digest_store(project_dir: str = "") -> DigestStore:
             scored[0][1].status = "pending"
             active = store.active_rules()
         return store
-    except (json.JSONDecodeError, TypeError, KeyError):
+    except (json.JSONDecodeError, TypeError, KeyError, OSError):
+        # OSError covers PermissionError, IsADirectoryError, disk IO failures.
+        # Crashing a PreCompact/Stop hook on a bad digest file is never acceptable.
         return DigestStore(project=project_dir)
 
 
