@@ -116,6 +116,48 @@ _EXPLICIT_PATTERNS = [
     re.compile(r"\bundo\s+(that|this|the)\b", re.IGNORECASE),
 ]
 
+# Synthetic-noise markers — user turns containing any of these are Claude Code
+# framework emissions (hooks, slash commands, tool blocks), not real corrections.
+_SYSTEM_NOISE_MARKERS = (
+    "<local-command-",
+    "<command-name>",
+    "<command-message>",
+    "<command-args>",
+    "<teammate-message",
+    "<system-reminder",
+    "<function_calls>",
+    "<function_results>",
+    "<bash-stdout>",
+    "<bash-stderr>",
+    "<user-prompt-submit-hook",
+    "Please analyze this codebase",  # /init prompt
+)
+
+
+def _is_system_noise(text: str) -> bool:
+    """Return True if `text` is a Claude Code synthetic/framework turn.
+
+    Rejects: empty text, tag-wrapped blocks, slash-command lines, and known
+    framework prompt markers. Used to gate `extract_corrections` upstream of
+    `classify_turn` so synthetic turns never become behavioral rules.
+    """
+    if not text:
+        return True
+    stripped = text.strip()
+    if not stripped:
+        return True
+    # Tag-like: any line starting with '<' is either synthetic or XML.
+    if stripped.startswith("<"):
+        return True
+    # Slash command: '/' + lowercase letter (distinguish from file paths like /Users)
+    if len(stripped) >= 2 and stripped[0] == "/" and stripped[1].islower():
+        return True
+    # Known framework markers (substring match).
+    for marker in _SYSTEM_NOISE_MARKERS:
+        if marker in stripped:
+            return True
+    return False
+
 _IMPLICIT_PATTERNS = [
     re.compile(r"\bactually[,\s]", re.IGNORECASE),
     re.compile(r"\binstead[,\s]", re.IGNORECASE),
@@ -296,6 +338,11 @@ def extract_corrections(
 
         user_text = _get_user_text(msg)
         if not user_text:
+            continue
+
+        # Skip Claude Code synthetic/framework turns — they are not corrections.
+        if _is_system_noise(user_text):
+            prev_assistant_text = ""
             continue
 
         turn_class = classify_turn(user_text, prev_assistant_text)
