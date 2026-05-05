@@ -647,9 +647,10 @@ def build_injection_text(store: DigestStore) -> str | None:
         "",
     ]
 
-    if hard:
+    hard_rules = [r for r in rules if r.priority == "hard"]
+    if hard_rules:
         lines.append("PROHIBITIONS:")
-        for r in hard:
+        for r in hard_rules:
             lines.append(_format_rule_4field(r))
         lines.append("")
 
