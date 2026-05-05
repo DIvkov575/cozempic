@@ -132,6 +132,8 @@ _SYSTEM_NOISE_MARKERS = (
     "<bash-stderr>",
     "<user-prompt-submit-hook",
     "Please analyze this codebase",  # /init prompt
+    "[Cozempic Guard:",  # cozempic self-restoration meta banner
+    "This session is being continued from a previous conversation",  # CC compaction-resume banner
 )
 
 
@@ -601,14 +603,20 @@ def load_digest_store(project_dir: str = "") -> DigestStore:
         )
         for rd in data.get("strategy_rules", []):
             store.strategy_rules.append(DigestRule(**rd))
-        # Evidence-noise purge — demote any active rule whose stored evidence
-        # or rule text is CC synthetic noise. Pre-polluted stores (from before
-        # the BUG-3 fix) have identical scoring inputs on every polluted rule,
-        # so stable-sort keeps the most-recent 20 pollution entries under the
-        # cap sweep alone. Purging by noise BEFORE the cap sweep lets genuine
-        # clean rules (if any) survive.
+        # Auto-migration for stores written before the hardening — demote any
+        # active rule whose stored evidence/rule text would NOT pass the current
+        # admission gate. This covers:
+        #   (a) CC synthetic noise (tags, slash commands, framework markers)
+        #   (b) Structural content that _to_prohibition rejects (markdown-lead,
+        #       oversize > 200 chars, multi-line, code fence)
+        # Composing the two existing validators gives users a zero-action upgrade:
+        # their next session loads the fix, the purge demotes pre-hardening noise,
+        # and only rules that pass the current contract remain active.
         for rule in store.strategy_rules:
-            if rule.status == "active" and _is_system_noise(rule.evidence or rule.rule):
+            if rule.status != "active":
+                continue
+            source = rule.evidence or rule.rule
+            if _is_system_noise(source) or _to_prohibition(source) == "":
                 rule.status = "pending"
         # Retroactive cap sweep — a pre-polluted store must be trimmed on load,
         # otherwise the per-admit cap never converges when no new rules arrive.
