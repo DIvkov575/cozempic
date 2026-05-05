@@ -438,27 +438,65 @@ def _normalize_for_match(text: str) -> set[str]:
     return words - _STOP
 
 
+def _bigrams(text: str) -> set[str]:
+    """Return token-level bigrams of `text` — used to distinguish rules that
+    share vocabulary but differ in word order (e.g., "use Edit not Write" vs
+    "use Write not Edit")."""
+    tokens = text.lower().split()
+    return {f"{tokens[i]} {tokens[i + 1]}" for i in range(len(tokens) - 1)}
+
+
 def _find_duplicate(new_rule: DigestRule, store: DigestStore) -> DigestRule | None:
-    """Find a semantically similar existing rule (normalized word overlap for Phase 1)."""
+    """Find a semantically similar existing rule.
+
+    Merge rules only when BOTH:
+      - scope AND priority match (opposite-priority or cross-scope rules are
+        considered different instructions even if word sets overlap)
+      - word-set overlap > 0.75 AND bigram (word-order-sensitive) overlap > 0.5
+
+    Bigram overlap is required to distinguish order-inverted rules like
+    "use Edit not Write" vs "use Write not Edit" which share the same bag
+    of words but have opposite intent.
+    """
     new_words = _normalize_for_match(new_rule.rule)
     if not new_words:
         return None
-    # Also check evidence for stronger matching
+    new_bigrams = _bigrams(new_rule.rule)
     new_evidence_words = _normalize_for_match(new_rule.evidence) if new_rule.evidence else set()
+    new_evidence_bigrams = _bigrams(new_rule.evidence) if new_rule.evidence else set()
 
     for existing in store.strategy_rules:
+        # Scope AND priority must match before any text-overlap merge.
+        if existing.scope != new_rule.scope or existing.priority != new_rule.priority:
+            continue
         existing_words = _normalize_for_match(existing.rule)
         if not existing_words:
             continue
-        # Match against rule text
-        overlap = len(new_words & existing_words) / max(len(new_words), len(existing_words))
-        if overlap > 0.5:
-            return existing
-        # Also match new evidence against existing rule (user may phrase differently)
-        if new_evidence_words:
-            ev_overlap = len(new_evidence_words & existing_words) / max(len(new_evidence_words), len(existing_words))
-            if ev_overlap > 0.5:
+        existing_bigrams = _bigrams(existing.rule)
+
+        word_overlap = len(new_words & existing_words) / max(len(new_words), len(existing_words))
+        if word_overlap > 0.5 and existing_bigrams and new_bigrams:
+            bigram_overlap = (
+                len(new_bigrams & existing_bigrams)
+                / max(len(new_bigrams), len(existing_bigrams))
+            )
+            if bigram_overlap >= 0.5:
                 return existing
+
+        # Fall back to evidence-vs-rule match (user may phrase differently
+        # on the second occurrence).
+        if new_evidence_words:
+            ev_word_overlap = (
+                len(new_evidence_words & existing_words)
+                / max(len(new_evidence_words), len(existing_words))
+            )
+            if ev_word_overlap > 0.5 and existing_bigrams and new_evidence_bigrams:
+                ev_bigram_overlap = (
+                    len(new_evidence_bigrams & existing_bigrams)
+                    / max(len(new_evidence_bigrams), len(existing_bigrams))
+                )
+                if ev_bigram_overlap > 0.5:
+                    return existing
     return None
 
 
