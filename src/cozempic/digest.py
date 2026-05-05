@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -541,6 +542,32 @@ def admit_rule(rule: DigestRule, store: DigestStore) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _atomic_write_text(target: Path, data: str, encoding: str = "utf-8") -> None:
+    """Write `data` to `target` atomically.
+
+    Writes to a hidden sibling (`.tmp.<name>`) whose path STILL ENDS with
+    the target's filename, then `os.replace`s it over `target`. Under a
+    mid-write crash the target is either fully-old or fully-new — never
+    partially truncated, because `os.replace` is atomic on POSIX and never
+    runs if the preceding temp write raised.
+
+    The `.tmp.<name>` prefix (rather than `<name>.tmp` suffix) preserves the
+    target filename as the temp path's suffix, so filesystem hooks / tests
+    that key on the target's filename also cover the temp write — keeping
+    the crash-safety contract verifiable.
+    """
+    tmp_path = target.with_name(f".tmp.{target.name}")
+    try:
+        tmp_path.write_text(data, encoding=encoding)
+        os.replace(tmp_path, target)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+
 def load_digest_store(project_dir: str = "") -> DigestStore:
     """Load the digest store from disk."""
     if not DIGEST_FILE.exists():
@@ -577,8 +604,28 @@ def load_digest_store(project_dir: str = "") -> DigestStore:
 
 
 def save_digest_store(store: DigestStore) -> None:
-    """Save the digest store to disk (JSON + human-readable markdown mirror)."""
+    """Save the digest store to disk (JSON + human-readable markdown mirror).
+
+    Atomic + lost-update-safe: writes via `_atomic_write_text` (tmp+os.replace)
+    so a mid-write crash leaves the target untouched, and re-reads the current
+    on-disk state just before writing to merge in any rules added by a
+    concurrent hook process (prevents PreCompact + Stop lost-update races).
+    """
     DIGEST_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Concurrent-save merge: if another process appended rules to the file
+    # between our load and this save, pull those rules in so they survive.
+    if DIGEST_FILE.exists():
+        try:
+            on_disk = json.loads(DIGEST_FILE.read_text(encoding="utf-8"))
+            known_rule_texts = {r.rule for r in store.strategy_rules}
+            for rd in on_disk.get("strategy_rules", []):
+                if rd.get("rule") not in known_rule_texts:
+                    store.strategy_rules.append(DigestRule(**rd))
+        except (json.JSONDecodeError, TypeError, KeyError, OSError):
+            # Corrupt or unreadable — skip merge, just overwrite with our state.
+            pass
+
     store.updated = datetime.now(timezone.utc).isoformat()
 
     data = {
@@ -589,7 +636,7 @@ def save_digest_store(store: DigestStore) -> None:
         "strategy_rules": [asdict(r) for r in store.strategy_rules],
         "failure_patterns": [],  # Reserved for future use
     }
-    DIGEST_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    _atomic_write_text(DIGEST_FILE, json.dumps(data, indent=2))
 
     # Write human-readable markdown mirror
     _write_digest_md(store)
@@ -626,7 +673,7 @@ def _write_digest_md(store: DigestStore) -> None:
             lines.append(f"- **[{r.id}|{r.scope}]** {r.rule} (seen {r.occurrence_count}x)")
         lines.append("")
 
-    DIGEST_MD_FILE.write_text("\n".join(lines), encoding="utf-8")
+    _atomic_write_text(DIGEST_MD_FILE, "\n".join(lines))
 
 
 def clear_digest_store() -> None:
@@ -802,7 +849,7 @@ type: feedback
 """
 
     digest_mem = mem_dir / "cozempic_digest.md"
-    digest_mem.write_text(content, encoding="utf-8")
+    _atomic_write_text(digest_mem, content)
 
     # Update MEMORY.md index if needed
     _update_memory_index(mem_dir)
