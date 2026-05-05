@@ -555,6 +555,15 @@ def load_digest_store(project_dir: str = "") -> DigestStore:
         )
         for rd in data.get("strategy_rules", []):
             store.strategy_rules.append(DigestRule(**rd))
+        # Evidence-noise purge — demote any active rule whose stored evidence
+        # or rule text is CC synthetic noise. Pre-polluted stores (from before
+        # the BUG-3 fix) have identical scoring inputs on every polluted rule,
+        # so stable-sort keeps the most-recent 20 pollution entries under the
+        # cap sweep alone. Purging by noise BEFORE the cap sweep lets genuine
+        # clean rules (if any) survive.
+        for rule in store.strategy_rules:
+            if rule.status == "active" and _is_system_noise(rule.evidence or rule.rule):
+                rule.status = "pending"
         # Retroactive cap sweep — a pre-polluted store must be trimmed on load,
         # otherwise the per-admit cap never converges when no new rules arrive.
         active = store.active_rules()
