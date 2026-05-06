@@ -1907,3 +1907,75 @@ class TestPurgePersistsToDisk(unittest.TestCase):
                 store2 = load_digest_store("/test")
                 active2 = [r for r in store2.strategy_rules if r.status == "active"]
                 self.assertEqual(len(active2), 1)
+
+
+# ---------------------------------------------------------------------------
+# BUG-11 — _infer_scope word-boundary
+# ---------------------------------------------------------------------------
+
+class TestInferScopeWordBoundary(unittest.TestCase):
+    """`_infer_scope` must match keywords as whole words, not substrings.
+
+    Substring match produces silent false-positives that break BUG-7's
+    dedup gate (which requires scope+priority match before text overlap).
+    "make it digital" matching "git" scope makes a GENERAL rule collide
+    with genuine git rules on dedup.
+    """
+
+    def test_digital_is_not_git(self):
+        """'digital' contains 'git' as substring but is not a git scope."""
+        from cozempic.digest import _infer_scope
+        self.assertEqual(_infer_scope("make it more digital"), "general")
+
+    def test_editorial_is_not_file_ops(self):
+        """'editorial' contains 'edit' as substring but is not a file-ops scope."""
+        from cozempic.digest import _infer_scope
+        self.assertEqual(_infer_scope("editorial review of the draft"), "general")
+
+    def test_testimony_is_not_testing(self):
+        """'testimony' contains 'test' as substring but is not a testing scope."""
+        from cozempic.digest import _infer_scope
+        self.assertEqual(_infer_scope("testimony from the witness"), "general")
+
+    def test_merger_is_not_git(self):
+        """'merger' contains 'merge' as substring but is not a git scope."""
+        from cozempic.digest import _infer_scope
+        self.assertEqual(_infer_scope("the merger acquisition"), "general")
+
+    def test_slackline_is_not_communication(self):
+        """'slackline' contains 'slack' as substring but is not a communication scope."""
+        from cozempic.digest import _infer_scope
+        self.assertEqual(_infer_scope("slackline balance practice"), "general")
+
+    def test_write_tests_is_testing_not_file_ops(self):
+        """Order-dependent: `don't write tests` has BOTH 'write' (file-ops)
+        AND 'tests' (testing). Testing intent should win — `tests` is the
+        noun; `write` is the verb operating on tests. Under the old order
+        `file-ops` wins because it appears first in the if/elif chain.
+        Word-boundary fix alone may not resolve this — may need priority
+        ordering adjustment. Documented as part of the fix."""
+        from cozempic.digest import _infer_scope
+        # Prefer testing since the user is explicitly talking about tests
+        self.assertEqual(_infer_scope("don't write tests"), "testing")
+
+    # Positive tests — real matches must still work
+    def test_legit_git_still_matches(self):
+        from cozempic.digest import _infer_scope
+        self.assertEqual(_infer_scope("always push to git main"), "git")
+        self.assertEqual(_infer_scope("never commit secrets"), "git")
+
+    def test_legit_file_ops_still_matches(self):
+        from cozempic.digest import _infer_scope
+        self.assertEqual(_infer_scope("don't edit the config file"), "file-ops")
+
+    def test_legit_testing_still_matches(self):
+        from cozempic.digest import _infer_scope
+        self.assertEqual(_infer_scope("never mock the database in tests"), "testing")
+
+    def test_legit_communication_still_matches(self):
+        from cozempic.digest import _infer_scope
+        self.assertEqual(_infer_scope("reply to the slack message"), "communication")
+
+    def test_case_insensitive_preserved(self):
+        from cozempic.digest import _infer_scope
+        self.assertEqual(_infer_scope("Always PUSH to GIT"), "git")
