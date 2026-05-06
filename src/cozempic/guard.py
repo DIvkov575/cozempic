@@ -1128,6 +1128,39 @@ def start_guard_daemon(
     if claude_pid is None:
         claude_pid = find_claude_pid()
 
+    # Atomically claim the pid slot before spawning (O_CREAT|O_EXCL prevents TOCTOU).
+    # If EEXIST, another concurrent starter won the race — return already_running.
+    try:
+        fd = os.open(str(pid_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, b"0")  # placeholder; real PID written after Popen
+        os.close(fd)
+    except FileExistsError:
+        # Re-read and verify to handle the case where the winner's daemon is up
+        existing_pid = _is_guard_running_for_session(session_id) if session_id else None
+        if existing_pid:
+            return {
+                "started": False,
+                "pid": existing_pid,
+                "pid_file": str(pid_path),
+                "log_file": None,
+                "already_running": True,
+            }
+        # Stale placeholder (previous crash before real PID was written) — remove and retry once
+        pid_path.unlink(missing_ok=True)
+        try:
+            fd = os.open(str(pid_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, b"0")
+            os.close(fd)
+        except FileExistsError:
+            existing_pid = _is_guard_running_for_session(session_id) if session_id else None
+            return {
+                "started": False,
+                "pid": existing_pid,
+                "pid_file": str(pid_path),
+                "log_file": None,
+                "already_running": True,
+            }
+
     # Build the guard command
     cmd_parts = [
         sys.executable, "-m", "cozempic.cli", "guard",
@@ -1172,8 +1205,10 @@ def start_guard_daemon(
             env=env,
         )
 
-    # Write PID file — keyed by session ID (or CWD hash as fallback)
-    pid_path.write_text(str(proc.pid))
+    # Write actual PID atomically via temp+rename so readers never see partial content
+    tmp_path = pid_path.with_suffix(".pid.tmp")
+    tmp_path.write_text(str(proc.pid))
+    tmp_path.replace(pid_path)
 
     return {
         "started": True,
