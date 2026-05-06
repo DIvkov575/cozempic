@@ -1354,16 +1354,18 @@ def _is_claude_process(pid: int) -> bool:
         tokens = args.split()
         if not tokens:
             return False
-        comm = tokens[0].lower()
-        # Match node-based Claude Code invocations
-        if "node" in comm:
+        binary = Path(tokens[0]).name.lower()
+        # Match native claude binary (whole name, not substring)
+        if binary == "claude":
             return True
-        # Match native claude binary
-        if comm.endswith("claude") or comm == "claude":
-            return True
-        # Match explicit claude-code invocations in args
-        if "claude-code" in args or "@anthropic-ai/claude-code" in args:
-            return True
+        # Match node-based Claude Code: binary must be exactly "node" or "node.js"
+        # AND args must contain a Claude Code-specific marker.
+        if binary in ("node", "node.js"):
+            if "@anthropic-ai/claude-code" in args:
+                return True
+            # cli.js under a claude-code directory
+            if "claude-code/cli.js" in args or "claude-code\\cli.js" in args:
+                return True
         return False
     except (subprocess.SubprocessError, OSError):
         return False
