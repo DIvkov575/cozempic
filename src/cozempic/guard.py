@@ -416,6 +416,16 @@ def start_guard(
                     os.kill(claude_pid, 0)
                 except (ProcessLookupError, PermissionError):
                     claude_alive = False
+                else:
+                    # Liveness confirmed — also verify PID identity to guard against
+                    # PID reuse (daemon started hours ago; original Claude exited and
+                    # kernel recycled its PID to an unrelated process).
+                    try:
+                        if not _is_claude_process(claude_pid):
+                            claude_alive = False
+                    except ProcessLookupError:
+                        claude_alive = False
+                if not claude_alive:
                     print(f"  [{_now()}] Claude process exited (PID {claude_pid}). Final checkpoint...")
                     checkpoint_team(session_path=session_path, quiet=False)
                     print(f"  Guard stopping (Claude exited).")
