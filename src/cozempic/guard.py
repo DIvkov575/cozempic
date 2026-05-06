@@ -1344,7 +1344,7 @@ def _is_cozempic_guard_process(pid: int) -> bool:
         # the cozempic entry-point. Rejects `run-cozempic`, `fake-cozempic`,
         # `python-attacker`. Accepts `python3.11`, `python3.13.12`, etc. used
         # by pyenv / Homebrew / distro packaging.
-        if not (binary == "cozempic" or re.match(r"^python(\d+(\.\d+)*)?$", binary)):
+        if not (binary == "cozempic" or re.fullmatch(r"^python(\d+(\.\d+)*)?$", binary)):
             return False
         # "cozempic.cli" and "guard" must appear as discrete arg tokens, not as
         # substrings in filenames/paths (grep, less, vim on our source tree).
