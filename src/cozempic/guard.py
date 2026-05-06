@@ -939,6 +939,10 @@ def _spawn_reload_watcher(claude_pid: int, project_dir: str, session_id: str | N
 
     system = platform.system()
 
+    # log_dir is a bash-safe representation of project_dir for the echo log line.
+    # shell_quote wraps in single quotes (POSIX safe); metachars are not executable.
+    log_dir = shell_quote(project_dir)
+
     if system == "Darwin":
         resume_cmd = (
             f"osascript -e 'tell application \"Terminal\" to do script "
@@ -953,18 +957,25 @@ def _spawn_reload_watcher(claude_pid: int, project_dir: str, session_id: str | N
             f"else echo 'No terminal emulator found' >> /tmp/cozempic_guard.log; fi"
         )
     elif system == "Windows":
+        # Escape cmd.exe metacharacters in project_dir so they cannot execute.
+        # ^ is the cmd.exe escape character; prefix each metachar with ^ to
+        # prevent them from being interpreted as shell operators.
+        _cmd_metachars = set('&|<>^"')
+        escaped_dir = "".join(f"^{c}" if c in _cmd_metachars else c for c in project_dir)
         resume_cmd = (
-            f"start cmd /c \"cd /d {project_dir} && claude {resume_flag}\""
+            f"start cmd /c \"cd /d {escaped_dir} && claude {resume_flag}\""
         )
+        # Use escaped form in log line too so the watcher_script has no raw metachars
+        log_dir = escaped_dir
     else:
         print(f"  WARNING: Auto-resume not supported on {system}.")
         return
 
     watcher_script = (
-        f"while kill -0 {claude_pid} 2>/dev/null; do sleep 1; done; "
+        f"while kill -0 {int(claude_pid)} 2>/dev/null; do sleep 1; done; "
         f"sleep 1; "
         f"{resume_cmd}; "
-        f"echo \"$(date): Cozempic guard resumed Claude in {project_dir}\" >> /tmp/cozempic_guard.log"
+        f"echo \"$(date): Cozempic guard resumed Claude in {log_dir}\" >> /tmp/cozempic_guard.log"
     )
 
     subprocess.Popen(
