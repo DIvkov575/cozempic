@@ -1011,6 +1011,10 @@ def _is_guard_running_for_session(session_id: str) -> int | None:
     try:
         pid = int(pid_path.read_text().strip())
         os.kill(pid, 0)
+        # Verify the PID is actually our guard — defend against PID reuse.
+        if not _is_cozempic_guard_process(pid):
+            pid_path.unlink(missing_ok=True)
+            return None
         return pid
     except (ValueError, ProcessLookupError, PermissionError):
         pid_path.unlink(missing_ok=True)
