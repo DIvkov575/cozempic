@@ -1258,8 +1258,10 @@ def start_guard_daemon(
     try:
         try:
             fd = os.open(str(pid_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(fd, b"0")  # placeholder; real PID written after Popen
-            os.close(fd)
+            try:
+                os.write(fd, b"0")  # placeholder; real PID written after Popen
+            finally:
+                os.close(fd)
         except (FileExistsError, OSError) as _e:
             if not isinstance(_e, FileExistsError):
                 _claim_result = {"started": False, "reason": f"pidfile: {_e}"}
@@ -1301,8 +1303,10 @@ def start_guard_daemon(
                         pid_path.unlink(missing_ok=True)
                         try:
                             fd = os.open(str(pid_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                            os.write(fd, b"0")
-                            os.close(fd)
+                            try:
+                                os.write(fd, b"0")
+                            finally:
+                                os.close(fd)
                         except (FileExistsError, OSError) as _e2:
                             if not isinstance(_e2, FileExistsError):
                                 _claim_result = {"started": False, "reason": f"pidfile: {_e2}"}
@@ -1345,34 +1349,47 @@ def start_guard_daemon(
     if claude_pid is not None:
         cmd_parts.extend(["--claude-pid", str(claude_pid)])
 
-    # Spawn detached process
-    with open(log_file, "a", encoding="utf-8") as lf:
-        from datetime import datetime
-        lf.write(f"\n--- Guard daemon started at {datetime.now().isoformat()} ---\n")
-        lf.write(f"CWD: {cwd}\n")
-        lf.write(f"CMD: {' '.join(cmd_parts)}\n\n")
-        lf.flush()
+    # Spawn detached process. Wrapped in try/finally so the spawn_lock is
+    # ALWAYS released and the "0" placeholder is cleaned up if Popen (or
+    # anything else in this block) raises. Without this, a FileNotFoundError
+    # from a missing Python binary or a PermissionError on the log file would
+    # leave the lock held permanently (blocking all future in-process spawns
+    # for this session) and the placeholder pidfile on disk (blocking all
+    # future cross-process spawns until manual deletion).
+    try:
+        with open(log_file, "a", encoding="utf-8") as lf:
+            from datetime import datetime
+            lf.write(f"\n--- Guard daemon started at {datetime.now().isoformat()} ---\n")
+            lf.write(f"CWD: {cwd}\n")
+            lf.write(f"CMD: {' '.join(cmd_parts)}\n\n")
+            lf.flush()
 
-        # PYTHONUNBUFFERED=1 ensures guard log output is written immediately (#14)
-        env = os.environ.copy()
-        env["PYTHONUNBUFFERED"] = "1"
-        proc = subprocess.Popen(
-            cmd_parts,
-            stdout=lf,
-            stderr=lf,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-            cwd=cwd,
-            env=env,
-        )
+            # PYTHONUNBUFFERED=1 ensures guard log output is written immediately (#14)
+            env = os.environ.copy()
+            env["PYTHONUNBUFFERED"] = "1"
+            proc = subprocess.Popen(
+                cmd_parts,
+                stdout=lf,
+                stderr=lf,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                cwd=cwd,
+                env=env,
+            )
 
-    # Write actual PID atomically via temp+rename so readers never see partial content
-    tmp_path = pid_path.with_suffix(".pid.tmp")
-    tmp_path.write_text(str(proc.pid))
-    tmp_path.replace(pid_path)
-    # Release the spawn lock now that the real PID is committed. Any concurrent
-    # _is_guard_running_for_session can now read the valid PID > 0.
-    spawn_lock.release()
+        # Write actual PID atomically via temp+rename so readers never see partial content
+        tmp_path = pid_path.with_suffix(".pid.tmp")
+        tmp_path.write_text(str(proc.pid))
+        tmp_path.replace(pid_path)
+    except Exception:
+        # Cleanup: remove the "0" placeholder so future spawns aren't blocked
+        pid_path.unlink(missing_ok=True)
+        raise
+    finally:
+        # Release the spawn lock regardless of success/failure. Any concurrent
+        # _is_guard_running_for_session can now read the valid PID > 0 (success)
+        # or find no pidfile (failure — cleaned up above).
+        spawn_lock.release()
 
     return {
         "started": True,
