@@ -1367,7 +1367,13 @@ def _is_claude_process(pid: int) -> bool:
     Mirrors _is_cozempic_guard_process but for the Claude client side.
     Guards against PID reuse: if Claude exits and its PID is recycled, a blind
     SIGTERM on the recycled PID is a confused-deputy bug.
+
+    On Windows, `ps` is unavailable — uses `tasklist /FI "PID eq <pid>" /FO CSV`
+    instead. If tasklist also fails, falls back to liveness-only (returns True
+    for a live PID) so callers can still proceed with taskkill.
     """
+    if platform.system() == "Windows":
+        return _is_claude_process_windows(pid)
     try:
         result = subprocess.run(
             ["ps", "-p", str(pid), "-o", "args="],
@@ -1394,6 +1400,26 @@ def _is_claude_process(pid: int) -> bool:
         return False
     except (subprocess.SubprocessError, OSError):
         return False
+
+
+def _is_claude_process_windows(pid: int) -> bool:
+    """Windows-specific helper: probe via tasklist /FO CSV."""
+    try:
+        result = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        if result.returncode != 0:
+            return True  # liveness fallback — let caller proceed with taskkill
+        output = (result.stdout or "").strip().lower()
+        if not output or "no tasks are running" in output:
+            return False
+        # CSV row: "image_name","pid","session_name","session#","mem_usage"
+        # Image name is the first quoted field.
+        image_name = output.split(",")[0].strip('"')
+        return any(marker in image_name for marker in ("claude", "node"))
+    except (subprocess.SubprocessError, OSError):
+        return True  # liveness fallback — let caller proceed with taskkill
 
 
 def _pid_file_points_to(session_id: str, expected_pid: int) -> bool:
