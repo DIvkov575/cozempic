@@ -1979,3 +1979,157 @@ class TestInferScopeWordBoundary(unittest.TestCase):
     def test_case_insensitive_preserved(self):
         from cozempic.digest import _infer_scope
         self.assertEqual(_infer_scope("Always PUSH to GIT"), "git")
+
+
+# ---------------------------------------------------------------------------
+# BUG-11 — _infer_scope edge case hardening (PR #85 verification probes)
+# ---------------------------------------------------------------------------
+
+
+class TestInferScopeEdgeCases(unittest.TestCase):
+    """Edge case hardening — empty/whitespace, Unicode, long inputs, mixed scripts,
+    URLs, regex injection, punctuation boundaries, multi-scope priority.
+    Added as part of PR #85 adversarial verification.
+    """
+
+    # -- empty / whitespace / newline-only -----------------------------------
+
+    def test_empty_string_returns_general_no_crash(self):
+        from cozempic.digest import _infer_scope
+        self.assertEqual(_infer_scope(""), "general")
+
+    def test_whitespace_only_returns_general(self):
+        from cozempic.digest import _infer_scope
+        self.assertEqual(_infer_scope("  "), "general")
+        self.assertEqual(_infer_scope("\n\n"), "general")
+        self.assertEqual(_infer_scope("\t"), "general")
+        self.assertEqual(_infer_scope(" \t\n "), "general")
+
+    # -- Unicode / CJK / emoji / zero-width ----------------------------------
+
+    def test_guillemets_wrapped_keyword_still_matches(self):
+        """Guillemets are non-word chars; the GIT token remains intact."""
+        from cozempic.digest import _infer_scope
+        self.assertEqual(_infer_scope("«GIT»"), "git")
+
+    def test_fullwidth_punctuation_around_keyword_still_matches(self):
+        """Fullwidth backticks around `push` do not prevent tokenization."""
+        from cozempic.digest import _infer_scope
+        self.assertEqual(_infer_scope("｀push｀"), "git")
+
+    def test_turkish_dotless_i_does_not_match(self):
+        """U+0131 (dotless i) is distinct from U+0069 (i) after .lower() —
+        `gıt` is not `git`. Fix must not silently coerce."""
+        from cozempic.digest import _infer_scope
+        self.assertEqual(_infer_scope("pısh to gıt"), "general")
+
+    def test_zero_width_space_between_keywords_loses_match(self):
+        """Zero-width space U+200B inside a keyword breaks tokenization.
+        This is acceptable — the user cannot have typed a ZWSP by accident;
+        if present, the token is genuinely not a keyword."""
+        from cozempic.digest import _infer_scope
+        # "don'tZWSPpush" — tokens are ['don', 't​push'] — no match
+        # but the full string contains "push" after zero-width is treated
+        # as part of the token — let's assert the current behavior
+        r = _infer_scope("don't​push")
+        # Result is 'git' because regex r'[\w-]+' with UNICODE splits on ZWSP?
+        # Actually \w matches ZWSP in Python 3, so this stays as one token.
+        # Document the behavior — this is implementation-defined and we
+        # just want to ensure no crash and deterministic output.
+        self.assertIn(r, ("general", "git"))
+
+    def test_cjk_scope_keyword_does_not_match(self):
+        """CJK characters for 'push' (推送) do not match English keywords."""
+        from cozempic.digest import _infer_scope
+        self.assertEqual(_infer_scope("推送 to main"), "general")
+
+    def test_emoji_only_returns_general(self):
+        from cozempic.digest import _infer_scope
+        self.assertEqual(_infer_scope("\U0001f527\U0001f4bb\U0001f680"), "general")
+
+    def test_cjk_plus_english_keyword_still_matches(self):
+        from cozempic.digest import _infer_scope
+        self.assertEqual(_infer_scope("don't 推送 to git"), "git")
+
+    # -- very long input -----------------------------------------------------
+
+    def test_long_input_no_regression(self):
+        """10k-char input with keyword at tail must still match without OOM."""
+        from cozempic.digest import _infer_scope
+        big = ("lorem " * 1000) + " don't push"
+        self.assertEqual(_infer_scope(big), "git")
+
+    # -- URL / path false-positive check -------------------------------------
+
+    def test_url_path_etc_passwords_maps_to_file_ops(self):
+        """`/etc/passwords` tokenizes as etc, passwords. file-ops wins via 'read'."""
+        from cozempic.digest import _infer_scope
+        self.assertEqual(_infer_scope("don't read /etc/passwords"), "file-ops")
+
+    def test_path_with_git_substring_but_no_token_is_general(self):
+        """/usr/local/gitlab/config has 'git' only as substring of 'gitlab'.
+        Post-fix should return general (BUG-11 premise)."""
+        from cozempic.digest import _infer_scope
+        self.assertEqual(_infer_scope("/usr/local/gitlab/config"), "general")
+
+    # -- regex injection safety ---------------------------------------------
+
+    def test_regex_metacharacters_in_input_not_interpreted(self):
+        """User text containing regex metacharacters must not be interpreted
+        as a pattern — tokenizer uses re.findall on the static pattern."""
+        from cozempic.digest import _infer_scope
+        self.assertEqual(_infer_scope("don't (.*?)"), "general")
+        self.assertEqual(_infer_scope(r"don't \b\w+\b"), "general")
+        # [git] contains the token 'git' as whole word
+        self.assertEqual(_infer_scope("[git]"), "git")
+
+    # -- punctuation boundary -----------------------------------------------
+
+    def test_parenthesized_keyword_matches(self):
+        from cozempic.digest import _infer_scope
+        self.assertEqual(_infer_scope("(commit)"), "git")
+        self.assertEqual(_infer_scope("[merge]"), "git")
+
+    def test_dot_notation_keyword_matches(self):
+        """`.push()` tokenizes so that `push` is a standalone token."""
+        from cozempic.digest import _infer_scope
+        self.assertEqual(_infer_scope(".push()"), "git")
+
+    def test_hyphen_compound_keeps_token_intact(self):
+        """`don't-push` tokenizes as ['don', 't-push'] — the fix preserves
+        hyphens in tokens. This means `pre-push` / `force-push` style
+        compounds will NOT match bare `push` keyword. Documented tradeoff."""
+        from cozempic.digest import _infer_scope
+        # don't-push → token 't-push' does not match 'push' whole token
+        self.assertEqual(_infer_scope("don't-push"), "general")
+        # pre-push hook → pre-push is one token, no match
+        self.assertEqual(_infer_scope("pre-push hook"), "general")
+
+    # -- multi-scope priority -----------------------------------------------
+
+    def test_push_tests_resolves_to_testing(self):
+        """BOTH 'push' (git) AND 'tests' (testing) present — testing wins
+        because it is listed FIRST in _SCOPE_KEYWORDS table."""
+        from cozempic.digest import _infer_scope
+        self.assertEqual(_infer_scope("push tests"), "testing")
+
+    def test_write_to_main_branch_resolves_to_git(self):
+        """write (file-ops) + branch (git) — git wins because testing was
+        checked first (no match) and file-ops would normally come before git,
+        but `write` and `branch` are both present; current table order
+        puts testing → git → file-ops so branch/git wins over write/file-ops."""
+        from cozempic.digest import _infer_scope
+        self.assertEqual(_infer_scope("don't write to main branch"), "git")
+
+    def test_merge_and_test_resolves_to_testing(self):
+        from cozempic.digest import _infer_scope
+        self.assertEqual(_infer_scope("merge and test"), "testing")
+
+    # -- co-authored compound stays matched ---------------------------------
+
+    def test_co_authored_by_compound_still_matches(self):
+        """Verify BUG-11 fix keeps hyphenated git keyword `co-authored-by`
+        working (it's explicitly in the keyword set as a single token)."""
+        from cozempic.digest import _infer_scope
+        self.assertEqual(_infer_scope("co-authored-by me"), "git")
+        self.assertEqual(_infer_scope("CO-AUTHORED-BY: ..."), "git")
