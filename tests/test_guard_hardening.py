@@ -1,0 +1,669 @@
+"""RED tests for guard.py PID-reuse and shell-injection hardening (bugs G1-G8).
+
+Each test class targets one concrete bug from AUDIT_REPORT.md and captures the
+CONTRACT that the fix must satisfy. Tests avoid implementation details — they
+assert what the caller / OS / filesystem observes.
+
+Bugs covered:
+  G1 CRITICAL — _cleanup_legacy_pid signals unverified PID
+  G2 CRITICAL — _cleanup_stale_watchers signals substring-only pgrep match
+  G3 HIGH     — _is_guard_running_for_session missing PID-reuse defence
+  G4 HIGH     — TOCTOU race in PID file creation
+  G5 HIGH     — _terminate_and_resume signals unverified claude_pid
+  G6 HIGH     — Windows cmd injection + unquoted project_dir/flags
+  G7 MED      — _detect_claude_flags breaks on spaces/metachar; injection flows through
+  G8 MED      — main-loop Claude watchdog uses PID with no identity verification
+"""
+from __future__ import annotations
+
+import os
+import signal
+import subprocess
+import tempfile
+import threading
+import unittest
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+
+# ---------------------------------------------------------------------------
+# BUG-G1 — _cleanup_legacy_pid must NOT SIGTERM unverified PID
+# ---------------------------------------------------------------------------
+class TestG1_CleanupLegacyPidRequiresArgvVerify(unittest.TestCase):
+    """_cleanup_legacy_pid must call _is_cozempic_guard_process before SIGTERM.
+
+    Scenario: pre-1.6.13 legacy pidfile holds PID N. Host has since recycled
+    N to an unrelated user process (editor, node server, shell). The cleanup
+    path must NOT send SIGTERM to N. It should only unlink the legacy file.
+    """
+
+    def setUp(self):
+        # Temp legacy pidfile so we don't touch /tmp globally
+        self.tmpdir = tempfile.mkdtemp()
+        self.cwd = self.tmpdir
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _write_legacy_pidfile(self, pid: int) -> Path:
+        """Write a legacy-format pidfile; return its Path."""
+        from cozempic.guard import _pid_file_for_cwd
+        legacy = _pid_file_for_cwd(self.cwd)
+        legacy.write_text(str(pid))
+        self.addCleanup(legacy.unlink, missing_ok=True)
+        return legacy
+
+    def test_does_not_sigterm_non_guard_pid(self):
+        """Recycled-PID scenario: pidfile points at a non-cozempic process.
+
+        With the fix, SIGTERM MUST NOT be sent. The legacy file is still unlinked.
+        """
+        from cozempic.guard import _cleanup_legacy_pid
+        self._write_legacy_pidfile(31337)
+
+        with (
+            patch("cozempic.guard._is_cozempic_guard_process", return_value=False),
+            patch("cozempic.guard.os.kill") as mock_kill,
+        ):
+            _cleanup_legacy_pid(self.cwd)
+
+            # Liveness probe kill(pid, 0) is OK; SIGTERM is NOT.
+            sigterm_calls = [
+                c for c in mock_kill.call_args_list
+                if len(c.args) >= 2 and c.args[1] == signal.SIGTERM
+            ]
+            self.assertEqual(
+                sigterm_calls, [],
+                "Legacy cleanup sent SIGTERM to a non-guard PID — confused deputy bug",
+            )
+
+    def test_sigterms_legitimate_guard_pid(self):
+        """Positive case: pidfile points at a real cozempic guard — SIGTERM is allowed."""
+        from cozempic.guard import _cleanup_legacy_pid
+        self._write_legacy_pidfile(42000)
+
+        with (
+            patch("cozempic.guard._is_cozempic_guard_process", return_value=True),
+            patch("cozempic.guard.os.kill") as mock_kill,
+            patch("cozempic.guard.time.sleep"),
+        ):
+            _cleanup_legacy_pid(self.cwd)
+
+            sigterm_calls = [
+                c for c in mock_kill.call_args_list
+                if len(c.args) >= 2 and c.args[1] == signal.SIGTERM and c.args[0] == 42000
+            ]
+            self.assertEqual(
+                len(sigterm_calls), 1,
+                "Legacy cleanup failed to SIGTERM a verified guard PID",
+            )
+
+
+# ---------------------------------------------------------------------------
+# BUG-G2 — _cleanup_stale_watchers must NOT signal substring-only pgrep matches
+# ---------------------------------------------------------------------------
+class TestG2_CleanupStaleWatchersRequiresArgvVerify(unittest.TestCase):
+    """_cleanup_stale_watchers must verify each match's full argv before SIGTERM.
+
+    pgrep -f matches the entire command line as regex. A process like
+    `vim /tmp/cozempic_guard_resumed_Claude_notes.md` matches
+    'cozempic.*resumed Claude' but is NOT a watcher.
+    """
+
+    def test_does_not_sigterm_false_positive_pgrep_match(self):
+        """pgrep returns a PID whose argv is not a real watcher; no SIGTERM."""
+        from cozempic.guard import _cleanup_stale_watchers
+
+        # pgrep returns the PID — but the argv that ps resolves is a vim editor
+        false_pid = "77777"
+        false_argv = "vim /home/u/cozempic_guard_resumed_Claude_notes.md"
+
+        def fake_run(cmd, *args, **kwargs):
+            mock = MagicMock()
+            mock.returncode = 0
+            if cmd[0] == "pgrep":
+                mock.stdout = false_pid + "\n"
+            elif cmd[0] == "ps":
+                mock.stdout = false_argv + "\n"
+            else:
+                mock.stdout = ""
+            return mock
+
+        with (
+            patch("cozempic.guard.subprocess.run", side_effect=fake_run),
+            patch("cozempic.guard.os.kill") as mock_kill,
+        ):
+            _cleanup_stale_watchers()
+
+            sigterm_calls = [
+                c for c in mock_kill.call_args_list
+                if len(c.args) >= 2 and c.args[1] == signal.SIGTERM
+            ]
+            self.assertEqual(
+                sigterm_calls, [],
+                "Stale-watcher cleanup SIGTERM'd a process whose argv is not a watcher "
+                "(substring-only match — confused deputy)",
+            )
+
+    def test_sigterms_real_watcher_match(self):
+        """Positive case: pgrep returns a real bash watcher — SIGTERM is allowed."""
+        from cozempic.guard import _cleanup_stale_watchers
+
+        real_pid = "88888"
+        # Matches the real watcher_script shape in _spawn_reload_watcher at ~933-937
+        real_argv = (
+            "bash -c while kill -0 5000 2>/dev/null; do sleep 1; done; sleep 1; "
+            "osascript ... Cozempic guard resumed Claude in /home/u/project"
+        )
+
+        def fake_run(cmd, *args, **kwargs):
+            mock = MagicMock()
+            mock.returncode = 0
+            if cmd[0] == "pgrep":
+                mock.stdout = real_pid + "\n"
+            elif cmd[0] == "ps":
+                mock.stdout = real_argv + "\n"
+            else:
+                mock.stdout = ""
+            return mock
+
+        with (
+            patch("cozempic.guard.subprocess.run", side_effect=fake_run),
+            patch("cozempic.guard.os.kill") as mock_kill,
+        ):
+            _cleanup_stale_watchers()
+
+            sigterm_calls = [
+                c for c in mock_kill.call_args_list
+                if len(c.args) >= 2 and c.args[1] == signal.SIGTERM
+                and c.args[0] == int(real_pid)
+            ]
+            self.assertGreaterEqual(
+                len(sigterm_calls), 1,
+                "Stale-watcher cleanup failed to SIGTERM a legitimate watcher",
+            )
+
+
+# ---------------------------------------------------------------------------
+# BUG-G3 — _is_guard_running_for_session must verify PID ownership
+# ---------------------------------------------------------------------------
+class TestG3_IsGuardRunningForSessionVerifiesPidOwnership(unittest.TestCase):
+    """_is_guard_running_for_session must return None when the pidfile PID
+    is alive but not a cozempic guard.
+
+    Scenario: daemon crashed, PID recycled to an unrelated process. The
+    function currently only checks `os.kill(pid, 0)` → returns the recycled
+    PID → start_guard_daemon treats session as already_running → session
+    is permanently unprotected.
+    """
+
+    def setUp(self):
+        self.session_id = "11111111-2222-3333-4444-000000000001"
+        # Pre-seed the session pidfile with a recycled-looking PID.
+        from cozempic.guard import _pid_file_for_session
+        self.pid_path = _pid_file_for_session(self.session_id)
+        self.pid_path.write_text("98765")
+        self.addCleanup(self.pid_path.unlink, missing_ok=True)
+
+    def test_returns_none_when_pid_is_not_cozempic_guard(self):
+        """PID is alive (os.kill returns) but ps shows it's not our daemon."""
+        from cozempic.guard import _is_guard_running_for_session
+
+        # os.kill(pid, 0) succeeds (liveness OK); but _is_cozempic_guard_process
+        # must return False for this PID → the function MUST return None.
+        with (
+            patch("cozempic.guard.os.kill") as mock_kill,
+            patch("cozempic.guard._is_cozempic_guard_process", return_value=False),
+        ):
+            result = _is_guard_running_for_session(self.session_id)
+
+            self.assertIsNone(
+                result,
+                "Returned a recycled PID as if guard were running — session would "
+                "run permanently unprotected. Must verify PID identity.",
+            )
+            # And liveness probe should have been attempted
+            # (we don't assert on _is_cozempic_guard_process call count, just on
+            # the returned contract — some implementations may short-circuit)
+
+    def test_returns_pid_when_pid_is_cozempic_guard(self):
+        """Positive case: PID is alive AND ps confirms it's a cozempic guard."""
+        from cozempic.guard import _is_guard_running_for_session
+
+        with (
+            patch("cozempic.guard.os.kill"),
+            patch("cozempic.guard._is_cozempic_guard_process", return_value=True),
+        ):
+            result = _is_guard_running_for_session(self.session_id)
+
+            self.assertEqual(
+                result, 98765,
+                "Failed to report a legitimate running guard PID",
+            )
+
+
+# ---------------------------------------------------------------------------
+# BUG-G4 — PID file creation must be atomic (no TOCTOU race)
+# ---------------------------------------------------------------------------
+class TestG4_PidfileWriteIsAtomic(unittest.TestCase):
+    """Two concurrent start_guard_daemon() calls for the same session must
+    NOT both succeed in spawning daemons.
+
+    Without atomic pidfile creation (O_CREAT|O_EXCL), both calls pass the
+    _is_guard_running_for_session check with None, both spawn Popen, one
+    overwrites the other's pidfile → orphan daemon.
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.session_id = "22222222-3333-4444-5555-000000000002"
+        from cozempic.guard import _pid_file_for_session
+        self.pid_path = _pid_file_for_session(self.session_id)
+        # Ensure clean state
+        self.pid_path.unlink(missing_ok=True)
+        # Also clean log file
+        key = self.session_id[:12]
+        self.log_path = Path("/tmp") / f"cozempic_guard_{key}.log"
+        self.log_path.unlink(missing_ok=True)
+        self.addCleanup(self.pid_path.unlink, missing_ok=True)
+        self.addCleanup(self.log_path.unlink, missing_ok=True)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _run_concurrent_starts(self, pid_base: int):
+        """Shared helper: apply patches on main thread (mock.patch is NOT
+        thread-safe across __enter__/__exit__) and race two start_guard_daemon
+        invocations via the existing threads. Returns (results, on_disk_pid).
+        """
+        from cozempic.guard import start_guard_daemon
+
+        start_gate = threading.Event()
+        popen_counter = {"n": 0}
+        counter_lock = threading.Lock()
+
+        class DummyProc:
+            def __init__(self, pid):
+                self.pid = pid
+
+        def fake_popen(cmd_parts, **kwargs):
+            with counter_lock:
+                popen_counter["n"] += 1
+                pid = pid_base + popen_counter["n"]
+            # Hold until gate releases so both threads pass the pre-check before
+            # either writes the pidfile (worst-case TOCTOU).
+            start_gate.wait(timeout=3.0)
+            return DummyProc(pid)
+
+        results = []
+        results_lock = threading.Lock()
+
+        def runner():
+            try:
+                r = start_guard_daemon(
+                    cwd=self.tmpdir,
+                    session_id=self.session_id,
+                    threshold_tokens=1000,
+                )
+            except Exception as e:
+                r = {"error": repr(e)}
+            with results_lock:
+                results.append(r)
+
+        # Patches applied on the main thread — safe.
+        with (
+            patch("cozempic.guard._cleanup_legacy_pid"),
+            patch("cozempic.guard.find_claude_pid", return_value=7777),
+            patch("cozempic.guard.subprocess.Popen", side_effect=fake_popen),
+        ):
+            t1 = threading.Thread(target=runner)
+            t2 = threading.Thread(target=runner)
+            t1.start()
+            t2.start()
+            import time as _t
+            _t.sleep(0.15)
+            start_gate.set()
+            t1.join(timeout=5.0)
+            t2.join(timeout=5.0)
+            self.assertFalse(
+                t1.is_alive() or t2.is_alive(),
+                "Worker threads didn't exit — pollutes mock.patch state",
+            )
+
+        on_disk_pid = None
+        if self.pid_path.exists():
+            try:
+                on_disk_pid = int(self.pid_path.read_text().strip())
+            except (ValueError, OSError):
+                on_disk_pid = None
+        return results, on_disk_pid
+
+    def test_concurrent_starts_only_one_spawn_wins(self):
+        """Race two start_guard_daemon calls; only one must report started=True.
+
+        Without atomic pidfile creation (O_CREAT|O_EXCL), both calls pass the
+        pre-check and both write the pidfile — TOCTOU orphan-daemon bug.
+        """
+        results, _ = self._run_concurrent_starts(pid_base=10000)
+
+        started_count = sum(1 for r in results if r.get("started") is True)
+        self.assertEqual(
+            started_count, 1,
+            f"Concurrent starts: {started_count} reported started=True. Expected 1. "
+            f"TOCTOU race — pidfile creation is not atomic.",
+        )
+
+    def test_final_pidfile_contains_only_winning_pid(self):
+        """After a race, the on-disk pidfile must contain the PID that actually
+        won the spawn, not an orphan of the loser."""
+        results, on_disk_pid = self._run_concurrent_starts(pid_base=20000)
+
+        winner_pids = [r.get("pid") for r in results if r.get("started") is True]
+        self.assertTrue(
+            self.pid_path.exists(),
+            "Pidfile missing after concurrent starts",
+        )
+        self.assertIn(
+            on_disk_pid, winner_pids,
+            f"Pidfile contains pid {on_disk_pid} which is not in the winner set "
+            f"{winner_pids} — orphan-daemon condition",
+        )
+
+
+# ---------------------------------------------------------------------------
+# BUG-G5 — _terminate_and_resume must re-verify claude_pid identity
+# ---------------------------------------------------------------------------
+class TestG5_TerminateAndResumeReVerifiesClaudePid(unittest.TestCase):
+    """_terminate_and_resume must check that claude_pid still points at a
+    Claude process (comm=node/claude) before SIGTERM/SIGKILL.
+
+    claude_pid is captured at daemon start but the daemon lives for hours.
+    If Claude exited and PID was recycled, blind SIGTERM targets a random
+    unrelated process.
+    """
+
+    def test_does_not_sigterm_when_pid_not_claude(self):
+        """Stale claude_pid now maps to a non-Claude process; no SIGTERM."""
+        from cozempic.guard import _terminate_and_resume
+
+        # Simulate: plain terminal path, claude_pid recycled to something else.
+        # The contract: before `os.kill(claude_pid, SIGTERM)` (lines 838, 862,
+        # 880), an identity check must gate the signal.
+        with (
+            patch("cozempic.guard._detect_terminal_env", return_value="plain"),
+            patch("cozempic.guard._detect_claude_flags", return_value=""),
+            patch("cozempic.guard.platform.system", return_value="Linux"),
+            # Simulate identity check: PID is NOT a claude/node process.
+            # Fix must introduce a helper; we pretend it exists and returns False.
+            patch("cozempic.guard._is_claude_process", create=True, return_value=False),
+            patch("cozempic.guard.os.kill") as mock_kill,
+            patch("cozempic.guard._wait_for_exit", return_value=True),
+            patch("cozempic.guard._spawn_reload_watcher"),
+        ):
+            _terminate_and_resume(31337, "/tmp/proj", session_id="sess-abc")
+
+            sigterm_calls = [
+                c for c in mock_kill.call_args_list
+                if len(c.args) >= 2 and c.args[1] == signal.SIGTERM
+                and c.args[0] == 31337
+            ]
+            sigkill_calls = [
+                c for c in mock_kill.call_args_list
+                if len(c.args) >= 2 and c.args[1] == signal.SIGKILL
+                and c.args[0] == 31337
+            ]
+            self.assertEqual(
+                sigterm_calls, [],
+                "_terminate_and_resume SIGTERM'd a recycled (non-Claude) PID",
+            )
+            self.assertEqual(
+                sigkill_calls, [],
+                "_terminate_and_resume SIGKILL'd a recycled (non-Claude) PID",
+            )
+
+    def test_tmux_path_does_not_sigterm_when_pid_not_claude(self):
+        """tmux branch (line 838) also must gate SIGTERM on identity check."""
+        from cozempic.guard import _terminate_and_resume
+
+        with (
+            patch("cozempic.guard._detect_terminal_env", return_value="tmux"),
+            patch("cozempic.guard._detect_claude_flags", return_value=""),
+            patch("cozempic.guard.platform.system", return_value="Linux"),
+            patch("cozempic.guard._is_claude_process", create=True, return_value=False),
+            patch("cozempic.guard.os.kill") as mock_kill,
+            patch("cozempic.guard._wait_for_exit", return_value=False),  # force escalation
+            patch("cozempic.guard.subprocess.run"),
+            patch("cozempic.guard.time.sleep"),
+        ):
+            _terminate_and_resume(44444, "/tmp/proj", session_id="sess-xyz")
+
+            bad_sigterm = [
+                c for c in mock_kill.call_args_list
+                if len(c.args) >= 2 and c.args[1] == signal.SIGTERM
+                and c.args[0] == 44444
+            ]
+            self.assertEqual(
+                bad_sigterm, [],
+                "tmux-path _terminate_and_resume SIGTERM'd a recycled (non-Claude) PID",
+            )
+
+
+# ---------------------------------------------------------------------------
+# BUG-G6 — Windows cmd must quote project_dir; injection must not execute
+# ---------------------------------------------------------------------------
+class TestG6_WindowsCmdQuotesArgs(unittest.TestCase):
+    """_spawn_reload_watcher on Windows must not shell-interpolate project_dir.
+
+    Current code uses: f"start cmd /c \"cd /d {project_dir} && claude ...\""
+    Any cmd metacharacter in project_dir (&, |, %, ^) executes arbitrary cmds.
+    """
+
+    def test_windows_malicious_project_dir_does_not_appear_raw_in_shell_string(self):
+        """A project_dir with `& calc &` must NOT be interpolated raw into
+        the watcher_script passed to bash."""
+        from cozempic.guard import _spawn_reload_watcher
+
+        malicious = r"C:\projects\evil & calc.exe &"
+
+        captured = {"cmd": None, "kwargs": None}
+
+        def fake_popen(cmd_parts, **kwargs):
+            captured["cmd"] = cmd_parts
+            captured["kwargs"] = kwargs
+            proc = MagicMock()
+            proc.pid = 9999
+            return proc
+
+        with (
+            patch("cozempic.guard.platform.system", return_value="Windows"),
+            patch("cozempic.guard.is_ssh_session", return_value=False),
+            patch("cozempic.guard._detect_claude_flags", return_value=""),
+            patch("cozempic.guard.subprocess.Popen", side_effect=fake_popen),
+        ):
+            _spawn_reload_watcher(5555, malicious, session_id="sess-w")
+
+        # The watcher_script is cmd_parts[-1] (bash -c <script>)
+        self.assertIsNotNone(captured["cmd"], "Popen was not called")
+        script = captured["cmd"][-1] if captured["cmd"] else ""
+
+        # Contract: on any platform, the Windows resume command must quote/escape
+        # `project_dir`. Test: the raw unquoted malicious sequence
+        # "evil & calc.exe &" must NOT appear verbatim in the script — a
+        # correctly-quoted form wraps it in quotes or escapes the `&`.
+        self.assertNotIn(
+            "evil & calc.exe &", script,
+            "project_dir interpolated raw into watcher script — cmd injection risk. "
+            "Must be quoted via subprocess.list2cmdline or argv-passed.",
+        )
+
+    def test_windows_malicious_project_dir_metachars_escaped(self):
+        """Stronger check: at least one of the cmd metacharacters (&, |) in
+        project_dir must be quoted/escaped in the final script."""
+        from cozempic.guard import _spawn_reload_watcher
+
+        malicious = r"C:\bad & pwn"
+        captured = {"cmd": None}
+
+        def fake_popen(cmd_parts, **kwargs):
+            captured["cmd"] = cmd_parts
+            proc = MagicMock()
+            proc.pid = 1
+            return proc
+
+        with (
+            patch("cozempic.guard.platform.system", return_value="Windows"),
+            patch("cozempic.guard.is_ssh_session", return_value=False),
+            patch("cozempic.guard._detect_claude_flags", return_value=""),
+            patch("cozempic.guard.subprocess.Popen", side_effect=fake_popen),
+        ):
+            _spawn_reload_watcher(1234, malicious, session_id="sess-x")
+
+        script = captured["cmd"][-1] if captured["cmd"] else ""
+        # The unquoted run sequence `\bad & pwn` indicates direct interpolation.
+        # A fix quotes the directory (`"C:\bad & pwn"`) or escapes & as `^&`.
+        self.assertFalse(
+            "\\bad & pwn" in script and '"C:\\bad & pwn"' not in script,
+            f"Windows cmd string embeds unquoted metachars: {script!r}",
+        )
+
+
+# ---------------------------------------------------------------------------
+# BUG-G7 — _detect_claude_flags must preserve flag/value boundaries
+# ---------------------------------------------------------------------------
+class TestG7_DetectClaudeFlagsPreservesBoundaries(unittest.TestCase):
+    """_detect_claude_flags must preserve flag-value boundaries and must not
+    allow shell metacharacters to reach subsequent shell interpolation.
+    """
+
+    def test_space_in_flag_value_preserved(self):
+        """--add-dir '/Users/foo/My Project' must come back with the path intact."""
+        from cozempic.guard import _detect_claude_flags
+
+        # On real POSIX, ps -o args= returns argv joined by spaces — quoting lost.
+        # A correct implementation uses psutil or /proc/<pid>/cmdline to preserve
+        # boundaries.
+        fake_ps = "claude --add-dir /Users/foo/My Project --other flag"
+
+        def fake_run(cmd, *a, **kw):
+            m = MagicMock()
+            m.returncode = 0
+            if cmd[0] == "ps":
+                m.stdout = fake_ps
+            else:
+                m.stdout = ""
+            return m
+
+        with patch("cozempic.guard.subprocess.run", side_effect=fake_run):
+            result = _detect_claude_flags(5000)
+
+        # Contract: either a correctly parsed flag-list is returned, or the
+        # value "/Users/foo/My Project" is preserved as a single token. In the
+        # current broken impl, result ends up as "--add-dir /Users/foo/My Project ..."
+        # — when re-interpolated into a shell, `ls /Users/foo/My` runs and
+        # `Project` is a separate arg. Fix: preserved via real argv parsing.
+        #
+        # Minimum contract: path with spaces must survive re-shell-parse.
+        import shlex
+        tokens = shlex.split(result) if result else []
+        self.assertIn(
+            "/Users/foo/My Project", tokens,
+            f"Space-containing flag value lost after _detect_claude_flags: {result!r}",
+        )
+
+    def test_shell_metachar_in_flag_value_not_executable(self):
+        """A flag value with `;` / `$(...)` / backtick must NOT be re-parseable
+        as a shell command when the result flows through resume_cmd."""
+        from cozempic.guard import _detect_claude_flags
+
+        # Simulate ps returning argv with injected shell metachars
+        fake_ps = "claude --model sonnet --foo \"; touch /tmp/pwned_by_g7 #\""
+
+        def fake_run(cmd, *a, **kw):
+            m = MagicMock()
+            m.returncode = 0
+            if cmd[0] == "ps":
+                m.stdout = fake_ps
+            else:
+                m.stdout = ""
+            return m
+
+        with patch("cozempic.guard.subprocess.run", side_effect=fake_run):
+            result = _detect_claude_flags(5001)
+
+        # Contract: result does not contain an un-quoted `;` or command
+        # substitution syntax that a downstream shell interpolator would
+        # execute. At minimum no bare `;` followed by whitespace+word.
+        import re
+        self.assertIsNone(
+            re.search(r";\s*touch\b", result),
+            f"_detect_claude_flags leaked an executable `;touch ...` into output: {result!r}",
+        )
+
+
+# ---------------------------------------------------------------------------
+# BUG-G8 — Main-loop Claude watchdog must verify PID identity
+# ---------------------------------------------------------------------------
+class TestG8_MainLoopWatchdogVerifiesClaudeIdentity(unittest.TestCase):
+    """The main-loop watchdog (guard.py:414-422) must not accept a
+    liveness-only os.kill(pid, 0) as proof that Claude is still alive.
+
+    After fix, a dedicated identity helper (e.g., _is_claude_process) or
+    equivalent argv check must exist and be called.
+    """
+
+    def test_is_claude_process_helper_exists(self):
+        """Post-fix, the module must expose a helper to verify a PID is Claude.
+
+        This contract mirrors _is_cozempic_guard_process (line 1161) but for
+        claude/node processes. Without it, the watchdog CAN'T verify identity.
+        """
+        import cozempic.guard as g
+        self.assertTrue(
+            hasattr(g, "_is_claude_process"),
+            "Expected cozempic.guard._is_claude_process helper (mirrors "
+            "_is_cozempic_guard_process but for claude/node) — currently missing "
+            "→ watchdog has no way to verify PID identity (BUG-G8).",
+        )
+
+    def test_is_claude_process_rejects_non_claude_pid(self):
+        """The helper, when present, must return False for a non-claude argv."""
+        import cozempic.guard as g
+        if not hasattr(g, "_is_claude_process"):
+            self.skipTest("helper missing — see test_is_claude_process_helper_exists")
+
+        def fake_run(cmd, *a, **kw):
+            m = MagicMock()
+            m.returncode = 0
+            # ps -p <pid> -o args= returns something unrelated
+            m.stdout = "nginx: master process /usr/sbin/nginx"
+            return m
+
+        with patch("cozempic.guard.subprocess.run", side_effect=fake_run):
+            self.assertFalse(
+                g._is_claude_process(12345),
+                "_is_claude_process accepted a non-claude process",
+            )
+
+    def test_is_claude_process_accepts_claude_pid(self):
+        """The helper must return True for a typical Claude/node argv."""
+        import cozempic.guard as g
+        if not hasattr(g, "_is_claude_process"):
+            self.skipTest("helper missing — see test_is_claude_process_helper_exists")
+
+        def fake_run(cmd, *a, **kw):
+            m = MagicMock()
+            m.returncode = 0
+            m.stdout = "node /usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js"
+            return m
+
+        with patch("cozempic.guard.subprocess.run", side_effect=fake_run):
+            self.assertTrue(
+                g._is_claude_process(54321),
+                "_is_claude_process rejected a legitimate claude node process",
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()
