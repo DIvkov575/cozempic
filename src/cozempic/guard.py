@@ -1067,7 +1067,10 @@ def _spawn_reload_watcher(claude_pid: int, project_dir: str, session_id: str | N
 # UUID-shape / hex-only guard for session_id inputs to pidfile path composition
 # (BUG-G13). 12+ chars keeps the `[:12]` truncation meaningful; the hex+dash
 # character class rejects path-traversal sequences and any non-UUID identifier.
-_SESSION_ID_RE = re.compile(r"^[0-9a-fA-F-]{12,}$")
+# R1-F9/F10: require a hex digit as the first char so pure-dash / leading-dash
+# inputs reject — real UUIDs always start with a hex digit. Lowercase only
+# because `_pid_file_for_session` lowercases the input before matching (F2).
+_SESSION_ID_RE = re.compile(r"^[0-9a-f][0-9a-f-]{11,}$")
 
 
 def _pid_file_for_session(session_id: str) -> Path:

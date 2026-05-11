@@ -189,8 +189,11 @@ def _is_system_noise(text: str) -> bool:
     stripped = text.strip().lstrip("".join(_ZERO_WIDTH_PREFIX_CHARS))
     if not stripped:
         return True
-    # Tag-like: any line starting with '<' is either synthetic or XML.
-    if stripped.startswith("<"):
+    # Tag-like: any line starting with '<' OR '/<' is synthetic. The '/<'
+    # form appears in some wrapped emissions where a slash precedes the
+    # tag (R1-F13). File paths like `/Users/...` still pass because they
+    # start with '/' followed by a letter, not '<'.
+    if stripped.startswith("<") or stripped.startswith("/<"):
         return True
     # Unicode tag-bracket lookalikes as LEADING char (A1 — fullwidth ＜, «, 〈).
     if stripped[0] in _UNICODE_TAG_LEAD_CHARS:
