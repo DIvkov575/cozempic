@@ -149,6 +149,12 @@ _ZERO_WIDTH_PREFIX_CHARS = ("​", "‌", "‍", "﻿", "⁠", "‎", "‏")
 # restrict to startswith.
 _UNICODE_TAG_LEAD_CHARS = ("＜", "«", "〈")  # ＜ « 〈
 
+# Slash-command detector: '/' + ASCII letter + identifier chars, terminated by
+# whitespace or end-of-string. Case-insensitive so /Compact, /INIT don't leak
+# (A12). File paths like `/Users/...` don't match because the first token
+# contains another '/'.
+_SLASH_CMD_RE = re.compile(r"^/[A-Za-z][A-Za-z0-9_-]*(?:\s|$)")
+
 
 def _is_system_noise(text: str) -> bool:
     """Return True if `text` is a Claude Code synthetic/framework turn.
@@ -171,8 +177,10 @@ def _is_system_noise(text: str) -> bool:
     # Unicode tag-bracket lookalikes as LEADING char (A1 — fullwidth ＜, «, 〈).
     if stripped[0] in _UNICODE_TAG_LEAD_CHARS:
         return True
-    # Slash command: '/' + lowercase letter (distinguish from file paths like /Users)
-    if len(stripped) >= 2 and stripped[0] == "/" and stripped[1].islower():
+    # Slash command: '/' + letter + identifier chars terminated by whitespace or
+    # end-of-string (A12 — case-insensitive; file paths /Users/... don't match
+    # because their first token embeds another '/').
+    if _SLASH_CMD_RE.match(stripped):
         return True
     # Known framework markers (substring match).
     for marker in _SYSTEM_NOISE_MARKERS:
