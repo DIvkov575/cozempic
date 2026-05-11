@@ -1808,5 +1808,123 @@ class TestPolishV2_BugG16DeadShimRemoved(unittest.TestCase):
         )
 
 
+# ===========================================================================
+# RED TESTS — R1 adversarial findings (F1 HIGH, F2 MED, F8 LOW)
+# ===========================================================================
+# Mapping:
+#   F1 → TestPolishV2R1Fixes_F1LibraryCallerSafety
+#   F2 → TestPolishV2R1Fixes_F2UuidCaseNormalization
+#   F8 → TestPolishV2R1Fixes_F8ValueErrorMessageSanitization
+# ===========================================================================
+
+
+class TestPolishV2R1Fixes_F1LibraryCallerSafety(unittest.TestCase):
+    """F1 HIGH: `_pid_file_for_session` ValueError propagates through
+    library API callers (`_is_guard_running_for_session`, `reload_self_daemon`)
+    and crashes non-CLI callers. Fix: those wrappers must catch ValueError
+    and return a safe default (None / `reloaded=False, reason=...`).
+    Security contract: `_pid_file_for_session` itself STILL raises.
+    """
+
+    def test_is_guard_running_returns_none_on_invalid_session(self):
+        """Non-UUID session_id must return None, not raise."""
+        from cozempic.guard import _is_guard_running_for_session
+        # Must not raise — "no daemon" is the safe default.
+        self.assertIsNone(_is_guard_running_for_session("my-project-session"))
+
+    def test_is_guard_running_returns_none_on_empty_session(self):
+        from cozempic.guard import _is_guard_running_for_session
+        self.assertIsNone(_is_guard_running_for_session(""))
+
+    def test_is_guard_running_returns_none_on_short_session(self):
+        from cozempic.guard import _is_guard_running_for_session
+        self.assertIsNone(_is_guard_running_for_session("abc"))
+
+    def test_reload_self_daemon_returns_safe_dict_on_invalid_session(self):
+        """Non-UUID session_id in reload_self_daemon → safe dict, not raise."""
+        from cozempic.guard import reload_self_daemon
+        result = reload_self_daemon(
+            cwd="/tmp",
+            session_id="my-project-session",
+        )
+        self.assertIsInstance(result, dict)
+        self.assertFalse(result.get("reloaded"))
+        # Should surface that session_id was the problem
+        self.assertIn("session", result.get("reason", "").lower())
+
+    def test_pid_file_for_session_still_raises_on_invalid(self):
+        """Regression: the underlying helper itself still raises —
+        the security contract for filename composition is intact."""
+        from cozempic.guard import _pid_file_for_session
+        with self.assertRaises(ValueError):
+            _pid_file_for_session("not-a-uuid")
+
+
+class TestPolishV2R1Fixes_F2UuidCaseNormalization(unittest.TestCase):
+    """F2 MED: same logical UUID in different cases currently maps to
+    different pid file paths, enabling split-brain spawning of 2-3
+    daemons per session. Fix: normalize to lowercase BEFORE truncation.
+    """
+
+    def test_uppercase_uuid_same_path_as_lowercase(self):
+        from cozempic.guard import _pid_file_for_session
+        lc = "abcdef12-3456-789a-bcde-f0123456789a"
+        uc = lc.upper()
+        self.assertEqual(
+            _pid_file_for_session(lc),
+            _pid_file_for_session(uc),
+            "UUID case variants mapped to different pid file paths — F2",
+        )
+
+    def test_mixed_case_uuid_same_path_as_lowercase(self):
+        from cozempic.guard import _pid_file_for_session
+        lc = "abcdef12-3456-789a-bcde-f0123456789a"
+        mc = "AbCdEf12-3456-789A-bCdE-F0123456789a"
+        self.assertEqual(
+            _pid_file_for_session(lc),
+            _pid_file_for_session(mc),
+            "mixed-case UUID produced different path — F2",
+        )
+
+    def test_normalized_path_is_lowercase(self):
+        """Post-fix contract: the stored filename uses the lowercased
+        first 12 chars, matching the canonical UUID form."""
+        from cozempic.guard import _pid_file_for_session
+        p = _pid_file_for_session("ABCDEF12-3456-789a-bcde-f0123456789a")
+        # First 12 chars of lowercased input
+        self.assertIn("abcdef12-345", str(p))
+
+
+class TestPolishV2R1Fixes_F8ValueErrorMessageSanitization(unittest.TestCase):
+    """F8 LOW: ValueError message echoes the raw session_id via `!r`,
+    which can leak sensitive callers-input (API keys misclassified as
+    session ids) into exception logs. Fix: log type + length, never
+    raw content.
+    """
+
+    def test_value_error_message_does_not_echo_raw_session_id(self):
+        from cozempic.guard import _pid_file_for_session
+        secret = "super-secret-token-would-be-bad-to-log-xyz"
+        with self.assertRaises(ValueError) as ctx:
+            _pid_file_for_session(secret)
+        self.assertNotIn(
+            secret, str(ctx.exception),
+            "ValueError message leaked raw session_id — F8",
+        )
+
+    def test_value_error_message_mentions_length(self):
+        """Message should include length to aid debugging without
+        echoing content."""
+        from cozempic.guard import _pid_file_for_session
+        with self.assertRaises(ValueError) as ctx:
+            _pid_file_for_session("xx")  # length 2
+        # 'length' keyword or the number 2 should appear
+        msg = str(ctx.exception)
+        self.assertTrue(
+            "length" in msg.lower() or " 2" in msg,
+            f"ValueError message should mention length, got: {msg!r}",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

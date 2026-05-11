@@ -2530,3 +2530,152 @@ class TestPolishV2_Bug12ToProhibitionDigitPrefix(unittest.TestCase):
                 "digit-prefix rule was not auto-demoted to pending on load "
                 "— BUG-12 migration path",
             )
+
+
+# ===========================================================================
+# RED TESTS — R1 adversarial findings (F4, F5, F6)
+# ===========================================================================
+# Mapping:
+#   F4 → TestPolishV2R1Fixes_F4BugTwelveShortBypass
+#   F5 → TestPolishV2R1Fixes_F5DebugPiiRedaction
+#   F6 → TestPolishV2R1Fixes_F6SaveDigestReadonlyGraceful
+# ===========================================================================
+
+
+class TestPolishV2R1Fixes_F4BugTwelveShortBypass(unittest.TestCase):
+    """F4 MED: BUG-12 fix gated isalpha() inside `len > 5`, so short
+    digit-led text (`5xx`, `1st`) bypassed the check and returned raw.
+    Fix: apply isalpha() gate BEFORE the len>5 branch — non-letter
+    leads reject regardless of length.
+    """
+
+    def test_short_digit_prefix_rejected(self):
+        """`_to_prohibition("5xx")` (len 3) must return '' — currently
+        bypasses the isalpha() gate via the len > 5 branch."""
+        self.assertEqual(
+            _to_prohibition("5xx"), "",
+            "short digit-led text leaked past _to_prohibition — F4",
+        )
+
+    def test_short_punctuation_prefix_rejected(self):
+        """Punctuation-led short text also rejected."""
+        self.assertEqual(
+            _to_prohibition("%foo"), "",
+            "short punctuation-led text leaked — F4",
+        )
+
+    def test_short_letter_prefix_still_returns_text(self):
+        """Regression: the len<=5 letter-led short-input path unchanged."""
+        self.assertEqual(_to_prohibition("hi"), "hi")
+
+    def test_borderline_len_5_digit_prefix_rejected(self):
+        """Exact-boundary case: `'1st hi'` is len 6 (already covered by
+        BUG-12) but `'1st'` is len 3 (bypasses). Confirm len 3 rejects."""
+        self.assertEqual(_to_prohibition("1st"), "")
+
+
+class TestPolishV2R1Fixes_F5DebugPiiRedaction(unittest.TestCase):
+    """F5 MED: `_debug` emitted `{text[:60]!r}` — first 60 chars of raw
+    user text went to stderr, leaking credentials / PII into logs when
+    COZEMPIC_DEBUG=1. Fix: log metadata (length, newline count, single
+    char) but never raw content.
+    """
+
+    def test_length_rejection_does_not_echo_content(self):
+        import io
+        import contextlib
+        with patch("cozempic.digest._DEBUG", True, create=True):
+            secret = "MY_API_KEY_xyz_do_not_log_me" + "x" * 200
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                _to_prohibition(secret)
+            out = buf.getvalue()
+            self.assertIn("len=", out, "still need length metadata")
+            self.assertNotIn(
+                "MY_API_KEY_xyz_do_not_log_me", out,
+                "debug output leaked raw user text — F5 PII risk",
+            )
+
+    def test_multiline_rejection_does_not_echo_content(self):
+        import io
+        import contextlib
+        with patch("cozempic.digest._DEBUG", True, create=True):
+            secret = "PASSWORD:hunter2\nLINE2\nLINE3\nLINE4"
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                _to_prohibition(secret)
+            out = buf.getvalue()
+            self.assertNotIn(
+                "hunter2", out,
+                "multiline debug output leaked secret — F5",
+            )
+
+    def test_structural_prefix_does_not_echo_full_content(self):
+        """Structural-prefix rejection must not leak the full user text
+        into debug output — only the single char prefix is metadata."""
+        import io
+        import contextlib
+        with patch("cozempic.digest._DEBUG", True, create=True):
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                _to_prohibition("<tag>SECRET_TOKEN_xyz_goes_here</tag>")
+            out = buf.getvalue()
+            self.assertNotIn(
+                "SECRET_TOKEN_xyz_goes_here", out,
+                "structural-prefix debug leaked raw content — F5",
+            )
+
+
+class TestPolishV2R1Fixes_F6SaveDigestReadonlyGraceful(unittest.TestCase):
+    """F6 MED: BUG-9's unconditional `save_digest_store` now crashes
+    `update_digest` when the digest dir is readonly (Docker --read-only,
+    hardened systemd, AFS/NFS quota). Fix: wrap save in try/except that
+    degrades gracefully — session state kept in-memory only, disk catches
+    up next call if FS recovers.
+    """
+
+    def setUp(self):
+        import shutil
+        self.tmpdir = Path(tempfile.mkdtemp())
+        self.digest_file = self.tmpdir / "behavioral-digest.json"
+        self.digest_md = self.tmpdir / "behavioral-digest.md"
+        self.addCleanup(lambda: shutil.rmtree(self.tmpdir, ignore_errors=True))
+
+    def test_update_digest_does_not_raise_on_permission_error(self):
+        """With a readonly target, update_digest must return (0,0,0)
+        gracefully, NOT raise PermissionError."""
+        from cozempic.digest import update_digest
+        with patch("cozempic.digest.DIGEST_DIR", self.tmpdir), \
+             patch("cozempic.digest.DIGEST_FILE", self.digest_file), \
+             patch("cozempic.digest.DIGEST_MD_FILE", self.digest_md), \
+             patch("cozempic.digest.save_digest_store",
+                   side_effect=PermissionError("readonly")):
+            # Must not raise
+            result = update_digest([], project_dir="/test", session_id="s1")
+            self.assertEqual(result, (0, 0, 0))
+
+    def test_update_digest_does_not_raise_on_os_error(self):
+        """OSError from save (disk full, FS error) also caught."""
+        from cozempic.digest import update_digest
+        with patch("cozempic.digest.DIGEST_DIR", self.tmpdir), \
+             patch("cozempic.digest.DIGEST_FILE", self.digest_file), \
+             patch("cozempic.digest.DIGEST_MD_FILE", self.digest_md), \
+             patch("cozempic.digest.save_digest_store",
+                   side_effect=OSError("disk full")):
+            result = update_digest([], project_dir="/test", session_id="s1")
+            self.assertEqual(result, (0, 0, 0))
+
+    def test_update_digest_still_calls_save_when_writable(self):
+        """Regression: BUG-9 fix stands — save IS attempted on every
+        update_digest call (this test just verifies the save path is not
+        conditional on admission outcomes)."""
+        from cozempic.digest import update_digest
+        with patch("cozempic.digest.DIGEST_DIR", self.tmpdir), \
+             patch("cozempic.digest.DIGEST_FILE", self.digest_file), \
+             patch("cozempic.digest.DIGEST_MD_FILE", self.digest_md), \
+             patch("cozempic.digest.save_digest_store") as mock_save:
+            update_digest([], project_dir="/test", session_id="s1")
+            self.assertTrue(
+                mock_save.called,
+                "save_digest_store was not called — BUG-9 regression",
+            )
