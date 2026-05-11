@@ -1255,15 +1255,29 @@ def start_guard_daemon(
     if session_id:
         session_id = _normalize_session_id(session_id)
 
-    # Use session_id for PID file if available, fall back to CWD hash
+    # Use session_id for PID file if available, fall back to CWD hash.
+    # R1-F16: route through `_pid_file_for_session` so the UUID-shape /
+    # lowercase / hex-first-char validation applies here too. Without this
+    # the write-side builds a different path than the read-side helper,
+    # and the caller's own daemon becomes an unreachable orphan.
     if session_id:
-        pid_key = session_id[:12]
+        try:
+            pid_path = _pid_file_for_session(session_id)
+        except ValueError as e:
+            return {
+                "started": False,
+                "reason": f"invalid session_id: {e}",
+                "pid": None,
+                "pid_file": None,
+                "log_file": None,
+                "already_running": False,
+            }
+        log_file = pid_path.with_suffix(".log")
     else:
         import hashlib
         pid_key = hashlib.md5(cwd.encode()).hexdigest()[:12]
-
-    log_file = Path("/tmp") / f"cozempic_guard_{pid_key}.log"
-    pid_path = Path("/tmp") / f"cozempic_guard_{pid_key}.pid"
+        log_file = Path("/tmp") / f"cozempic_guard_{pid_key}.log"
+        pid_path = Path("/tmp") / f"cozempic_guard_{pid_key}.pid"
 
     if claude_pid is None:
         claude_pid = find_claude_pid()

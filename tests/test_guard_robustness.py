@@ -49,8 +49,12 @@ class TestGuardDaemonPidHandoff(unittest.TestCase):
         from cozempic.guard import start_guard_daemon
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            session_log = Path("/tmp/cozempic_guard_test-session.log")
-            session_pid = Path("/tmp/cozempic_guard_test-session.pid")
+            # Use a valid-shape UUID — R1-F16 requires hex/UUID session_id
+            # at the write-side (start_guard_daemon), matching the read-side
+            # contract in _pid_file_for_session.
+            uuid = "ffffffff-eeee-dddd-cccc-bbbbbbbbbbbb"
+            session_log = Path("/tmp") / f"cozempic_guard_{uuid[:12]}.log"
+            session_pid = Path("/tmp") / f"cozempic_guard_{uuid[:12]}.pid"
             captured = {}
 
             class DummyProc:
@@ -68,7 +72,7 @@ class TestGuardDaemonPidHandoff(unittest.TestCase):
             ):
                 result = start_guard_daemon(
                     cwd=tmpdir,
-                    session_id="test-session",
+                    session_id=uuid,
                     threshold_tokens=123,
                 )
 
