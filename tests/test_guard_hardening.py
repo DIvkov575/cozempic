@@ -1973,5 +1973,86 @@ class TestPolishV2R1Fixes_F9F10HexDigitRequired(unittest.TestCase):
         )
 
 
+# ===========================================================================
+# RED TESTS — R1-FIX-3 adversarial finding (F16 CRIT)
+# ===========================================================================
+# F16 → TestPolishV2R1Fixes_F16StartGuardDaemonValidation
+# ===========================================================================
+
+
+class TestPolishV2R1Fixes_F16StartGuardDaemonValidation(unittest.TestCase):
+    """F16 CRITICAL: `start_guard_daemon` bypasses `_pid_file_for_session`
+    and builds `pid_path`/`log_file` directly from `session_id[:12]`.
+    Result: a caller with a non-UUID session_id successfully spawns a
+    daemon at an unreachable pidfile path (orphan), and
+    `_is_guard_running_for_session` — which validates via the helper —
+    returns None, unable to find the caller's own daemon.
+
+    Fix: route the pidfile construction through `_pid_file_for_session`
+    and return `{started: False, reason: ...}` when the helper raises.
+    """
+
+    def test_invalid_session_id_does_not_spawn(self):
+        """Non-UUID session_id must refuse to spawn the daemon — prevents
+        orphaning. Returns {started: False, reason mentions session}."""
+        from cozempic.guard import start_guard_daemon
+        result = start_guard_daemon(
+            cwd="/tmp",
+            session_id="test-session-xyz",
+        )
+        self.assertFalse(
+            result.get("started"),
+            f"daemon spawned with invalid session_id — F16 orphan: {result}",
+        )
+        self.assertIn("session", result.get("reason", "").lower())
+
+    def test_pure_dash_session_id_does_not_spawn(self):
+        """F9/F10 cascade: a pure-dash session_id also rejects at
+        start_guard_daemon entry."""
+        from cozempic.guard import start_guard_daemon
+        result = start_guard_daemon(
+            cwd="/tmp",
+            session_id="-" * 12,
+        )
+        self.assertFalse(
+            result.get("started"),
+            f"daemon spawned with pure-dash session_id — F16/F9 cascade: {result}",
+        )
+
+    def test_no_orphan_pidfile_on_invalid_session(self):
+        """Post-fix: a rejected spawn MUST NOT leave a pidfile anywhere,
+        orphan or otherwise. Current RED: `/tmp/cozempic_guard_test-sessio.pid`
+        (or similar truncation) is created by the raw [:12] path."""
+        from cozempic.guard import start_guard_daemon
+        # Clean any pre-existing stale file
+        for stale in Path("/tmp").glob("cozempic_guard_test-session*.pid"):
+            stale.unlink(missing_ok=True)
+        result = start_guard_daemon(
+            cwd="/tmp",
+            session_id="test-session-xyz",
+        )
+        # If the fix refused to start, cleanup not needed — but assert no
+        # orphan pidfile was left behind.
+        orphans = list(Path("/tmp").glob("cozempic_guard_test-session*.pid"))
+        # Cleanup any accidentally-spawned daemon from the RED state
+        pid = result.get("pid")
+        if pid:
+            try:
+                import signal
+                os.kill(pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+        for o in orphans:
+            o.unlink(missing_ok=True)
+        self.assertFalse(
+            result.get("started"),
+            "daemon spawned with invalid session_id — F16",
+        )
+        self.assertEqual(
+            orphans, [],
+            f"orphan pidfile(s) left behind — F16: {[str(o) for o in orphans]}",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
