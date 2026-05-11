@@ -2230,6 +2230,25 @@ class TestPolishV2_Bug9PersistOnRejected(unittest.TestCase):
                 "updated timestamp not refreshed on rejected-only run — BUG-9",
             )
 
+    def test_zero_candidate_no_op_regression(self):
+        """Regression: with empty `messages`, update_digest must not raise
+        and must still persist the caller's session_id. Zero candidates is
+        a valid corner case (quiet session, no user turns)."""
+        self._seed_store(session_id="s0", updated="2020-01-01T00:00:00+00:00")
+
+        with patch("cozempic.digest.DIGEST_DIR", self.tmpdir), \
+             patch("cozempic.digest.DIGEST_FILE", self.digest_file), \
+             patch("cozempic.digest.DIGEST_MD_FILE", self.digest_md):
+            added, upvoted, rejected = update_digest(
+                [], project_dir="/test", session_id="s0-new"
+            )
+            self.assertEqual((added, upvoted, rejected), (0, 0, 0))
+            data = json.loads(self.digest_file.read_text())
+            self.assertEqual(
+                data["session_id"], "s0-new",
+                "zero-candidate run dropped session_id — BUG-9 regression",
+            )
+
 
 # ---------------------------------------------------------------------------
 # A12 — slash-command noise filter must match uppercase commands (/Compact,
@@ -2462,3 +2481,49 @@ class TestPolishV2_Bug12ToProhibitionDigitPrefix(unittest.TestCase):
         """Regression: the len<=5 short-input branch is unchanged; it
         returns the input verbatim (no 'Do not' prefix)."""
         self.assertEqual(_to_prohibition("hi"), "hi")
+
+    def test_existing_digit_prefix_rule_migrates_to_pending(self):
+        """Load-time migration: an existing active rule whose evidence starts
+        with a digit must auto-demote to 'pending' via load_digest_store's
+        re-validation pass (digest.py:636-644).
+
+        Closes the data-migration loop: the fix doesn't just reject NEW
+        digit-prefix input, it also cleans UP existing malformed active
+        rules on next cozempic invocation."""
+        tmpdir = Path(tempfile.mkdtemp())
+        self.addCleanup(
+            lambda: __import__("shutil").rmtree(tmpdir, ignore_errors=True)
+        )
+        digest_file = tmpdir / "behavioral-digest.json"
+        digest_md = tmpdir / "behavioral-digest.md"
+
+        payload = {
+            "version": "1",
+            "project": "/test",
+            "updated": "2020-01-01T00:00:00+00:00",
+            "session_id": "s1",
+            "strategy_rules": [
+                {
+                    "id": "R001",
+                    "rule": "Do not 5xx errors must be retried",
+                    "evidence": "5xx errors must be retried",
+                    "status": "active",
+                    "occurrence_count": 3,
+                    "source_reliability": 1.0,
+                    "type_prior": 0.8,
+                }
+            ],
+            "failure_patterns": [],
+        }
+        digest_file.write_text(json.dumps(payload))
+
+        with patch("cozempic.digest.DIGEST_DIR", tmpdir), \
+             patch("cozempic.digest.DIGEST_FILE", digest_file), \
+             patch("cozempic.digest.DIGEST_MD_FILE", digest_md):
+            store = load_digest_store("/test")
+            self.assertEqual(len(store.strategy_rules), 1)
+            self.assertEqual(
+                store.strategy_rules[0].status, "pending",
+                "digit-prefix rule was not auto-demoted to pending on load "
+                "— BUG-12 migration path",
+            )
