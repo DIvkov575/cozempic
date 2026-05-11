@@ -384,9 +384,18 @@ def _to_prohibition(text: str) -> str:
         if rest:
             return rest[0].upper() + rest[1:]
 
-    # Default: prefix with "Do not"
-    if len(text) > 5:
+    # Default: prefix with "Do not". Require a letter lead so the grammar is
+    # valid — digit/punctuation prefixes produce malformed prohibitions like
+    # "Do not 5xx errors..." which no model can usefully follow (BUG-12).
+    # Existing digit-prefixed active rules auto-demote via the load_digest_store
+    # migration path which re-runs _to_prohibition on rule.evidence.
+    if len(text) > 5 and text[0].isalpha():
         return f"Do not {text[0].lower()}{text[1:]}"
+    if len(text) > 5:
+        # Malformed lead (digit / punctuation / symbol) — reject. Returning
+        # the raw input was itself a latent bug: callers expect prohibition
+        # framing and would otherwise persist a non-prohibition rule.
+        return ""
     return text
 
 
