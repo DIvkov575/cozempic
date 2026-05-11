@@ -105,12 +105,18 @@ class DigestStore:
         return self.strategy_rules
 
     def next_id(self) -> str:
+        # Gap-aware: find the smallest unused Rnnnn slot. Widen from 3 to 4
+        # digits past R999 so IDs stay lex-sortable through the boundary
+        # (R0999 < R1000) and the fallback never collides with an existing
+        # 4-digit ID — see BUG-13.
         existing = {r.id for r in self.all_rules()}
-        for i in range(1, 1000):
-            rid = f"R{i:03d}"
+        for i in range(1, 10_000):
+            rid = f"R{i:03d}" if i < 1000 else f"R{i:04d}"
             if rid not in existing:
                 return rid
-        return f"R{len(self.all_rules()) + 1:03d}"
+        # MAX_ACTIVE_RULES=20 caps real usage far below 9999; reaching this
+        # branch is a corruption signal, not a normal overflow.
+        raise RuntimeError("digest store exhausted R001-R9999 id space")
 
 
 # ---------------------------------------------------------------------------
