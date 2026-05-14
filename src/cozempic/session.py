@@ -471,22 +471,38 @@ def get_session_context_window(session_id: str) -> int | None:
 MAX_LINE_BYTES = 10 * 1024 * 1024  # 10MB per-line safety limit
 
 
+def _parse_one_line(raw: str, idx: int) -> Message | None:
+    """Parse a single stripped JSONL line into a Message tuple.
+
+    Returns None if the line is empty or oversized (skip). Matches the
+    behaviour shared by load_messages() and _parse_jsonl_chunk() — both
+    full-read and incremental-read paths route through this helper to
+    guarantee identical byte-length accounting and _parse_error shape.
+    """
+    stripped = raw.strip()
+    if not stripped:
+        return None
+    if len(stripped) > MAX_LINE_BYTES:
+        print(
+            f"  Warning: skipping oversized line {idx} ({len(stripped)} bytes)",
+            file=sys.stderr,
+        )
+        return None
+    byte_len = len(stripped.encode("utf-8"))
+    try:
+        return (idx, json.loads(stripped), byte_len)
+    except json.JSONDecodeError:
+        return (idx, {"_raw": stripped, "_parse_error": True}, byte_len)
+
+
 def load_messages(path: Path) -> list[Message]:
     """Load JSONL file. Returns list of (line_index, message_dict, byte_size)."""
     messages: list[Message] = []
     with open(path, "r", encoding="utf-8") as f:
         for i, line in enumerate(f):
-            line = line.strip()
-            if not line:
-                continue
-            if len(line) > MAX_LINE_BYTES:
-                print(f"  Warning: skipping oversized line {i} ({len(line)} bytes)", file=sys.stderr)
-                continue
-            try:
-                msg = json.loads(line)
-                messages.append((i, msg, len(line.encode("utf-8"))))
-            except json.JSONDecodeError:
-                messages.append((i, {"_raw": line, "_parse_error": True}, len(line.encode("utf-8"))))
+            parsed = _parse_one_line(line, i)
+            if parsed is not None:
+                messages.append(parsed)
     return messages
 
 
@@ -539,26 +555,11 @@ def _parse_jsonl_chunk(
     """
     out: list[Message] = []
     lines_consumed = 0
-    idx = start_line_index
-    for raw in chunk.splitlines():
+    for offset, raw in enumerate(chunk.splitlines()):
         lines_consumed += 1
-        stripped = raw.strip()
-        current = idx
-        idx += 1
-        if not stripped:
-            continue
-        if len(stripped) > MAX_LINE_BYTES:
-            print(
-                f"  Warning: skipping oversized line {current} ({len(stripped)} bytes)",
-                file=sys.stderr,
-            )
-            continue
-        byte_len = len(stripped.encode("utf-8"))
-        try:
-            msg = json.loads(stripped)
-            out.append((current, msg, byte_len))
-        except json.JSONDecodeError:
-            out.append((current, {"_raw": stripped, "_parse_error": True}, byte_len))
+        parsed = _parse_one_line(raw, start_line_index + offset)
+        if parsed is not None:
+            out.append(parsed)
     return out, lines_consumed
 
 

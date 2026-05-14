@@ -1,15 +1,15 @@
 """RED tests for guard memory leak fix (PR #89).
 
-Captures the contracts that FIX-L1 (`load_messages_incremental` + bounded cache)
-and FIX-L2 (`_is_claude_process` mtime-recency fallback) must satisfy.
+Captures the contracts that The incremental loader (`load_messages_incremental` + bounded cache)
+and `_is_claude_process` mtime-recency fallback must satisfy.
 
 Why these tests are RED on current main:
   - `cozempic.session.load_messages_incremental` does not exist yet (ImportError
-    at test-collection time for every TestPolishV3_* class that imports it).
+    at test-collection time for every Test_* class that imports it).
   - `cozempic.guard._is_claude_process` does not accept `session_path=` yet.
 
 Bug map (from AUDIT_REPORT_leak.md §5):
-  FIX-L1 contracts
+  Incremental-loader contracts
     - equivalence on append (cache returns same shape as full read)
     - rewrite detection via inode (os.replace)
     - size-shrink detection (in-place truncation)
@@ -18,7 +18,7 @@ Bug map (from AUDIT_REPORT_leak.md §5):
     - empirical RSS growth bound under hot-loop (checkpoint_team pattern)
     - thread-serialized cache access (no dup / no corruption)
 
-  FIX-L2 contracts
+  Claude-process mtime-fallback contracts
     - mtime-fresh JSONL corroborates liveness when ps drifts
     - aged mtime does not falsely corroborate
 
@@ -75,16 +75,16 @@ def _append_jsonl(path: Path, n_lines: int, start_index: int, payload_bytes: int
             f.write(json.dumps({"role": "user", "content": f"{i}:{filler}"}) + "\n")
 
 
-# ─── FIX-L1 — memory growth under hot-loop pattern ──────────────────────────
+# ─── memory growth under hot-loop pattern ──────────────────────────
 
 
-class TestPolishV3_MemoryGrowth(unittest.TestCase):
+class Test_MemoryGrowth(unittest.TestCase):
     """Empirical RSS bound: 50 cycles of checkpoint-style read on a 20 MB JSONL.
 
     Pre-team repro (`/tmp/leak_repro_v2.py`): 120 cycles → +587 MB.
-    FIX-L1 repro (`/tmp/fix_l1_repro.py`):      50 cycles → +100 MB, flat.
+    50 cycles → +100 MB, flat.
 
-    We assert the FIX-L1 bound (≤ 200 MB delta over 50 cycles) because the
+    We assert the incremental-read bound (≤ 200 MB delta over 50 cycles) because the
     alternative (leak-proving that current load_messages grows >300 MB) cannot
     be RED at collection time — it would actually pass on current code iff the
     leak is deterministic, but the mechanical RED signal is the ImportError on
@@ -105,17 +105,17 @@ class TestPolishV3_MemoryGrowth(unittest.TestCase):
                 load_messages_incremental(jsonl)
             delta = _rss_bytes() - baseline
 
-        # Conservative upper bound — FIX-L1 empirical is ~100 MB; give 2× headroom.
+        # Conservative upper bound — empirical is ~100 MB; give 2× headroom.
         self.assertLess(
             delta, 200 * 1024 * 1024,
             f"Incremental loader leaked {delta/1e6:.1f} MB over 50 cycles",
         )
 
 
-# ─── FIX-L1 — incremental append contract ────────────────────────────────────
+# ─── incremental append contract ────────────────────────────────────
 
 
-class TestPolishV3_IncrementalAppend(unittest.TestCase):
+class Test_IncrementalAppend(unittest.TestCase):
     """Equivalence on append + minimal re-parsing.
 
     Audit contract 1 (§5.1): after growing, incremental result must equal
@@ -172,10 +172,10 @@ class TestPolishV3_IncrementalAppend(unittest.TestCase):
             )
 
 
-# ─── FIX-L1 — rewrite detection ──────────────────────────────────────────────
+# ─── rewrite detection ──────────────────────────────────────────────
 
 
-class TestPolishV3_RewriteDetection(unittest.TestCase):
+class Test_RewriteDetection(unittest.TestCase):
     """Inode change (os.replace) and size shrink must trigger full re-read.
 
     Audit contracts 2 & 3 (§5.2, §5.3). Prune cycle rewrites JSONL via
@@ -223,10 +223,10 @@ class TestPolishV3_RewriteDetection(unittest.TestCase):
             self.assertEqual(len(second), 5, "cache must invalidate on size shrink")
 
 
-# ─── FIX-L1 — bounded cache ──────────────────────────────────────────────────
+# ─── bounded cache ──────────────────────────────────────────────────
 
 
-class TestPolishV3_CacheBounded(unittest.TestCase):
+class Test_CacheBounded(unittest.TestCase):
     """Per-session cache must cap at MAX_CACHED_MESSAGES (audit §2, §5.5).
 
     Growing past the cap should not leak: the in-memory list is trimmed to
@@ -255,10 +255,10 @@ class TestPolishV3_CacheBounded(unittest.TestCase):
             )
 
 
-# ─── FIX-L1 — partial-line tail safety + concurrency ────────────────────────
+# ─── partial-line tail safety + concurrency ────────────────────────
 
 
-class TestPolishV3_ConcurrentLoad(unittest.TestCase):
+class Test_ConcurrentLoad(unittest.TestCase):
     """Parallel incremental readers must not race or double-parse.
 
     Audit §6 risk row: module-global lock serializes cache access.
@@ -301,7 +301,7 @@ class TestPolishV3_ConcurrentLoad(unittest.TestCase):
             self.assertEqual(results[0], results[3])
 
 
-class TestPolishV3_PartialLineTailSafe(unittest.TestCase):
+class Test_PartialLineTailSafe(unittest.TestCase):
     """Partial (mid-write) trailing line must be ignored until complete.
 
     Audit contract 4 (§5.4). If Claude is mid-write, the file ends without a
@@ -332,11 +332,11 @@ class TestPolishV3_PartialLineTailSafe(unittest.TestCase):
             self.assertEqual(second[-1][1]["content"], "partial")
 
 
-# ─── FIX-L2 — ps drift + mtime corroboration ─────────────────────────────────
+# ─── ps drift + mtime corroboration ─────────────────────────────────
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="FIX-L2 mtime fallback is POSIX-only")
-class TestPolishV3_ClaudeProcessMtimeFallback(unittest.TestCase):
+@pytest.mark.skipif(sys.platform == "win32", reason="mtime fallback is POSIX-only")
+class Test_ClaudeProcessMtimeFallback(unittest.TestCase):
     """_is_claude_process must corroborate with JSONL mtime when ps drifts.
 
     Audit §4. Live PID 58060 proved ps-based detection can return False for
@@ -387,11 +387,11 @@ class TestPolishV3_ClaudeProcessMtimeFallback(unittest.TestCase):
             )
 
 
-# ─── R1-FIX F1 — same-size in-place rewrite must invalidate cache ───────────
+# ─── same-size in-place rewrite must invalidate cache ───────────
 
 
-class TestR1_F1_SameSizeRewriteInvalidation(unittest.TestCase):
-    """Adversarial R1 F1: an in-place rewrite via `open('r+')` preserves inode
+class Test_SameSizeRewriteInvalidation(unittest.TestCase):
+    """Adversarial review surfaced: an in-place rewrite via `open('r+')` preserves inode
     and size while advancing mtime. The original inode/size/mtime_ns predicate
     missed this case and returned stale cached content, violating the audit §3
     equivalence contract.
@@ -428,11 +428,11 @@ class TestR1_F1_SameSizeRewriteInvalidation(unittest.TestCase):
             )
 
 
-# ─── R1-FIX F2 — _INCR_CACHE LRU bound across sessions ──────────────────────
+# ─── _INCR_CACHE LRU bound across sessions ──────────────────────
 
 
-class TestR1_F2_CacheLRUAcrossSessions(unittest.TestCase):
-    """Adversarial R1 F2: _INCR_CACHE accreted one entry per distinct Path,
+class Test_CacheLRUAcrossSessions(unittest.TestCase):
+    """Adversarial review surfaced: _INCR_CACHE accreted one entry per distinct Path,
     unbounded. Single-session guard is fine, but library-API consumers
     (find_sessions() → loop) leaked.
 
@@ -489,13 +489,13 @@ class TestR1_F2_CacheLRUAcrossSessions(unittest.TestCase):
             self.assertNotIn(paths[1], _INCR_CACHE, "least-recently-used path was NOT evicted")
 
 
-# ─── R1-FIX F3 — _terminate_and_resume accepts session_path ──────────────────
+# ─── _terminate_and_resume accepts session_path ──────────────────
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only fallback path")
-class TestR1_F3_TerminateAndResumeAcceptsSessionPath(unittest.TestCase):
-    """Adversarial R1 F3: watchdog passed session_path to _is_claude_process
-    (FIX-L2), but _terminate_and_resume's 8 internal calls did not. Result:
+class Test_TerminateAndResumeAcceptsSessionPath(unittest.TestCase):
+    """Adversarial review surfaced: watchdog passed session_path to _is_claude_process
+    (the mtime fallback), but _terminate_and_resume's 8 internal calls did not. Result:
     watchdog said alive, reload path said dead, reload silently skipped.
 
     Fix contract: _terminate_and_resume accepts session_path and plumbs it
