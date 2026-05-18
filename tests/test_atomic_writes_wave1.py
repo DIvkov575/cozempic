@@ -289,23 +289,86 @@ class TestHostFileLockWindows(unittest.TestCase):
                             "Expected lock to degrade to no-op when msvcrt unavailable")
 
 
-# ─── Hook schema bump v5 → v6 ────────────────────────────────────────────────
+# ─── Hook schema bump v6 → v7 ────────────────────────────────────────────────
 
-class TestHookSchemaV6(unittest.TestCase):
+class TestHookSchemaV7(unittest.TestCase):
     def test_schema_marker_bumped(self):
         from cozempic.init import HOOK_SCHEMA_VERSION
-        self.assertEqual(HOOK_SCHEMA_VERSION, "v6")
+        self.assertEqual(HOOK_SCHEMA_VERSION, "v7")
 
     def test_no_unflocked_foreground_guard_daemon_call(self):
-        """The unflocked foreground `cozempic guard --daemon` call is REMOVED.
-        Hook should have exactly 2 occurrences of `cozempic guard --daemon`
-        in SessionStart (1 flocked + 1 python3 fallback)."""
+        """The unflocked foreground `cozempic guard --daemon` call stays removed.
+        v7 three-branch idempotency wraps the spawn in `if PID alive then : ;
+        elif has flock then (flock -n 8 || exit 0; spawn) 8>$STARTUP_LOCK ;
+        else spawn ; fi`. Two branches (elif + else) each carry the
+        `cozempic guard --daemon || python3 -m cozempic guard --daemon` pair,
+        so the total occurrence count is 4 (2 branches × 2 fallback variants).
+        Anything else means an unguarded branch or a missing fallback."""
         hooks_path = Path(__file__).parent.parent / "src" / "cozempic" / "data" / "hooks.json"
         hooks = json.loads(hooks_path.read_text())
         ss_cmd = hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"]
         count = ss_cmd.count("cozempic guard --daemon")
-        self.assertEqual(count, 2,
-            f"Expected 2 'cozempic guard --daemon' occurrences (1 primary + 1 python3 fallback inside flock), got {count}")
+        self.assertEqual(count, 4,
+            f"Expected 4 'cozempic guard --daemon' occurrences (2 branches × "
+            f"[primary + python3 fallback]), got {count}")
+
+    def test_startup_lock_present(self):
+        """v7 second-layer guard: when flock is available, the daemon spawn
+        runs inside a flock on a dedicated `*.startup-lock` file (distinct
+        from the existing hook-level `*.lock`). This closes the residual
+        race where the Python-side check-then-write window inside
+        `_pid_file_for_session` could let two near-simultaneous spawns both
+        pass the kill -0 fast-path. The two locks MUST be distinct files so
+        the daemon-spawn lock doesn't serialize unrelated hook work."""
+        hooks_path = Path(__file__).parent.parent / "src" / "cozempic" / "data" / "hooks.json"
+        hooks = json.loads(hooks_path.read_text())
+        ss_cmd = hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+        self.assertIn("GUARD_STARTUP_LOCK=", ss_cmd,
+            "Expected a dedicated GUARD_STARTUP_LOCK variable for the "
+            "second-layer flock guarding the daemon spawn")
+        self.assertIn("/tmp/cozempic_guard_${SESSION_ID:0:12}.startup-lock", ss_cmd,
+            "GUARD_STARTUP_LOCK path must be the per-session startup-lock "
+            "file (distinct from the existing /tmp/cozempic_hook_*.lock "
+            "which serializes the outer hook chain)")
+        # The startup-lock must use a DIFFERENT fd than the outer hook lock
+        # (fd 9) — otherwise the inner flock acquire would race the outer.
+        self.assertIn("flock -n 8", ss_cmd,
+            "Inner startup-lock flock must use fd 8 (outer hook lock owns fd 9)")
+        self.assertIn("8>\"$GUARD_STARTUP_LOCK\"", ss_cmd,
+            "fd 8 must be redirected to the startup-lock file via 8>\"$GUARD_STARTUP_LOCK\"")
+
+    def test_pid_fast_path_present(self):
+        """v7 invariant: the SessionStart hook must wrap the guard --daemon
+        spawn in a `kill -0 $(cat GUARD_PID_FILE)` fast-path so a healthy
+        daemon for the current session is NOT respawned. Closes the 2-ms
+        race observed in the 2026-05-18 crash trace where two daemons
+        started for the same SESSION_ID within the Python check-then-write
+        window."""
+        hooks_path = Path(__file__).parent.parent / "src" / "cozempic" / "data" / "hooks.json"
+        hooks = json.loads(hooks_path.read_text())
+        ss_cmd = hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+        self.assertIn("GUARD_PID_FILE=", ss_cmd,
+            "Expected the SessionStart hook to declare GUARD_PID_FILE for the fast-path")
+        self.assertIn("kill -0", ss_cmd,
+            "Expected `kill -0` liveness probe to short-circuit redundant daemon spawns")
+        # Path must match Python's `_pid_file_for_session` convention
+        # (/tmp/cozempic_guard_<sid_lower:0:12>.pid).
+        self.assertIn("/tmp/cozempic_guard_${SESSION_ID:0:12}.pid", ss_cmd,
+            "Fast-path PID file path must match the Python convention so the "
+            "shell-level check reads the same file the daemon writes")
+
+    def test_session_id_lowercased(self):
+        """v7 requires lowercase normalization of session_id in the hook so
+        the shell-side PID file path matches Python's _pid_file_for_session
+        (which lowercases before truncating to 12 chars)."""
+        hooks_path = Path(__file__).parent.parent / "src" / "cozempic" / "data" / "hooks.json"
+        hooks = json.loads(hooks_path.read_text())
+        ss_cmd = hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+        self.assertIn(".lower()", ss_cmd,
+            "SESSION_ID extraction must call .lower() to match the Python "
+            "PID file naming convention; otherwise an upper-case UUID from "
+            "Claude Code stdin would cause the fast-path to look at the "
+            "wrong file and the daemon spawn would not be deduplicated")
 
     def test_plugin_and_data_hooks_synced(self):
         plugin_path = Path(__file__).parent.parent / "plugin" / "hooks" / "hooks.json"
