@@ -32,6 +32,28 @@ from pathlib import Path
 _spawn_locks: dict[str, threading.Lock] = {}
 _spawn_locks_mu = threading.Lock()
 
+
+# ── HARD-threshold back-off + exit constants ────────────────────────────────
+# When ``guard_prune_cycle`` keeps returning saved_bytes == 0 at the HARD
+# threshold (because the live conversation is dominated by immutable tool-
+# result blocks the soft prune cannot touch), the daemon used to loop at the
+# original 30s interval indefinitely — production log showed 265 cycles over
+# 5h21m. The current contract:
+#
+#   K < HARD_LOOP_BACKOFF_START   → sleep ``interval`` (original cadence)
+#   K >= HARD_LOOP_BACKOFF_START  → sleep min(interval * 2 ** (K - 2),
+#                                              HARD_LOOP_BACKOFF_CAP_SECONDS)
+#   K >= HARD_LOOP_EXIT_THRESHOLD → log diagnostic, write final checkpoint,
+#                                   sys.exit(0). SessionStart hook will respawn.
+#
+# Any prune that returns saved_bytes > 0 resets K to 0 (counter never decays
+# on its own — only a genuine prune signals "we can still make progress").
+# The cap is 5 minutes: longer is operator-hostile (HARD threshold context
+# may genuinely need attention), shorter wastes cycles on doomed prunes.
+HARD_LOOP_BACKOFF_START = 3
+HARD_LOOP_BACKOFF_CAP_SECONDS = 300
+HARD_LOOP_EXIT_THRESHOLD = 10
+
 from ._validation import ConfigError
 from .executor import run_prescription
 from .helpers import is_ssh_session, shell_quote
@@ -555,10 +577,52 @@ def start_guard(
 
                 if result.get("saved_mb", 0) <= 0:
                     consecutive_empty_hard_prunes += 1
-                    if consecutive_empty_hard_prunes >= 3:
-                        print(f"  [{_now()}] WARNING: Hard prune freed 0 bytes 3x in a row.")
-                        consecutive_empty_hard_prunes = 0
-                        time.sleep(interval * 4)
+
+                    # Exit path: the daemon is powerless against this context
+                    # (live tool-result blocks dominate; HARD prune cannot free
+                    # bytes; reload+0-byte = the cascade that crashed sessions
+                    # in production). Exit gracefully and let the SessionStart
+                    # hook respawn on next activity. Do NOT change reload-trigger
+                    # gating in guard_prune_cycle — that's not the right escape.
+                    if consecutive_empty_hard_prunes >= HARD_LOOP_EXIT_THRESHOLD:
+                        try:
+                            checkpoint_team(session_path=session_path, quiet=True)
+                        except Exception:
+                            # Checkpoint failure must not prevent exit — final
+                            # checkpoint is best-effort here; the SOFT loop above
+                            # has been writing checkpoints every cycle for the
+                            # entire run, so on-disk state is already current.
+                            pass
+                        print(
+                            f"  [{_now()}] Guard powerless against live-context "
+                            f"dominance ({HARD_LOOP_EXIT_THRESHOLD} consecutive "
+                            f"0-byte HARD prunes). Exiting gracefully — SessionStart "
+                            f"hook will respawn on next activity. Recommend: split "
+                            f"work across fresh sessions to avoid >55% context.",
+                            flush=True,
+                        )
+                        sys.exit(0)
+
+                    # Back-off path: replace the original fixed-cadence sleep at
+                    # the bottom of the loop with an exponentially growing one.
+                    # The loop's primary ``time.sleep(interval)`` at the top of
+                    # the next iteration is the normal cadence — we ADD an extra
+                    # back-off sleep here so the next prune is genuinely delayed.
+                    backoff = _hard_loop_backoff_sleep(
+                        consecutive_empty_hard_prunes, interval
+                    )
+                    # Only emit a back-off sleep beyond the normal interval to
+                    # avoid double-sleeping at K=1 / K=2 where backoff == interval.
+                    if backoff > interval:
+                        if consecutive_empty_hard_prunes == HARD_LOOP_BACKOFF_START:
+                            print(
+                                f"  [{_now()}] Hard prune freed 0 bytes "
+                                f"{HARD_LOOP_BACKOFF_START}x — entering exponential "
+                                f"back-off (next sleep: {backoff}s, cap "
+                                f"{HARD_LOOP_BACKOFF_CAP_SECONDS}s, exit after "
+                                f"{HARD_LOOP_EXIT_THRESHOLD} cycles)."
+                            )
+                        time.sleep(backoff)
                 else:
                     consecutive_empty_hard_prunes = 0
                 print()
@@ -1753,6 +1817,29 @@ def reload_self_daemon(
         "log_file": result.get("log_file"),
         "reason": reason,
     }
+
+
+def _hard_loop_backoff_sleep(consecutive_empty: int, interval: int) -> int:
+    """Compute the sleep duration for the next HARD-loop cycle.
+
+    Doubles the wait starting at ``HARD_LOOP_BACKOFF_START`` consecutive
+    zero-byte HARD prunes, capped at ``HARD_LOOP_BACKOFF_CAP_SECONDS``.
+    Returns ``interval`` unchanged for K < HARD_LOOP_BACKOFF_START.
+
+    With defaults (interval=30, start=3, cap=300):
+        K=1 → 30s   (normal)
+        K=2 → 30s   (normal)
+        K=3 → 60s   (interval * 2 ** 1)
+        K=4 → 120s  (interval * 2 ** 2)
+        K=5 → 240s  (interval * 2 ** 3)
+        K=6 → 300s  (capped from 480s)
+        K=7+ → 300s (cap)
+    """
+    if consecutive_empty < HARD_LOOP_BACKOFF_START:
+        return interval
+    # Exponent grows from 1 at K=3 onwards: K - (start - 1).
+    exp = consecutive_empty - (HARD_LOOP_BACKOFF_START - 1)
+    return min(interval * (2 ** exp), HARD_LOOP_BACKOFF_CAP_SECONDS)
 
 
 def _fmt_prune_result(result: dict) -> str:

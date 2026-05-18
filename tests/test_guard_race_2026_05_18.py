@@ -351,8 +351,17 @@ class TestR2_HardThresholdZeroByteLoop(unittest.TestCase):
             except _StopAfterNSleeps as e:
                 raised = e
             except SystemExit as e:
-                # Acceptable: guard.start_guard could exit cleanly with a diagnostic
-                self.assertNotEqual(e.code, 0, "Loop must NOT exit silently with 0")
+                # Acceptable: guard.start_guard exits cleanly after detecting
+                # sustained 0-byte HARDs and emitting a diagnostic. The handoff
+                # specifies sys.exit(0) — what matters is that the loop did NOT
+                # silently iterate forever. Any number of sleeps strictly fewer
+                # than max_cycles proves the loop bounded itself.
+                self.assertIn(e.code, (0, None, 1, 2), f"unexpected exit code {e.code}")
+                self.assertLess(
+                    len(sleep_calls), max_cycles,
+                    f"Loop exited but recorded {len(sleep_calls)} sleeps "
+                    f"(>= max_cycles={max_cycles}); back-off was ineffective.",
+                )
                 return  # PASS — exit-with-diagnostic counts as a back-off behavior
             except Exception as e:
                 raised = e
