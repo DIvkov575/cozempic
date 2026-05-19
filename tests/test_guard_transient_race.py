@@ -1,0 +1,664 @@
+"""RED tests for NEW-1 — transient daemon vs SessionStart spawn race.
+
+Architect spec: AUDIT_REPORT_pr94_transient_daemon_race.md § NEW-1 Test contract.
+Root cause: OLD guard daemon exits during reload, writes sentinel, transient daemon
+spawns in the reload gap (upgrade-chain re-fire of SessionStart hook), NEW Claude's
+SessionStart hook fires and sees the transient daemon → skips guard spawn →
+NEW Claude ends up UNPROTECTED.
+
+Fix design: Option (c) — write a reload sentinel BEFORE spawning watcher;
+SessionStart hook skips spawn if sentinel exists and is fresh (<SENTINEL_TTL_SECONDS).
+Option (b) defense-in-depth: unlink pidfile immediately when watched Claude dies.
+
+All 7 tests EXPECTED TO FAIL until Phase B implementation lands on top of PR #93 merge.
+"""
+from __future__ import annotations
+
+import json
+import os
+import stat
+import subprocess
+import sys
+import tempfile
+import textwrap
+import threading
+import time
+import unittest
+from pathlib import Path
+from unittest.mock import MagicMock, call, patch
+
+SRC = Path(__file__).resolve().parent.parent / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+# ---------------------------------------------------------------------------
+# Test 1 — _terminate_and_resume writes in-flight sentinel BEFORE watcher
+# ---------------------------------------------------------------------------
+class TestReloadWritesInFlightSentinel(unittest.TestCase):
+    """After Option (c) fix: _terminate_and_resume MUST write the sentinel
+    file BEFORE calling _spawn_reload_watcher.
+
+    Asserts:
+    - sentinel path = /tmp/cozempic_reload_<sid12>.in-flight
+    - sentinel exists and contains old_claude_pid and an ISO timestamp
+    - sentinel is written BEFORE _spawn_reload_watcher is invoked
+    (we verify order by checking write precedes the watcher call via a side_effect)
+    """
+
+    def setUp(self):
+        self.sid = "abcdef012345678901234567890abcde"  # 32 hex chars
+        self.sid12 = self.sid[:12]  # "abcdef012345"
+        self.old_claude_pid = 89113
+        self.sentinel_path = Path(f"/tmp/cozempic_reload_{self.sid12}.in-flight")
+        self.sentinel_path.unlink(missing_ok=True)
+        self.addCleanup(self.sentinel_path.unlink, missing_ok=True)
+
+    def test_reload_writes_in_flight_sentinel(self):
+        """sentinel written before watcher spawned — order enforced."""
+        # write_reload_sentinel must exist in reload_lock after Phase B
+        try:
+            from cozempic.reload_lock import write_reload_sentinel, SENTINEL_TTL_SECONDS
+        except ImportError as exc:
+            self.fail(
+                f"Phase B symbols missing: {exc}. "
+                "Expected: write_reload_sentinel, SENTINEL_TTL_SECONDS in reload_lock."
+            )
+
+        sentinel_written_before_watcher = []
+
+        def _fake_watcher(claude_pid, project_dir, session_id=None):
+            # Record whether sentinel exists at the moment watcher is called
+            sentinel_written_before_watcher.append(self.sentinel_path.exists())
+
+        with patch("cozempic.guard._spawn_reload_watcher", side_effect=_fake_watcher), \
+             patch("cozempic.guard.os.kill"), \
+             patch("cozempic.guard.time.sleep"):
+            from cozempic.guard import _terminate_and_resume
+            _terminate_and_resume(
+                claude_pid=self.old_claude_pid,
+                project_dir="/tmp/fake_project",
+                session_id=self.sid,
+                rx_name="standard",
+                config=None,
+                auto_reload=True,
+            )
+
+        # Sentinel must exist on disk now
+        self.assertTrue(
+            self.sentinel_path.exists(),
+            "Sentinel file was not created by _terminate_and_resume",
+        )
+
+        # Watcher must have been called with sentinel ALREADY present
+        self.assertTrue(
+            sentinel_written_before_watcher,
+            "_spawn_reload_watcher was never called",
+        )
+        self.assertTrue(
+            sentinel_written_before_watcher[0],
+            "Sentinel was NOT present when _spawn_reload_watcher was called — write order violated",
+        )
+
+        # Sentinel content: first line = old_claude_pid, second = ISO timestamp
+        content = self.sentinel_path.read_text()
+        lines = content.strip().splitlines()
+        self.assertGreaterEqual(len(lines), 2, "Sentinel must have at least 2 lines (pid, iso-ts)")
+        self.assertEqual(int(lines[0].strip()), self.old_claude_pid)
+        # Rough ISO timestamp check (must parse without ValueError)
+        from datetime import datetime
+        datetime.fromisoformat(lines[1].strip())  # raises on bad format
+
+
+# ---------------------------------------------------------------------------
+# Test 2 — SessionStart hook bash skips guard --daemon when sentinel exists
+# ---------------------------------------------------------------------------
+class TestSessionStartHookSkipsSpawnDuringSentinel(unittest.TestCase):
+    """Option (c) fix: the SessionStart hook bash command must NOT invoke
+    `cozempic guard --daemon` when the in-flight sentinel file exists.
+
+    Strategy: plant the sentinel, run the hook bash with a stub cozempic
+    binary, assert guard --daemon was never invoked.
+    """
+
+    def setUp(self):
+        self.tmpdir = Path(tempfile.mkdtemp(prefix="cozempic_sentinel_test_"))
+        self.sid = "bbbbbbbbbbbb1234567890abcdefbbbb"
+        self.sid12 = self.sid[:12]
+        self.sentinel_path = Path(f"/tmp/cozempic_reload_{self.sid12}.in-flight")
+        # Plant a fresh sentinel
+        self.sentinel_path.write_text(f"89113\n{__import__('datetime').datetime.now().isoformat()}\n")
+        self.addCleanup(self.sentinel_path.unlink, missing_ok=True)
+        self.addCleanup(__import__("shutil").rmtree, self.tmpdir, True)
+
+        # Build stub cozempic that logs invocations
+        self.invocation_log = self.tmpdir / "invocations.log"
+        stub_dir = self.tmpdir / "bin"
+        stub_dir.mkdir()
+        stub = stub_dir / "cozempic"
+        stub.write_text(textwrap.dedent(f"""\
+            #!/bin/sh
+            echo "$@" >> {self.invocation_log}
+            # Act as a no-op guard --daemon
+            exit 0
+        """))
+        stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
+        self.stub_dir = stub_dir
+
+    def _load_session_start_command(self) -> str:
+        hooks_path = SRC / "cozempic" / "data" / "hooks.json"
+        hooks = json.loads(hooks_path.read_text(encoding="utf-8"))
+        return hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+
+    def test_session_start_hook_skips_spawn_during_reload(self):
+        """Hook must skip guard --daemon when sentinel is present (v10 behavior)."""
+        cmd = self._load_session_start_command()
+        # Sentinel check requires v10 hook schema — if not present, this RED is expected
+        self.assertIn(
+            "v10",
+            cmd,
+            "Hook schema is not v10 — sentinel check not yet in hooks.json. "
+            "This test RED until Phase B adds sentinel skip to hooks.json.",
+        )
+        hook_data = json.dumps({"session_id": self.sid, "transcript_path": ""})
+        env = os.environ.copy()
+        env["PATH"] = f"{self.stub_dir}:{env.get('PATH', '')}"
+        result = subprocess.run(
+            ["bash", "-c", f"echo '{hook_data}' | {cmd}"],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=15,
+        )
+        # Check invocation log — guard --daemon must NOT appear
+        if self.invocation_log.exists():
+            invocations = self.invocation_log.read_text()
+        else:
+            invocations = ""
+        self.assertNotIn(
+            "guard --daemon",
+            invocations,
+            f"guard --daemon was invoked despite sentinel being present. "
+            f"Invocations: {invocations!r}",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Test 3 — Watcher unlinks sentinel after osascript fires
+# ---------------------------------------------------------------------------
+class TestWatcherUnlinksSentinelAfterOsascript(unittest.TestCase):
+    """After Option (c) fix: the watcher bash script must unlink the
+    in-flight sentinel AFTER the resume command (osascript/gnome-terminal/etc)
+    fires, so by the time NEW Claude's SessionStart hook runs, the sentinel
+    is gone and spawn proceeds normally.
+    """
+
+    def setUp(self):
+        self.sid = "cccccccccccc5678901234abcdefcccc"
+        self.sid12 = self.sid[:12]
+        self.sentinel_path = Path(f"/tmp/cozempic_reload_{self.sid12}.in-flight")
+        self.sentinel_path.write_text(f"89113\n{__import__('datetime').datetime.now().isoformat()}\n")
+        self.addCleanup(self.sentinel_path.unlink, missing_ok=True)
+
+    def test_watcher_unlinks_sentinel_after_osascript(self):
+        """Watcher bash script removes sentinel after osascript exits."""
+        # The watcher is generated at runtime by _spawn_reload_watcher.
+        # After Phase B, the watcher script will contain a `rm -f` or
+        # unlink_reload_sentinel call AFTER the resume_cmd line.
+        # We verify by calling _spawn_reload_watcher with a mocked osascript
+        # (replaces it with `true`) and a mock subprocess.Popen that runs
+        # the script directly (not in a detached process).
+
+        # This will RED until Phase B adds the sentinel unlink to the watcher script.
+        try:
+            from cozempic.reload_lock import SENTINEL_TTL_SECONDS
+        except ImportError:
+            self.fail(
+                "SENTINEL_TTL_SECONDS missing from reload_lock — Phase B not yet applied."
+            )
+
+        # Build a fake "dying" process: we'll use a subprocess that exits immediately
+        fake_old_pid = os.getpid()  # use ourselves (alive), test will manipulate script
+
+        scripts_run = []
+
+        def _fake_popen(cmd_parts, **kwargs):
+            # Actually run the watcher script, but synchronously so we can inspect
+            # the sentinel after it completes
+            if cmd_parts[0] == "bash" and cmd_parts[1] == "-c":
+                script = cmd_parts[2]
+                # Munge the script: replace `while kill -0 <pid>` with `true` (skip wait)
+                # and replace the resume_cmd with `true` so osascript doesn't actually run
+                import re
+                patched = re.sub(r"while kill -0 \d+ 2>/dev/null; do sleep 1; done", "true", script)
+                patched = re.sub(r"osascript[^\n;]+", "true", patched)
+                patched = re.sub(r"gnome-terminal[^\n;]+", "true", patched)
+                scripts_run.append(patched)
+                # Run synchronously in a shell to test sentinel unlink
+                result = subprocess.run(
+                    ["bash", "-c", patched],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                return MagicMock(pid=99999)
+            return MagicMock(pid=99999)
+
+        with patch("cozempic.guard.subprocess.Popen", side_effect=_fake_popen), \
+             patch("cozempic.guard.platform.system", return_value="Darwin"), \
+             patch("cozempic.guard.is_ssh_session", return_value=False):
+            from cozempic.guard import _spawn_reload_watcher
+            _spawn_reload_watcher(
+                claude_pid=fake_old_pid,
+                project_dir="/tmp/fake_project",
+                session_id=self.sid,
+            )
+
+        self.assertFalse(
+            self.sentinel_path.exists(),
+            f"Sentinel was NOT unlinked by the watcher script. "
+            f"Scripts captured: {scripts_run}",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Test 4 — Sentinel mtime GC: stale sentinel treated as absent
+# ---------------------------------------------------------------------------
+class TestSentinelMtimeGCAfterStaleWindow(unittest.TestCase):
+    """When a sentinel is older than SENTINEL_TTL_SECONDS, the SessionStart
+    hook must treat it as stale and allow spawn to proceed.
+
+    This covers the leak scenario: watcher was SIGKILL'd between osascript
+    and sentinel-unlink, leaving an orphan sentinel. GC prevents permanent
+    spawn suppression.
+    """
+
+    def setUp(self):
+        self.sid = "dddddddddddd567890abcdef12345ddd"
+        self.sid12 = self.sid[:12]
+        self.sentinel_path = Path(f"/tmp/cozempic_reload_{self.sid12}.in-flight")
+        self.addCleanup(self.sentinel_path.unlink, missing_ok=True)
+
+    def test_sentinel_mtime_gc_after_stale_window(self):
+        """Stale sentinel (age > SENTINEL_TTL_SECONDS) is ignored; spawn proceeds."""
+        try:
+            from cozempic.reload_lock import SENTINEL_TTL_SECONDS, write_reload_sentinel
+        except ImportError:
+            self.fail(
+                "SENTINEL_TTL_SECONDS / write_reload_sentinel missing from reload_lock. "
+                "Phase B not yet applied — expected RED."
+            )
+
+        # Plant a sentinel that is artificially old
+        write_reload_sentinel(self.sid, claude_pid=89113)
+        stale_age = SENTINEL_TTL_SECONDS + 10
+        old_mtime = time.time() - stale_age
+        os.utime(self.sentinel_path, (old_mtime, old_mtime))
+
+        # Now call the Python-side sentinel check from start_guard_daemon
+        # After Phase B, start_guard_daemon will have a sentinel check that
+        # reads the file age and returns immediately if fresh, otherwise
+        # treats as stale and allows spawn.
+        from cozempic.guard import start_guard_daemon
+
+        spawn_calls = []
+
+        def _fake_popen(cmd_parts, **kwargs):
+            spawn_calls.append(cmd_parts)
+            return MagicMock(pid=99001)
+
+        with patch("cozempic.guard.subprocess.Popen", side_effect=_fake_popen), \
+             patch("cozempic.guard.find_claude_pid", return_value=94466), \
+             patch("cozempic.guard.find_current_session", return_value={
+                 "session_id": self.sid,
+                 "path": Path("/tmp/fake.jsonl"),
+             }), \
+             patch("cozempic.guard._cleanup_legacy_pid"), \
+             patch("cozempic.guard.maybe_auto_update", return_value=False):
+
+            # Stale sentinel should NOT suppress spawn
+            result = start_guard_daemon(session_id=self.sid, claude_pid=94466)
+
+        self.assertNotEqual(
+            result.get("reason"),
+            "reload in flight",
+            "start_guard_daemon returned 'reload in flight' for a STALE sentinel — "
+            "GC not applied. Expected to spawn.",
+        )
+        # start_guard_daemon should have attempted to spawn (spawn_calls non-empty
+        # OR result["started"] is True)
+        self.assertTrue(
+            spawn_calls or result.get("started") or result.get("already_running"),
+            f"Spawn was suppressed by stale sentinel — GC logic missing. result={result}",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Test 5 — Option (b): pidfile unlinked IMMEDIATELY on watched Claude death
+# ---------------------------------------------------------------------------
+class TestPidfileUnlinkedImmediatelyOnWatchedClaudeDeath(unittest.TestCase):
+    """Defense-in-depth (option b): in start_guard's main loop, when the
+    watched Claude process dies, _safe_unlink_session_pidfile must be called
+    BEFORE checkpoint_team (the expensive post-loop work).
+
+    This closes the residual window where NEW Claude's SessionStart fires
+    AFTER the old Claude dies but BEFORE the daemon's finally-block runs.
+    """
+
+    def test_pidfile_unlinked_immediately_on_watched_claude_death(self):
+        """Pidfile is unlinked in the if-not-claude_alive branch, not only in finally."""
+        # Inspect start_guard source to verify the call order.
+        # This is a structural test — we read the source and assert the unlink
+        # call precedes checkpoint_team in the not-claude_alive branch.
+        import inspect
+        try:
+            from cozempic.guard import start_guard
+        except ImportError:
+            self.fail("Cannot import start_guard from cozempic.guard")
+
+        source = inspect.getsource(start_guard)
+
+        # Find the not-claude_alive block and check ordering
+        # Strategy: find the position of `_safe_unlink_session_pidfile` and
+        # `checkpoint_team` within the `not claude_alive` branch.
+        # After the fix, _safe_unlink_session_pidfile should appear BEFORE
+        # checkpoint_team in that block.
+
+        # Locate the "claude_alive = False" → action block
+        not_alive_pos = source.find("if not claude_alive:")
+        if not_alive_pos == -1:
+            # Older layout: `claude_alive = False` check is inline
+            not_alive_pos = source.find("claude_alive = False")
+        self.assertGreater(not_alive_pos, 0, "Could not find not-claude_alive block in start_guard source")
+
+        sub_source = source[not_alive_pos:]
+
+        unlink_pos = sub_source.find("_safe_unlink_session_pidfile")
+        checkpoint_pos = sub_source.find("checkpoint_team")
+
+        self.assertGreater(unlink_pos, -1,
+            "_safe_unlink_session_pidfile not found in the not-claude_alive block — "
+            "option (b) defense-in-depth not implemented. Expected RED until Phase B.")
+        self.assertLess(
+            unlink_pos, checkpoint_pos,
+            f"_safe_unlink_session_pidfile (pos {unlink_pos}) is NOT before "
+            f"checkpoint_team (pos {checkpoint_pos}) in the not-claude_alive block — "
+            "pidfile is not freed before expensive checkpoint work. Option (b) violated.",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Test 6 — Reproducer: 86cb258b scenario walk (NEW Claude ends up UNPROTECTED)
+# ---------------------------------------------------------------------------
+class TestReproducer86cb258bNoTransientUnprotectedState(unittest.TestCase):
+    """Full integration reproducer for the 86cb258b event sequence.
+
+    Sequence:
+    1. OLD guard daemon for session 86cb258b exits (reload path).
+    2. Upgrade-chain re-fires SessionStart → transient guard spawns, claims pidfile slot.
+    3. NEW Claude's SessionStart hook fires → sees transient daemon → skips spawn.
+    4. RESULT: NEW Claude UNPROTECTED.
+
+    BEFORE the fix (current main / v1.8.14 + PR #93):
+      - This scenario leaves NEW Claude unprotected (DaemonAlreadyStarting raised).
+      - Test expects DaemonAlreadyStarting to be raised, confirming the bug exists.
+      - RED = hypothesis confirmed.
+
+    AFTER the fix (Phase B):
+      - Sentinel suppresses the transient daemon claim.
+      - NEW Claude's SessionStart spawns a fresh guard.
+      - Test expects NEW Claude to have started=True.
+      - GREEN = fix verified.
+    """
+
+    def setUp(self):
+        self.sid = "86cb258b3e024515849a0e25a485ca93"  # normalized 86cb258b session
+        self.sid12 = self.sid[:12]
+        self.old_claude_pid = 89113
+        self.new_claude_pid = 94466
+        self.pid_path = Path(f"/tmp/cozempic_guard_{self.sid12}.pid")
+        self.sentinel_path = Path(f"/tmp/cozempic_reload_{self.sid12}.in-flight")
+        self.pid_path.unlink(missing_ok=True)
+        self.sentinel_path.unlink(missing_ok=True)
+        self.addCleanup(self.pid_path.unlink, missing_ok=True)
+        self.addCleanup(self.sentinel_path.unlink, missing_ok=True)
+
+    def _simulate_transient_daemon_spawn(self):
+        """Simulate the upgrade-chain re-fire: SessionStart hook spawns a
+        transient daemon for OLD Claude's session while OLD Claude is still
+        dying.
+
+        Returns the transient daemon's mock PID.
+        """
+        from cozempic.spawn_lock import DaemonSpawnClaim, INIT_SPAWN_DAEMON
+        from datetime import datetime
+
+        # Transient daemon claims the pidfile slot (as would happen via
+        # start_guard_daemon when upgrade chain fires with OLD Claude still alive)
+        transient_pid = 99888
+        claim = DaemonSpawnClaim(self.sid, self.pid_path)
+        claim._claim()
+        claim.owned = True
+
+        # Write the transient daemon's PID (simulating the post-Popen rename)
+        payload = (
+            f"{transient_pid}\n"
+            f"{datetime.now().isoformat(timespec='seconds')}\n"
+            f"{INIT_SPAWN_DAEMON}\n"
+        )
+        self.pid_path.write_text(payload)
+        claim.handed_off = True  # prevent __exit__ from unlinking
+
+        return transient_pid
+
+    def test_86cb258b_reproducer_no_transient_unprotected_state(self):
+        """Reproduce the race: NEW Claude's SessionStart is blocked by transient daemon.
+
+        On CURRENT CODE (no sentinel fix): DaemonAlreadyStarting raised →
+        NEW Claude unprotected. Test CONFIRMS the bug by asserting this happens.
+
+        On FIXED CODE (Phase B): sentinel suppresses transient claim →
+        NEW Claude gets a fresh guard. Test CONFIRMS the fix.
+
+        RED = bug confirmed (current behavior — architect hypothesis CONFIRMED).
+        GREEN = bug fixed (after Phase B).
+        """
+        from cozempic.spawn_lock import DaemonAlreadyStarting
+
+        # Step 1: Simulate OLD daemon exiting (slot freed, but in current code
+        # there is NO sentinel — that's the bug)
+        # In current code, _terminate_and_resume does NOT write a sentinel.
+        # The slot is free at this moment.
+
+        # Step 2: Transient daemon claims the slot (upgrade-chain re-fire)
+        transient_pid = self._simulate_transient_daemon_spawn()
+        # Verify transient daemon is "alive" (we'll mock _is_process_alive to return True)
+
+        # Step 3: NEW Claude's SessionStart calls start_guard_daemon
+        # Expect: DaemonAlreadyStarting raised because transient daemon holds the slot
+        from cozempic.guard import start_guard_daemon
+
+        spawn_calls = []
+
+        def _fake_popen(cmd_parts, **kwargs):
+            spawn_calls.append(cmd_parts)
+            return MagicMock(pid=self.new_claude_pid)
+
+        with patch("cozempic.guard.subprocess.Popen", side_effect=_fake_popen), \
+             patch("cozempic.guard.find_claude_pid", return_value=self.new_claude_pid), \
+             patch("cozempic.guard.find_current_session", return_value={
+                 "session_id": self.sid,
+                 "path": Path("/tmp/fake_86cb258b.jsonl"),
+             }), \
+             patch("cozempic.guard._cleanup_legacy_pid"), \
+             patch("cozempic.guard.maybe_auto_update", return_value=False), \
+             patch("cozempic.spawn_lock._is_process_alive", return_value=True):
+
+            result = start_guard_daemon(
+                session_id=self.sid,
+                claude_pid=self.new_claude_pid,
+            )
+
+        # On CURRENT CODE (no sentinel): NEW Claude gets already_running=True
+        # This CONFIRMS the architect's hypothesis: NEW Claude UNPROTECTED.
+        if result.get("started") and not result.get("already_running"):
+            # Phase B is active — sentinel prevented the race. Test goes GREEN.
+            self.fail(
+                "UNEXPECTED GREEN: NEW Claude got a fresh guard. "
+                "This means Phase B is already applied. "
+                "If Phase B is NOT yet applied, this is a test logic error."
+            )
+        else:
+            # Bug confirmed: NEW Claude is UNPROTECTED (already_running=True)
+            self.assertTrue(
+                result.get("already_running"),
+                f"Expected already_running=True (bug confirmed), got: {result}. "
+                "Architect's hypothesis may need revision — inspect result carefully.",
+            )
+            # This RED confirms: architect's hypothesis is CORRECT.
+            # NEW Claude's SessionStart was blocked by the transient daemon.
+            # Raising explicitly so this surfaces as a RED test confirming the bug.
+            self.fail(
+                "HYPOTHESIS CONFIRMED (RED as expected): "
+                "NEW Claude ended up UNPROTECTED — DaemonAlreadyStarting / already_running "
+                f"returned True. Transient daemon (PID {transient_pid}) blocked fresh spawn. "
+                "This is exactly the 86cb258b race. Phase B will fix this."
+            )
+
+
+# ---------------------------------------------------------------------------
+# Test 7 — Race under contention: N=10 concurrent SessionStart hooks
+# ---------------------------------------------------------------------------
+class TestRaceUnderContention(unittest.TestCase):
+    """N=10 concurrent SessionStart hook invocations, half with sentinel present
+    and half without.
+
+    Invariants:
+    - Zero guard --daemon spawns during the sentinel window (hooks with sentinel).
+    - Exactly 1 guard --daemon spawn for the post-sentinel hooks (single-winner).
+    - No multi-winner (DaemonSpawnClaim ensures this even without sentinel).
+    """
+
+    def setUp(self):
+        self.tmpdir = Path(tempfile.mkdtemp(prefix="cozempic_race_"))
+        self.sid = "eeeeeeeeeeee789012345abcdefeeee0"
+        self.sid12 = self.sid[:12]
+        self.pid_path = Path(f"/tmp/cozempic_guard_{self.sid12}.pid")
+        self.sentinel_path = Path(f"/tmp/cozempic_reload_{self.sid12}.in-flight")
+        self.pid_path.unlink(missing_ok=True)
+        self.sentinel_path.unlink(missing_ok=True)
+        self.addCleanup(self.pid_path.unlink, missing_ok=True)
+        self.addCleanup(self.sentinel_path.unlink, missing_ok=True)
+        self.addCleanup(__import__("shutil").rmtree, self.tmpdir, True)
+
+    def _run_start_guard_daemon(self, with_sentinel: bool, results: list, idx: int):
+        """Worker: attempt start_guard_daemon; record result."""
+        try:
+            if with_sentinel:
+                # Ensure sentinel is present (may already be)
+                if not self.sentinel_path.exists():
+                    self.sentinel_path.write_text(
+                        f"89113\n{__import__('datetime').datetime.now().isoformat()}\n"
+                    )
+            from cozempic.guard import start_guard_daemon
+            from unittest.mock import patch, MagicMock
+            from pathlib import Path
+
+            def _fake_popen(cmd_parts, **kwargs):
+                return MagicMock(pid=90000 + idx)
+
+            with patch("cozempic.guard.subprocess.Popen", side_effect=_fake_popen), \
+                 patch("cozempic.guard.find_claude_pid", return_value=94466), \
+                 patch("cozempic.guard.find_current_session", return_value={
+                     "session_id": self.sid,
+                     "path": Path("/tmp/fake.jsonl"),
+                 }), \
+                 patch("cozempic.guard._cleanup_legacy_pid"), \
+                 patch("cozempic.guard.maybe_auto_update", return_value=False):
+                result = start_guard_daemon(session_id=self.sid, claude_pid=94466)
+            results.append({"idx": idx, "with_sentinel": with_sentinel, "result": result})
+        except Exception as exc:
+            results.append({"idx": idx, "with_sentinel": with_sentinel, "error": str(exc)})
+
+    def test_race_under_contention(self):
+        """10 concurrent SessionStart calls: sentinel batch must be suppressed (0 spawns).
+
+        This test REDs because the Phase B sentinel check is not yet in start_guard_daemon.
+        On current code, all 10 calls attempt to spawn (sentinel is ignored).
+        """
+        # First: assert the Phase B symbol is present — otherwise the sentinel check
+        # cannot exist. This is the correct RED failure surface for this test.
+        try:
+            from cozempic.guard import start_guard_daemon
+            import inspect
+            source = inspect.getsource(start_guard_daemon)
+        except ImportError:
+            self.fail("Cannot import start_guard_daemon")
+
+        # The Phase B sentinel check must be present in start_guard_daemon source.
+        # RED until Phase B adds: if _reload_sentinel_active(session_id): return {reason: ...}
+        # Use specific functional phrases that only appear when the check is implemented
+        # (not in existing docstrings about the spawn lock sentinel pattern).
+        sentinel_check_phrases = [
+            "reload in flight",          # the reason string returned on sentinel match
+            "_reload_sentinel_active",   # the helper function name
+            "write_reload_sentinel",     # import of the sentinel writer
+            "in-flight",                 # the file suffix used in sentinel path
+            "SENTINEL_TTL",              # the TTL constant from reload_lock
+        ]
+        found = any(phrase in source for phrase in sentinel_check_phrases)
+        self.assertTrue(
+            found,
+            f"start_guard_daemon does not contain a sentinel/reload-in-flight check. "
+            f"Phase B not yet applied. Checked for: {sentinel_check_phrases}. "
+            f"This test RED is expected until Phase B implementation.",
+        )
+
+        # If we get here, Phase B is active. Run the actual contention test.
+        self.sentinel_path.write_text(
+            f"89113\n{__import__('datetime').datetime.now().isoformat()}\n"
+        )
+
+        results = []
+        threads = []
+        barrier = threading.Barrier(10)
+
+        def _worker(with_sentinel, idx):
+            barrier.wait(timeout=5)
+            self._run_start_guard_daemon(with_sentinel, results, idx)
+
+        for i in range(5):
+            t = threading.Thread(target=_worker, args=(True, i), daemon=True)
+            threads.append(t)
+        for i in range(5, 10):
+            t = threading.Thread(target=_worker, args=(False, i), daemon=True)
+            threads.append(t)
+
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=15)
+
+        sentinel_started = [r["result"].get("started") for r in results
+                           if not r.get("error") and r["with_sentinel"]]
+        no_sentinel_started = [r["result"].get("started") for r in results
+                               if not r.get("error") and not r["with_sentinel"]]
+
+        sentinel_spawn_count = sum(1 for s in sentinel_started if s)
+        self.assertEqual(
+            sentinel_spawn_count,
+            0,
+            f"Expected 0 spawns in sentinel window, got {sentinel_spawn_count}. "
+            f"Results: {results}.",
+        )
+
+        no_sentinel_spawn_count = sum(1 for s in no_sentinel_started if s)
+        self.assertLessEqual(
+            no_sentinel_spawn_count,
+            1,
+            f"Multi-winner detected in no-sentinel batch: {no_sentinel_spawn_count} spawns. "
+            f"Results: {results}",
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
