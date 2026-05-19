@@ -47,6 +47,48 @@ HARD_LOOP_BACKOFF_START = 3
 HARD_LOOP_BACKOFF_CAP_SECONDS = 300
 HARD_LOOP_EXIT_THRESHOLD = 10
 
+
+# ── Hard cap: K=10 exit deferral when agents_active (PR #93 item #4) ────────
+# When K reaches HARD_LOOP_EXIT_THRESHOLD (=10) AND `agents_active=True`,
+# the daemon used to `sys.exit(0)` mid-task, killing the subagents'
+# protection AND telling the operator to `/clear` (which destroys
+# subagent state). PR #93 defers the exit while agents are running and
+# only exits at the HARD cap below — giving subagents a chance to
+# finish before context dies.
+#
+# Default cap K=50 ≈ 4 hours wall time at the backoff cap (300s/cycle),
+# well past any normal subagent batch but short enough that a stuck
+# session doesn't outlive an operator's workday.
+#
+# Override via env var COZEMPIC_GUARD_HARD_EXIT_K (sister-module
+# precedent: spawn_lock._read_fresh_window_seconds clamps + falls back
+# on garbage). Read EXACTLY ONCE at module import time — requires a
+# daemon restart to take effect (same convention as
+# COZEMPIC_PIDFILE_FRESH_SECONDS).
+def _read_hard_exit_threshold() -> int:
+    """Read COZEMPIC_GUARD_HARD_EXIT_K env var. Clamps to (10, 1000].
+
+    Read at module import time only — restart the daemon to apply
+    a new value. Invalid values (non-numeric, <=K=10, > 1000) fall
+    back to the default 50.
+    """
+    raw = os.environ.get("COZEMPIC_GUARD_HARD_EXIT_K")
+    if raw is None:
+        return 50
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        return 50
+    # Must be strictly > HARD_LOOP_EXIT_THRESHOLD (otherwise no defer
+    # window). Cap at 1000 to prevent absurd values (~3.5 days at 5min
+    # cap) from silently disabling the circuit breaker.
+    if val <= HARD_LOOP_EXIT_THRESHOLD or val > 1000:
+        return 50
+    return val
+
+
+HARD_LOOP_HARD_EXIT_THRESHOLD = _read_hard_exit_threshold()
+
 from ._validation import ConfigError
 from .executor import run_prescription
 from .helpers import is_ssh_session, shell_quote
@@ -421,6 +463,9 @@ def start_guard(
     cycle_count = 0
     last_team_hash = ""
     consecutive_empty_hard_prunes = 0
+    # PR #93 item #4: one-shot flag so the "deferring K=10 exit" log
+    # line only emits once per defer-window, not every cycle.
+    deferred_exit_announced = False
 
     try:
         while True:
@@ -577,29 +622,95 @@ def start_guard(
                     # in production). Exit gracefully and let the SessionStart
                     # hook respawn on next activity. Do NOT change reload-trigger
                     # gating in guard_prune_cycle — that's not the right escape.
+                    #
+                    # PR #93 item #4: defer the exit when `agents_active=True`.
+                    # Killing the daemon mid-task destroys subagent protection
+                    # AND the diagnostic recommends `/clear` (which also
+                    # destroys subagent state). Hard cap at
+                    # HARD_LOOP_HARD_EXIT_THRESHOLD (default 50, override via
+                    # COZEMPIC_GUARD_HARD_EXIT_K) ensures eventual exit so a
+                    # stuck `extract_team_state` (BUG-G15 family) can't wedge
+                    # the daemon forever.
                     if consecutive_empty_hard_prunes >= HARD_LOOP_EXIT_THRESHOLD:
-                        try:
-                            checkpoint_team(session_path=session_path, quiet=True)
-                        except Exception:
-                            # Checkpoint failure must not prevent exit — final
-                            # checkpoint is best-effort here; the SOFT loop above
-                            # has been writing checkpoints every cycle for the
-                            # entire run, so on-disk state is already current.
-                            pass
-                        print(
-                            f"  [{_now()}] Guard powerless against live-context "
-                            f"dominance ({HARD_LOOP_EXIT_THRESHOLD} consecutive "
-                            f"0-byte HARD prunes). Exiting — NO further guard "
-                            f"protection in this session. SessionStart fires only "
-                            f"on startup/resume/clear, NOT on tool calls or "
-                            f"message turns, so the daemon will NOT auto-respawn "
-                            f"while the session continues. To re-enable cozempic: "
-                            f"type /clear or restart the session. Recommended: "
-                            f"split work across fresh sessions to avoid >55% "
-                            f"context dominance by immutable tool-result blocks.",
-                            flush=True,
-                        )
-                        sys.exit(0)
+                        if (
+                            agents_active
+                            and consecutive_empty_hard_prunes < HARD_LOOP_HARD_EXIT_THRESHOLD
+                        ):
+                            # Defer: stay alive, keep cycling at backoff cap.
+                            if not deferred_exit_announced:
+                                running_count = sum(
+                                    1 for s in state.subagents
+                                    if s.status in ("running", "unknown")
+                                )
+                                worst_case_min = (
+                                    HARD_LOOP_HARD_EXIT_THRESHOLD
+                                    * HARD_LOOP_BACKOFF_CAP_SECONDS
+                                    // 60
+                                )
+                                print(
+                                    f"  [{_now()}] K={consecutive_empty_hard_prunes} "
+                                    f"reached normal exit threshold "
+                                    f"({HARD_LOOP_EXIT_THRESHOLD}) but "
+                                    f"{running_count} subagent(s) still active. "
+                                    f"Deferring daemon exit until agents quiesce "
+                                    f"or K reaches hard cap "
+                                    f"({HARD_LOOP_HARD_EXIT_THRESHOLD}, "
+                                    f"~{worst_case_min} min worst case).",
+                                    flush=True,
+                                )
+                                deferred_exit_announced = True
+                            # Fall through to the back-off sleep below.
+                            # We do NOT sys.exit while agents are working.
+                        else:
+                            # Either no agents (original K=10 exit) OR hard
+                            # cap reached even with agents (circuit breaker).
+                            try:
+                                checkpoint_team(session_path=session_path, quiet=True)
+                            except Exception:
+                                # Checkpoint failure must not prevent exit —
+                                # final checkpoint is best-effort here; the
+                                # SOFT loop above has been writing checkpoints
+                                # every cycle for the entire run, so on-disk
+                                # state is already current.
+                                pass
+                            if (
+                                agents_active
+                                and consecutive_empty_hard_prunes >= HARD_LOOP_HARD_EXIT_THRESHOLD
+                            ):
+                                # Hard cap fired with agents still active —
+                                # different diagnostic. Do NOT tell the
+                                # operator to `/clear` (that destroys
+                                # subagent state too).
+                                print(
+                                    f"  [{_now()}] Guard hard-cap exit "
+                                    f"(K={consecutive_empty_hard_prunes} >= "
+                                    f"{HARD_LOOP_HARD_EXIT_THRESHOLD}). "
+                                    f"Subagents are still active; their state "
+                                    f"may be lost on the next compaction. "
+                                    f"Consider letting current subagents "
+                                    f"finish then starting a fresh session.",
+                                    flush=True,
+                                )
+                            else:
+                                # Original K=10 exit (no agents — operator
+                                # can safely `/clear`).
+                                print(
+                                    f"  [{_now()}] Guard powerless against live-context "
+                                    f"dominance ({HARD_LOOP_EXIT_THRESHOLD} consecutive "
+                                    f"0-byte HARD prunes). Exiting — NO further guard "
+                                    f"protection in this session. SessionStart fires only "
+                                    f"on startup/resume/clear, NOT on tool calls or "
+                                    f"message turns, so the daemon will NOT auto-respawn "
+                                    f"while the session continues. To re-enable cozempic: "
+                                    f"type /clear or restart the session. Recommended: "
+                                    f"split work across fresh sessions to avoid >55% "
+                                    f"context dominance by immutable tool-result blocks.",
+                                    flush=True,
+                                )
+                            # _safe_unlink_session_pidfile is called via the
+                            # finally block (PR #93 commit 2) — covers this
+                            # sys.exit path automatically.
+                            sys.exit(0)
 
                     # Back-off path: replace the original fixed-cadence sleep at
                     # the bottom of the loop with an exponentially growing one.
@@ -623,6 +734,10 @@ def start_guard(
                         time.sleep(backoff)
                 else:
                     consecutive_empty_hard_prunes = 0
+                    # Reset the defer announcement so a fresh K-cycle that
+                    # reaches K=10-with-agents will emit the notice again
+                    # (PR #93 item #4 — operator-friendly).
+                    deferred_exit_announced = False
                 print()
 
             # ── Phase 2: SOFT (25%) — gentle, no reload (file maintenance only) ──

@@ -410,26 +410,37 @@ class TestPolishPR93_K10DeferWhenAgentsActive(unittest.TestCase):
 
     def test_hard_cap_exits_with_agents_active(self):
         """Even with agents perma-running, the hard cap must fire eventually.
-        Use a low override via env var to keep the test fast."""
-        with patch.dict(os.environ, {"COZEMPIC_GUARD_HARD_EXIT_K": "15"}):
-            # Re-import to pick up env override at module load time, BUT the
-            # constant is read at module import. The architect spec says
-            # `int(os.environ.get(...))` is evaluated at module load. To
-            # actually exercise the override, we patch the module attribute.
-            import importlib
-            import cozempic.guard as guard_mod
-            importlib.reload(guard_mod)
-            try:
-                self.assertEqual(guard_mod.HARD_LOOP_HARD_EXIT_THRESHOLD, 15)
-                # Restore session_path resolution since we reloaded
-                exited, n = self._run_loop(agents_active=True, max_cycles=40)
-                self.assertTrue(
-                    exited,
-                    f"Hard cap K=15 should fire even with agents_active=True. "
-                    f"Got exited=False after {n} cycles.",
-                )
-            finally:
-                importlib.reload(guard_mod)
+        Patch the constant directly rather than env-var-reloading the module
+        so we don't pollute other tests with a leftover overridden value."""
+        import cozempic.guard as guard_mod
+        with patch.object(guard_mod, "HARD_LOOP_HARD_EXIT_THRESHOLD", 15):
+            self.assertEqual(guard_mod.HARD_LOOP_HARD_EXIT_THRESHOLD, 15)
+            exited, n = self._run_loop(agents_active=True, max_cycles=40)
+            self.assertTrue(
+                exited,
+                f"Hard cap K=15 should fire even with agents_active=True. "
+                f"Got exited=False after {n} cycles.",
+            )
+        # After patch exits, constant is restored to module default (50).
+        self.assertEqual(guard_mod.HARD_LOOP_HARD_EXIT_THRESHOLD, 50)
+
+    def test_env_var_overrides_hard_cap(self):
+        """Module-import env var COZEMPIC_GUARD_HARD_EXIT_K is read by
+        _read_hard_exit_threshold and clamped. Test the helper directly
+        (not via importlib.reload which is hard to clean up reliably)."""
+        import cozempic.guard as guard_mod
+        with patch.dict(os.environ, {"COZEMPIC_GUARD_HARD_EXIT_K": "25"}):
+            self.assertEqual(guard_mod._read_hard_exit_threshold(), 25)
+
+    def test_env_var_invalid_falls_back_to_default(self):
+        import cozempic.guard as guard_mod
+        for bad in ("not-a-number", "0", "-5", "10", "9", "10000"):
+            with self.subTest(value=bad):
+                with patch.dict(os.environ, {"COZEMPIC_GUARD_HARD_EXIT_K": bad}):
+                    self.assertEqual(
+                        guard_mod._read_hard_exit_threshold(), 50,
+                        f"invalid value {bad!r} must fall back to default 50",
+                    )
 
 
 # ─── Item #5 — DaemonSpawnClaim metadata parity with _ReloadLock ────────────
