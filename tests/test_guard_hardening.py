@@ -335,9 +335,13 @@ class TestG4_PidfileWriteIsAtomic(unittest.TestCase):
 
         on_disk_pid = None
         if self.pid_path.exists():
+            # PR #93 item #5: pidfile is now 3-line (pid + ts + initiator).
+            # Parse first line only — mirrors the tolerant production
+            # parser in spawn_lock._parse_pidfile_pid.
             try:
-                on_disk_pid = int(self.pid_path.read_text().strip())
-            except (ValueError, OSError):
+                first_line = self.pid_path.read_text().splitlines()[0].strip()
+                on_disk_pid = int(first_line)
+            except (ValueError, OSError, IndexError):
                 on_disk_pid = None
         return results, on_disk_pid
 

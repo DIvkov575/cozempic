@@ -319,13 +319,16 @@ def _classify_tmp_artifacts() -> tuple[list[Path], list[Path], list[Path]]:
     except OSError:
         entries = []
 
+    from .spawn_lock import _parse_pidfile_pid
     for pid_path in entries:
         if _is_protected_tmp_artifact(pid_path.name):
             continue
         slug = pid_path.stem[len("cozempic_guard_"):]  # strip prefix, keep before .pid
-        try:
-            pid = int(pid_path.read_text().strip())
-        except (OSError, ValueError):
+        # Tolerant parse: handles both legacy 1-line and new 3-line
+        # pidfile formats (PR #93 item #5). Returns 0 on garble → we
+        # classify as stale.
+        pid = _parse_pidfile_pid(pid_path)
+        if pid <= 0:
             stale_pids.append(pid_path)
             continue
         if _is_live_guard_pid(pid):
@@ -1062,12 +1065,17 @@ def check_cozempic_daemon_running() -> CheckResult:
     from pathlib import Path as _Path
     import os as _os, glob as _glob
     from .guard import _is_cozempic_guard_process
+    from .spawn_lock import _parse_pidfile_pid
     pids_alive: list[int] = []
     for pidf in _glob.glob("/tmp/cozempic_guard_*.pid"):
+        # Tolerant parse: handles both legacy 1-line and new 3-line
+        # pidfile formats (PR #93 item #5). Returns 0 on garble.
+        pid = _parse_pidfile_pid(_Path(pidf))
+        if pid <= 0:
+            continue
         try:
-            pid = int(_Path(pidf).read_text().strip())
             _os.kill(pid, 0)
-        except (OSError, ValueError):
+        except OSError:
             continue
         # Verify this PID is actually our guard (not a PID-reused stranger)
         if _is_cozempic_guard_process(pid):

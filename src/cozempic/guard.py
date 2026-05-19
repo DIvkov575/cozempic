@@ -1312,7 +1312,14 @@ def _is_guard_running_for_session(session_id: str) -> int | None:
         return None
 
     try:
-        pid = int(pid_path.read_text().strip())
+        # Tolerant parse: handles both legacy 1-line and new 3-line
+        # pidfile formats (PR #93 item #5). Returns 0 on garbled/empty
+        # content — caller's `if pid <= 0` branch then unlinks the stale
+        # file. Replaces `int(read_text().strip())` which would raise
+        # ValueError on 3-line content and (via the except below) skip
+        # the unlink, leaking the stale file.
+        from .spawn_lock import _parse_pidfile_pid
+        pid = _parse_pidfile_pid(pid_path)
         if pid <= 0:
             # Pidfile contains a sentinel/placeholder — treat as stale.
             # Guards against the PID-reuse footgun where os.kill(0, sig)
@@ -1596,15 +1603,54 @@ def start_guard_daemon(
             # non-OSError between write_text and rename used to leak the
             # .pid.tmp orphan; we now unlink it on every failure path.
             try:
+                from .spawn_lock import INIT_SPAWN_DAEMON
+                from datetime import datetime as _dt
                 _tmp_flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
                 if hasattr(os, "O_NOFOLLOW"):
                     _tmp_flags |= os.O_NOFOLLOW
                 _tmp_fd = os.open(str(tmp_path), _tmp_flags, 0o600)
                 try:
-                    os.write(_tmp_fd, f"{proc.pid}\n".encode("utf-8"))
+                    # 3-line payload: pid + iso-timestamp + initiator.
+                    # Mirrors DaemonSpawnClaim._claim and
+                    # reload_lock._ReloadLock._try_create. Operators
+                    # cat-ing the pidfile see immediately who wrote it
+                    # (parent vs daemon) and when (PR #93 item #5).
+                    payload = (
+                        f"{proc.pid}\n"
+                        f"{_dt.now().isoformat(timespec='seconds')}\n"
+                        f"{INIT_SPAWN_DAEMON}\n"
+                    )
+                    os.write(_tmp_fd, payload.encode("utf-8"))
+                    # Fsync the payload to disk BEFORE rename so a power
+                    # loss between rename and parent-dir-fsync can't
+                    # produce a renamed-but-empty pidfile that readers
+                    # then misclassify as garbled (DA round 1 M1).
+                    try:
+                        os.fsync(_tmp_fd)
+                    except OSError:
+                        pass
                 finally:
                     os.close(_tmp_fd)
                 os.rename(str(tmp_path), str(pid_path))
+                # Fsync the parent directory so the rename itself is
+                # durable across abrupt power loss (DA round 1 M1).
+                # Without this, the rename is in the kernel's metadata
+                # journal but not yet on stable storage — a crash
+                # between rename and the next fs commit could roll the
+                # filesystem back to pre-rename state, leaving an
+                # orphan .pid.tmp and no .pid (next spawn would see no
+                # pidfile and start a duplicate daemon).
+                try:
+                    parent_dir = os.path.dirname(str(pid_path)) or "."
+                    _dir_fd = os.open(parent_dir, os.O_RDONLY)
+                    try:
+                        os.fsync(_dir_fd)
+                    finally:
+                        os.close(_dir_fd)
+                except OSError:
+                    # Some filesystems (network FS, tmpfs on certain
+                    # kernels) reject directory fsync — best-effort.
+                    pass
             except Exception:
                 # Unlink any partial .pid.tmp we may have created so a
                 # retry can succeed. unlink is symlink-safe (operates on
@@ -1775,12 +1821,18 @@ def _pid_file_points_to(session_id: str, expected_pid: int) -> bool:
     """CAS helper: return True if the session pid file currently contains
     `expected_pid`. Used before unlink() to avoid clobbering a fresh pid
     file written by a concurrent SessionStart hook.
+
+    Uses ``_parse_pidfile_pid`` so both legacy 1-line and new 3-line
+    pidfile formats parse correctly (PR #93 item #5). A garbled file
+    returns 0 from the parser, which won't match any expected_pid (>0),
+    so the CAS skips the unlink — the conservative behaviour.
     """
     try:
+        from .spawn_lock import _parse_pidfile_pid
         path = _pid_file_for_session(session_id)
         if not path.exists():
             return False
-        return int(path.read_text().strip()) == expected_pid
+        return _parse_pidfile_pid(path) == expected_pid
     except (ValueError, OSError):
         return False
 
@@ -1883,9 +1935,15 @@ def reload_self_daemon(
         pid_path = _pid_file_for_session(session_id)
         try:
             if pid_path.exists():
-                stale_pid = int(pid_path.read_text().strip())
+                from .spawn_lock import _parse_pidfile_pid
+                stale_pid = _parse_pidfile_pid(pid_path)
+                if stale_pid <= 0:
+                    # Garbled or empty — treat as stale and unlink.
+                    pid_path.unlink(missing_ok=True)
+                    stale_pid = 0
                 try:
-                    os.kill(stale_pid, 0)
+                    if stale_pid > 0:
+                        os.kill(stale_pid, 0)
                     # Still alive — leave the pid file alone and let
                     # start_guard_daemon below return already_running.
                 except (ProcessLookupError, PermissionError):

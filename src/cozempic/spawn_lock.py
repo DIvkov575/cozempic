@@ -71,6 +71,7 @@ import re
 import tempfile
 import time
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Iterator
 
@@ -103,6 +104,23 @@ _FRESH_MAX = 300.0
 
 
 def _read_fresh_window_seconds() -> float:
+    """Read the COZEMPIC_PIDFILE_FRESH_SECONDS env var and clamp.
+
+    IMPORTANT: this value is read EXACTLY ONCE at module import time
+    and cached in module-level ``_FRESH_PIDFILE_SECONDS``. Changing
+    the env var at runtime has NO effect on an already-running daemon
+    — the daemon must be restarted (or the module re-imported via
+    ``importlib.reload``) to pick up the new value. This mirrors the
+    "config frozen at process start" convention used for other
+    cozempic env vars (e.g. ``COZEMPIC_GUARD_HARD_EXIT_K`` in guard.py).
+    Operators tuning the fresh window for a fleet should set the env
+    var in their shell rc BEFORE launching Claude Code, not after.
+
+    Clamps to ``(0, _FRESH_MAX]``. Invalid values (non-numeric, NaN,
+    inf, ≤0, > _FRESH_MAX) silently fall back to the default — keeps
+    the daemon working rather than failing at startup over a
+    misconfigured env var. (DA round 1 N3 docstring fold.)
+    """
     raw = os.environ.get("COZEMPIC_PIDFILE_FRESH_SECONDS")
     if raw is None:
         return _DEFAULT_FRESH
@@ -116,6 +134,58 @@ def _read_fresh_window_seconds() -> float:
 
 
 _FRESH_PIDFILE_SECONDS = _read_fresh_window_seconds()
+
+
+# Initiator strings — mirrored from ``reload_lock.INIT_*`` conventions
+# for operator-triage parity. The parent-vs-daemon split is the only
+# meaningful distinction for spawn-claim payloads:
+#
+#   spawn-claim-parent  — written by ``DaemonSpawnClaim._claim`` when
+#                         the SessionStart hook (parent process) wins
+#                         the O_CREAT|O_EXCL race
+#   spawn-claim-daemon  — written by the atomic ``os.rename`` hand-off
+#                         in ``start_guard_daemon`` after Popen
+#
+# Operators inspecting a stale pidfile can ``cat /tmp/cozempic_guard_*.pid``
+# and see immediately who wrote it and when (PR #93 commit 3, item #5).
+INIT_SPAWN_PARENT = "spawn-claim-parent"
+INIT_SPAWN_DAEMON = "spawn-claim-daemon"
+
+
+def _parse_pidfile_pid(pid_path: Path) -> int:
+    """Read PID from a cozempic guard pidfile (1-line or 3-line format).
+
+    Tolerates both:
+      - legacy single-line ``<pid>\\n`` (v1.8.14 and earlier)
+      - new 3-line ``<pid>\\n<iso-timestamp>\\n<initiator>\\n``
+        (v1.8.15+, parity with ``reload_lock._ReloadLock``)
+
+    Returns 0 on any parse failure (missing file, empty file, garbled
+    first line, OSError on read). Callers treat 0 as "no live pid here".
+    Mirrors ``DaemonSpawnClaim._read_existing_pid`` semantics and
+    ``reload_lock._read_lock_metadata``'s tolerant parsing.
+
+    Bash callers (``hooks.json``) should use ``head -n 1 $path`` — they
+    only need line 1 and ``cat`` would feed multi-token output to
+    ``kill -0``, which is undefined-behaviour across shells.
+    """
+    try:
+        content = pid_path.read_text()
+    except OSError:
+        return 0
+    if not content:
+        return 0
+    lines = content.splitlines()
+    if not lines:
+        return 0
+    first = lines[0].strip()
+    if not first:
+        return 0
+    try:
+        pid = int(first)
+    except ValueError:
+        return 0
+    return pid if pid > 0 else 0
 
 
 # Round-3 C2 (Option B) alignment: char class kept relaxed (mirrors
@@ -288,12 +358,20 @@ class DaemonSpawnClaim:
                 holder_pid = self._read_existing_pid()
                 raise DaemonAlreadyStarting(self.session_id, holder_pid=holder_pid)
 
-        # Won the claim. Write our parent PID so concurrent readers see a
-        # real, alive PID (not a placeholder) until we hand off the real
-        # daemon PID via tmp+rename. This is the inverse of the prior
-        # placeholder "0" pattern: we publish a meaningful pid immediately.
+        # Won the claim. Write our parent PID + timestamp + initiator
+        # so concurrent readers see a real, alive PID (not a placeholder)
+        # AND operators inspecting the pidfile have triage metadata.
+        # Three-line payload mirrors ``reload_lock._ReloadLock._try_create``
+        # (PR #93 commit 3, item #5 — operator-triage parity). Readers
+        # use ``_parse_pidfile_pid`` which tolerates both 1-line legacy
+        # and 3-line new formats.
         try:
-            os.write(fd, f"{os.getpid()}\n".encode("utf-8"))
+            payload = (
+                f"{os.getpid()}\n"
+                f"{datetime.now().isoformat(timespec='seconds')}\n"
+                f"{INIT_SPAWN_PARENT}\n"
+            )
+            os.write(fd, payload.encode("utf-8"))
         finally:
             os.close(fd)
         self.owned = True
@@ -305,29 +383,34 @@ class DaemonSpawnClaim:
         that just wrote a real PID may have that PID die between the
         write and our read (test mock, fast crash, PID reuse). A fresh
         file with a dead PID is still a peer claim, not a stale file.
+
+        EACCES handling (DA round 1 M2): if we can't stat() the file
+        (PermissionError — e.g. multi-user /tmp with restrictive
+        permissions, SELinux), return True. Conservative: treat an
+        unreadable pidfile as a live peer claim rather than re-claiming
+        over what might be a real peer's slot. Returning False would
+        race the peer and let two daemons spawn for the same session.
+        Other OSErrors (ENOENT — file vanished between exists() and
+        stat() — most likely) return False so we can re-claim cleanly.
         """
         try:
             mtime = self.pid_file.stat().st_mtime
+        except PermissionError:
+            # EACCES: can't read mtime → assume fresh (don't race a
+            # potentially-live peer claim).
+            return True
         except OSError:
             return False
         return (time.time() - mtime) < _FRESH_PIDFILE_SECONDS
 
     def _read_existing_pid(self) -> int:
-        """Best-effort read of the PID currently in the file."""
-        try:
-            content = self.pid_file.read_text().strip()
-        except OSError:
-            return 0
-        if not content:
-            return 0
-        # File may carry a single PID, or PID + extra lines (legacy formats
-        # in reload_lock.py have trailing metadata). Take the first token.
-        first = content.split()[0] if content.split() else ""
-        try:
-            pid = int(first)
-        except ValueError:
-            return 0
-        return pid if pid > 0 else 0
+        """Best-effort read of the PID currently in the file.
+
+        Delegates to module-level ``_parse_pidfile_pid`` for DRY parity
+        with all other pidfile readers (guard.py, doctor.py). Tolerates
+        both legacy 1-line and new 3-line payload formats.
+        """
+        return _parse_pidfile_pid(self.pid_file)
 
 
 @contextmanager
