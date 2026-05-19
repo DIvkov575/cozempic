@@ -26,16 +26,6 @@ import threading
 import time
 from pathlib import Path
 
-# Per-session spawn lock: prevents a concurrent _is_guard_running_for_session
-# from treating a live O_CREAT placeholder as a stale file (within the same
-# process). Keyed by session_id to avoid false contention across sessions.
-# Kept as a fast-path for single-process scenarios; the authoritative gate
-# is now ``spawn_lock.daemon_spawn_lock`` (kernel-mediated flock) which
-# spans process boundaries — see start_guard_daemon below.
-_spawn_locks: dict[str, threading.Lock] = {}
-_spawn_locks_mu = threading.Lock()
-
-
 # ── HARD-threshold back-off + exit constants ────────────────────────────────
 # When ``guard_prune_cycle`` keeps returning saved_bytes == 0 at the HARD
 # threshold (because the live conversation is dominated by immutable tool-
@@ -680,6 +670,17 @@ def start_guard(
                 overflow_watcher.stop()
             except Exception:
                 pass
+        # Unlink session pidfile on EVERY daemon-exit path (PR #93 commit 2,
+        # class-of-bug fold). Covers SIGTERM, K=10 voluntary exit,
+        # KeyboardInterrupt, and the four `break` paths above. The helper
+        # CAS-checks ``_pid_file_points_to(session_id, os.getpid())`` so we
+        # never destroy a peer's just-completed claim during a hot reload.
+        # ``sys.exit(0)`` raises ``SystemExit`` which DOES run try/finally,
+        # so this single call site is sufficient for all 6 surfaces.
+        try:
+            _safe_unlink_session_pidfile(sess["session_id"])
+        except Exception:
+            pass
 
 
 def guard_prune_cycle(
@@ -1256,6 +1257,42 @@ def _cleanup_legacy_pid(cwd: str) -> None:
     legacy_sess.unlink(missing_ok=True)
 
 
+def _safe_unlink_session_pidfile(session_id: str | None) -> None:
+    """Best-effort pidfile unlink on daemon exit paths.
+
+    Used by every daemon shutdown surface (SIGTERM handler, K=10
+    voluntary exit, KeyboardInterrupt, the four `break` paths in
+    ``start_guard``'s main loop). Wired through the ``finally`` block
+    of ``start_guard`` so a single call site covers all 6 exit paths.
+
+    CAS gate: only unlinks if the pidfile currently contains OUR PID
+    (``_pid_file_points_to(session_id, os.getpid())``). This prevents
+    destroying a peer's just-completed claim during the brief window
+    where a concurrent SessionStart hook may have already spawned a
+    replacement daemon and rewritten the pidfile with its PID. Mirrors
+    the CAS pattern in ``reload_self_daemon`` (sister-module precedent
+    at lines 1802, 1809, 1823, 1829).
+
+    Swallows ValueError (malformed session_id passed in via stale
+    closure capture) and OSError (pidfile already gone, /tmp unwritable,
+    EACCES). Never raises — the daemon is mid-shutdown; nothing useful
+    to do on failure.
+
+    Class-of-bug fold (PR #93 commit 2): consolidates the unlink so
+    adding a new ``sys.exit`` path requires touching ONE callsite, not
+    N. Covers the pre-existing ``_graceful_shutdown`` leak (TODO:55,
+    pre-PR-#88) AND the K=10 leak PR #92 introduced — both daemon-exit
+    surfaces now reach the same ``finally`` block in ``start_guard``.
+    """
+    if not session_id:
+        return
+    try:
+        if _pid_file_points_to(session_id, os.getpid()):
+            _pid_file_for_session(session_id).unlink(missing_ok=True)
+    except (ValueError, OSError):
+        pass
+
+
 def _is_guard_running_for_session(session_id: str) -> int | None:
     """Check if a guard daemon is already running for this specific session.
 
@@ -1266,7 +1303,6 @@ def _is_guard_running_for_session(session_id: str) -> int | None:
     (hooks, pytest, third-party integrations) should get a safe default
     instead of a ValueError propagating up from `_pid_file_for_session`.
     """
-    norm_sid = _normalize_session_id(session_id)
     try:
         pid_path = _pid_file_for_session(session_id)
     except ValueError:
@@ -1278,17 +1314,12 @@ def _is_guard_running_for_session(session_id: str) -> int | None:
     try:
         pid = int(pid_path.read_text().strip())
         if pid <= 0:
-            # Guard against PID-reuse footgun: os.kill(0, sig) broadcasts to
-            # the caller's process group rather than targeting a sentinel.
-            # If a concurrent start_guard_daemon in THIS process holds the
-            # session spawn lock, the placeholder is live — skip the unlink.
-            with _spawn_locks_mu:
-                lock = _spawn_locks.get(norm_sid)
-            if lock is not None and not lock.acquire(blocking=False):
-                # Lock is held → spawner is in-flight; placeholder is live.
-                return None
-            if lock is not None:
-                lock.release()
+            # Pidfile contains a sentinel/placeholder — treat as stale.
+            # Guards against the PID-reuse footgun where os.kill(0, sig)
+            # broadcasts to the caller's process group rather than
+            # targeting a sentinel. Cross-process freshness for in-flight
+            # claims is enforced by DaemonSpawnClaim's O_CREAT|O_EXCL +
+            # _FRESH_PIDFILE_SECONDS gate, not by an in-process dict.
             pid_path.unlink(missing_ok=True)
             return None
         os.kill(pid, 0)
