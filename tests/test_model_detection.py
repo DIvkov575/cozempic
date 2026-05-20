@@ -79,6 +79,22 @@ class TestDetectModel(unittest.TestCase):
 
 class TestDetectContextWindow(unittest.TestCase):
 
+    def setUp(self):
+        # Isolate from inherited COZEMPIC_CONTEXT_WINDOW env var. Some dev
+        # boxes set this globally (e.g., to force a specific window for the
+        # guard daemon). When present, get_context_window_override() returns
+        # the env value and short-circuits the MODEL_CONTEXT_WINDOWS dict
+        # lookup that these tests target — producing "1M != 200K" failures
+        # on model-mapping tests that ARE actually correct in production
+        # code. Tests that exercise the override path explicitly use
+        # patch.dict to set the env var inside their own context.
+        self._prev_env = os.environ.pop("COZEMPIC_CONTEXT_WINDOW", None)
+        self.addCleanup(self._restore_env)
+
+    def _restore_env(self):
+        if self._prev_env is not None:
+            os.environ["COZEMPIC_CONTEXT_WINDOW"] = self._prev_env
+
     def test_opus_47_is_1m(self):
         """Current Opus 4.7 defaults to 1M (standard for Claude Code Max)."""
         messages = [make_assistant_with_model(0, "claude-opus-4-7")]
@@ -155,6 +171,19 @@ class TestGetContextWindowOverride(unittest.TestCase):
 
 
 class TestEstimateSessionTokensWithModel(unittest.TestCase):
+
+    def setUp(self):
+        # Same env-isolation pattern as TestDetectContextWindow — see comment
+        # there. estimate_session_tokens() calls detect_context_window()
+        # internally, which honours COZEMPIC_CONTEXT_WINDOW. Without this
+        # cleanup, test_context_pct_200k_model fails on dev boxes that set
+        # the env var globally.
+        self._prev_env = os.environ.pop("COZEMPIC_CONTEXT_WINDOW", None)
+        self.addCleanup(self._restore_env)
+
+    def _restore_env(self):
+        if self._prev_env is not None:
+            os.environ["COZEMPIC_CONTEXT_WINDOW"] = self._prev_env
 
     def test_includes_model_in_result(self):
         messages = [make_assistant_with_model(0, "claude-opus-4-6", input_tokens=50000)]
