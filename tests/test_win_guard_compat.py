@@ -30,8 +30,17 @@ class TestGuardTmpRoot(unittest.TestCase):
             self.assertEqual(guard._guard_tmp_root(), Path("/tmp"))
 
     def test_windows_uses_platform_tempdir(self):
-        with patch.object(guard.os, "name", "nt"):
-            self.assertEqual(guard._guard_tmp_root(), Path(tempfile.gettempdir()))
+        # Verify the Windows branch picks tempfile.gettempdir() (not /tmp)
+        # WITHOUT constructing a real WindowsPath: on a POSIX test host, pre-3.12
+        # pathlib raises NotImplementedError when instantiating WindowsPath, so
+        # `Path(...)` under an os.name="nt" patch would fail on the runner rather
+        # than exercise the branch. Mock guard.Path to capture the argument.
+        with patch.object(guard.os, "name", "nt"), \
+             patch.object(guard.tempfile, "gettempdir", return_value="C:\\Temp"), \
+             patch.object(guard, "Path", side_effect=lambda p: ("Path", p)) as mock_path:
+            result = guard._guard_tmp_root()
+        self.assertEqual(result, ("Path", "C:\\Temp"))
+        mock_path.assert_called_once_with("C:\\Temp")
 
     def test_pid_file_for_session_posix_stays_in_tmp(self):
         # SessionStart shell hook hardcodes /tmp; Python must agree on POSIX so
