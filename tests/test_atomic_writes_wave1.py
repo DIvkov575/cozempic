@@ -289,24 +289,28 @@ class TestHostFileLockWindows(unittest.TestCase):
                             "Expected lock to degrade to no-op when msvcrt unavailable")
 
 
-# ─── Hook schema bump v7 → v8 (round 3 — C2 slug convergence, Option B) ─────
+# ─── Hook schema bump v8 → v9 (PR #93 — pidfile 3-line format + head -1) ────
 
-class TestHookSchemaV8(unittest.TestCase):
-    """v8 converges the bash hook slug rules with Python's
-    ``_pid_file_for_session`` (round 3 — C2 fix). Per code-auditor's
-    Option B sign-off (2026-05-18): the existing bash sanitiser
-    ``re.sub(r'[^a-z0-9_-]','_', s.lower())`` is kept as the codebase
-    convention (already used in ``reload_lock._slug_for`` and
-    ``spawn_lock._slug_for``); Python's previously stricter
-    ``^[0-9a-f][0-9a-f-]{11,}$`` is RELAXED to
-    ``^[a-z0-9][a-z0-9_-]{11,}$`` so both sides accept the same character
-    set. The leading-alphanumeric anchor is preserved as a security
-    property (dash-collision defense, see
-    ``TestPolishV2_SessionIdRegexRequiresHexFirstChar``)."""
+class TestHookSchemaV9(unittest.TestCase):
+    """v9 migrates the bash hook's PID liveness probe from
+    ``cat "$GUARD_PID_FILE"`` to ``head -n 1 "$GUARD_PID_FILE"`` to
+    handle the new 3-line pidfile format introduced in PR #93 (item #5)
+    for operator-triage metadata parity with ``_ReloadLock``.
+
+    Without ``head -n 1``, the multi-line pidfile content would be
+    passed to ``kill -0`` as multiple whitespace-separated arguments,
+    producing shell-implementation-defined behaviour (the multi-arg
+    ``kill -0`` syntax exists but tries each PID — likely succeeds on
+    the first valid line, but the timestamp/initiator lines would emit
+    confusing errors). Using ``head -n 1`` extracts only line 1 (the
+    PID) cleanly across all POSIX shells.
+
+    v8's C2 slug convergence is preserved verbatim (kept as the
+    codebase convention); v9 only changes the PID-reading mechanism."""
 
     def test_schema_marker_bumped(self):
         from cozempic.init import HOOK_SCHEMA_VERSION
-        self.assertEqual(HOOK_SCHEMA_VERSION, "v8")
+        self.assertEqual(HOOK_SCHEMA_VERSION, "v9")
 
     def test_no_unflocked_foreground_guard_daemon_call(self):
         """The unflocked foreground `cozempic guard --daemon` call stays removed.

@@ -148,9 +148,12 @@ class TestHookSpawnIdempotency(unittest.TestCase):
         if not self.pid_file.exists():
             return
         try:
-            pid = int(self.pid_file.read_text().strip())
+            # PR #93 item #5: pidfile may be 1-line legacy or 3-line new.
+            # Parse first line only for forward-compat.
+            first_line = self.pid_file.read_text().splitlines()[0].strip()
+            pid = int(first_line)
             os.kill(pid, 9)
-        except (ValueError, ProcessLookupError, OSError):
+        except (ValueError, ProcessLookupError, OSError, IndexError):
             pass
 
     def _run_hook_once(self, hook_cmd: str) -> subprocess.CompletedProcess:

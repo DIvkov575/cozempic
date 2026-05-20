@@ -26,16 +26,6 @@ import threading
 import time
 from pathlib import Path
 
-# Per-session spawn lock: prevents a concurrent _is_guard_running_for_session
-# from treating a live O_CREAT placeholder as a stale file (within the same
-# process). Keyed by session_id to avoid false contention across sessions.
-# Kept as a fast-path for single-process scenarios; the authoritative gate
-# is now ``spawn_lock.daemon_spawn_lock`` (kernel-mediated flock) which
-# spans process boundaries — see start_guard_daemon below.
-_spawn_locks: dict[str, threading.Lock] = {}
-_spawn_locks_mu = threading.Lock()
-
-
 # ── HARD-threshold back-off + exit constants ────────────────────────────────
 # When ``guard_prune_cycle`` keeps returning saved_bytes == 0 at the HARD
 # threshold (because the live conversation is dominated by immutable tool-
@@ -56,6 +46,48 @@ _spawn_locks_mu = threading.Lock()
 HARD_LOOP_BACKOFF_START = 3
 HARD_LOOP_BACKOFF_CAP_SECONDS = 300
 HARD_LOOP_EXIT_THRESHOLD = 10
+
+
+# ── Hard cap: K=10 exit deferral when agents_active (PR #93 item #4) ────────
+# When K reaches HARD_LOOP_EXIT_THRESHOLD (=10) AND `agents_active=True`,
+# the daemon used to `sys.exit(0)` mid-task, killing the subagents'
+# protection AND telling the operator to `/clear` (which destroys
+# subagent state). PR #93 defers the exit while agents are running and
+# only exits at the HARD cap below — giving subagents a chance to
+# finish before context dies.
+#
+# Default cap K=50 ≈ 4 hours wall time at the backoff cap (300s/cycle),
+# well past any normal subagent batch but short enough that a stuck
+# session doesn't outlive an operator's workday.
+#
+# Override via env var COZEMPIC_GUARD_HARD_EXIT_K (sister-module
+# precedent: spawn_lock._read_fresh_window_seconds clamps + falls back
+# on garbage). Read EXACTLY ONCE at module import time — requires a
+# daemon restart to take effect (same convention as
+# COZEMPIC_PIDFILE_FRESH_SECONDS).
+def _read_hard_exit_threshold() -> int:
+    """Read COZEMPIC_GUARD_HARD_EXIT_K env var. Clamps to (10, 1000].
+
+    Read at module import time only — restart the daemon to apply
+    a new value. Invalid values (non-numeric, <=K=10, > 1000) fall
+    back to the default 50.
+    """
+    raw = os.environ.get("COZEMPIC_GUARD_HARD_EXIT_K")
+    if raw is None:
+        return 50
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        return 50
+    # Must be strictly > HARD_LOOP_EXIT_THRESHOLD (otherwise no defer
+    # window). Cap at 1000 to prevent absurd values (~3.5 days at 5min
+    # cap) from silently disabling the circuit breaker.
+    if val <= HARD_LOOP_EXIT_THRESHOLD or val > 1000:
+        return 50
+    return val
+
+
+HARD_LOOP_HARD_EXIT_THRESHOLD = _read_hard_exit_threshold()
 
 from ._validation import ConfigError
 from .executor import run_prescription
@@ -431,6 +463,9 @@ def start_guard(
     cycle_count = 0
     last_team_hash = ""
     consecutive_empty_hard_prunes = 0
+    # PR #93 item #4: one-shot flag so the "deferring K=10 exit" log
+    # line only emits once per defer-window, not every cycle.
+    deferred_exit_announced = False
 
     try:
         while True:
@@ -587,29 +622,95 @@ def start_guard(
                     # in production). Exit gracefully and let the SessionStart
                     # hook respawn on next activity. Do NOT change reload-trigger
                     # gating in guard_prune_cycle — that's not the right escape.
+                    #
+                    # PR #93 item #4: defer the exit when `agents_active=True`.
+                    # Killing the daemon mid-task destroys subagent protection
+                    # AND the diagnostic recommends `/clear` (which also
+                    # destroys subagent state). Hard cap at
+                    # HARD_LOOP_HARD_EXIT_THRESHOLD (default 50, override via
+                    # COZEMPIC_GUARD_HARD_EXIT_K) ensures eventual exit so a
+                    # stuck `extract_team_state` (BUG-G15 family) can't wedge
+                    # the daemon forever.
                     if consecutive_empty_hard_prunes >= HARD_LOOP_EXIT_THRESHOLD:
-                        try:
-                            checkpoint_team(session_path=session_path, quiet=True)
-                        except Exception:
-                            # Checkpoint failure must not prevent exit — final
-                            # checkpoint is best-effort here; the SOFT loop above
-                            # has been writing checkpoints every cycle for the
-                            # entire run, so on-disk state is already current.
-                            pass
-                        print(
-                            f"  [{_now()}] Guard powerless against live-context "
-                            f"dominance ({HARD_LOOP_EXIT_THRESHOLD} consecutive "
-                            f"0-byte HARD prunes). Exiting — NO further guard "
-                            f"protection in this session. SessionStart fires only "
-                            f"on startup/resume/clear, NOT on tool calls or "
-                            f"message turns, so the daemon will NOT auto-respawn "
-                            f"while the session continues. To re-enable cozempic: "
-                            f"type /clear or restart the session. Recommended: "
-                            f"split work across fresh sessions to avoid >55% "
-                            f"context dominance by immutable tool-result blocks.",
-                            flush=True,
-                        )
-                        sys.exit(0)
+                        if (
+                            agents_active
+                            and consecutive_empty_hard_prunes < HARD_LOOP_HARD_EXIT_THRESHOLD
+                        ):
+                            # Defer: stay alive, keep cycling at backoff cap.
+                            if not deferred_exit_announced:
+                                running_count = sum(
+                                    1 for s in state.subagents
+                                    if s.status in ("running", "unknown")
+                                )
+                                worst_case_min = (
+                                    HARD_LOOP_HARD_EXIT_THRESHOLD
+                                    * HARD_LOOP_BACKOFF_CAP_SECONDS
+                                    // 60
+                                )
+                                print(
+                                    f"  [{_now()}] K={consecutive_empty_hard_prunes} "
+                                    f"reached normal exit threshold "
+                                    f"({HARD_LOOP_EXIT_THRESHOLD}) but "
+                                    f"{running_count} subagent(s) still active. "
+                                    f"Deferring daemon exit until agents quiesce "
+                                    f"or K reaches hard cap "
+                                    f"({HARD_LOOP_HARD_EXIT_THRESHOLD}, "
+                                    f"~{worst_case_min} min worst case).",
+                                    flush=True,
+                                )
+                                deferred_exit_announced = True
+                            # Fall through to the back-off sleep below.
+                            # We do NOT sys.exit while agents are working.
+                        else:
+                            # Either no agents (original K=10 exit) OR hard
+                            # cap reached even with agents (circuit breaker).
+                            try:
+                                checkpoint_team(session_path=session_path, quiet=True)
+                            except Exception:
+                                # Checkpoint failure must not prevent exit —
+                                # final checkpoint is best-effort here; the
+                                # SOFT loop above has been writing checkpoints
+                                # every cycle for the entire run, so on-disk
+                                # state is already current.
+                                pass
+                            if (
+                                agents_active
+                                and consecutive_empty_hard_prunes >= HARD_LOOP_HARD_EXIT_THRESHOLD
+                            ):
+                                # Hard cap fired with agents still active —
+                                # different diagnostic. Do NOT tell the
+                                # operator to `/clear` (that destroys
+                                # subagent state too).
+                                print(
+                                    f"  [{_now()}] Guard hard-cap exit "
+                                    f"(K={consecutive_empty_hard_prunes} >= "
+                                    f"{HARD_LOOP_HARD_EXIT_THRESHOLD}). "
+                                    f"Subagents are still active; their state "
+                                    f"may be lost on the next compaction. "
+                                    f"Consider letting current subagents "
+                                    f"finish then starting a fresh session.",
+                                    flush=True,
+                                )
+                            else:
+                                # Original K=10 exit (no agents — operator
+                                # can safely `/clear`).
+                                print(
+                                    f"  [{_now()}] Guard powerless against live-context "
+                                    f"dominance ({HARD_LOOP_EXIT_THRESHOLD} consecutive "
+                                    f"0-byte HARD prunes). Exiting — NO further guard "
+                                    f"protection in this session. SessionStart fires only "
+                                    f"on startup/resume/clear, NOT on tool calls or "
+                                    f"message turns, so the daemon will NOT auto-respawn "
+                                    f"while the session continues. To re-enable cozempic: "
+                                    f"type /clear or restart the session. Recommended: "
+                                    f"split work across fresh sessions to avoid >55% "
+                                    f"context dominance by immutable tool-result blocks.",
+                                    flush=True,
+                                )
+                            # _safe_unlink_session_pidfile is called via the
+                            # finally block (PR #93 commit 2) — covers this
+                            # sys.exit path automatically.
+                            sys.exit(0)
 
                     # Back-off path: replace the original fixed-cadence sleep at
                     # the bottom of the loop with an exponentially growing one.
@@ -633,6 +734,10 @@ def start_guard(
                         time.sleep(backoff)
                 else:
                     consecutive_empty_hard_prunes = 0
+                    # Reset the defer announcement so a fresh K-cycle that
+                    # reaches K=10-with-agents will emit the notice again
+                    # (PR #93 item #4 — operator-friendly).
+                    deferred_exit_announced = False
                 print()
 
             # ── Phase 2: SOFT (25%) — gentle, no reload (file maintenance only) ──
@@ -680,6 +785,17 @@ def start_guard(
                 overflow_watcher.stop()
             except Exception:
                 pass
+        # Unlink session pidfile on EVERY daemon-exit path (PR #93 commit 2,
+        # class-of-bug fold). Covers SIGTERM, K=10 voluntary exit,
+        # KeyboardInterrupt, and the four `break` paths above. The helper
+        # CAS-checks ``_pid_file_points_to(session_id, os.getpid())`` so we
+        # never destroy a peer's just-completed claim during a hot reload.
+        # ``sys.exit(0)`` raises ``SystemExit`` which DOES run try/finally,
+        # so this single call site is sufficient for all 6 surfaces.
+        try:
+            _safe_unlink_session_pidfile(sess["session_id"])
+        except Exception:
+            pass
 
 
 def guard_prune_cycle(
@@ -1256,6 +1372,42 @@ def _cleanup_legacy_pid(cwd: str) -> None:
     legacy_sess.unlink(missing_ok=True)
 
 
+def _safe_unlink_session_pidfile(session_id: str | None) -> None:
+    """Best-effort pidfile unlink on daemon exit paths.
+
+    Used by every daemon shutdown surface (SIGTERM handler, K=10
+    voluntary exit, KeyboardInterrupt, the four `break` paths in
+    ``start_guard``'s main loop). Wired through the ``finally`` block
+    of ``start_guard`` so a single call site covers all 6 exit paths.
+
+    CAS gate: only unlinks if the pidfile currently contains OUR PID
+    (``_pid_file_points_to(session_id, os.getpid())``). This prevents
+    destroying a peer's just-completed claim during the brief window
+    where a concurrent SessionStart hook may have already spawned a
+    replacement daemon and rewritten the pidfile with its PID. Mirrors
+    the CAS pattern in ``reload_self_daemon`` (sister-module precedent
+    at lines 1802, 1809, 1823, 1829).
+
+    Swallows ValueError (malformed session_id passed in via stale
+    closure capture) and OSError (pidfile already gone, /tmp unwritable,
+    EACCES). Never raises — the daemon is mid-shutdown; nothing useful
+    to do on failure.
+
+    Class-of-bug fold (PR #93 commit 2): consolidates the unlink so
+    adding a new ``sys.exit`` path requires touching ONE callsite, not
+    N. Covers the pre-existing ``_graceful_shutdown`` leak (TODO:55,
+    pre-PR-#88) AND the K=10 leak PR #92 introduced — both daemon-exit
+    surfaces now reach the same ``finally`` block in ``start_guard``.
+    """
+    if not session_id:
+        return
+    try:
+        if _pid_file_points_to(session_id, os.getpid()):
+            _pid_file_for_session(session_id).unlink(missing_ok=True)
+    except (ValueError, OSError):
+        pass
+
+
 def _is_guard_running_for_session(session_id: str) -> int | None:
     """Check if a guard daemon is already running for this specific session.
 
@@ -1266,7 +1418,6 @@ def _is_guard_running_for_session(session_id: str) -> int | None:
     (hooks, pytest, third-party integrations) should get a safe default
     instead of a ValueError propagating up from `_pid_file_for_session`.
     """
-    norm_sid = _normalize_session_id(session_id)
     try:
         pid_path = _pid_file_for_session(session_id)
     except ValueError:
@@ -1276,19 +1427,21 @@ def _is_guard_running_for_session(session_id: str) -> int | None:
         return None
 
     try:
-        pid = int(pid_path.read_text().strip())
+        # Tolerant parse: handles both legacy 1-line and new 3-line
+        # pidfile formats (PR #93 item #5). Returns 0 on garbled/empty
+        # content — caller's `if pid <= 0` branch then unlinks the stale
+        # file. Replaces `int(read_text().strip())` which would raise
+        # ValueError on 3-line content and (via the except below) skip
+        # the unlink, leaking the stale file.
+        from .spawn_lock import _parse_pidfile_pid
+        pid = _parse_pidfile_pid(pid_path)
         if pid <= 0:
-            # Guard against PID-reuse footgun: os.kill(0, sig) broadcasts to
-            # the caller's process group rather than targeting a sentinel.
-            # If a concurrent start_guard_daemon in THIS process holds the
-            # session spawn lock, the placeholder is live — skip the unlink.
-            with _spawn_locks_mu:
-                lock = _spawn_locks.get(norm_sid)
-            if lock is not None and not lock.acquire(blocking=False):
-                # Lock is held → spawner is in-flight; placeholder is live.
-                return None
-            if lock is not None:
-                lock.release()
+            # Pidfile contains a sentinel/placeholder — treat as stale.
+            # Guards against the PID-reuse footgun where os.kill(0, sig)
+            # broadcasts to the caller's process group rather than
+            # targeting a sentinel. Cross-process freshness for in-flight
+            # claims is enforced by DaemonSpawnClaim's O_CREAT|O_EXCL +
+            # _FRESH_PIDFILE_SECONDS gate, not by an in-process dict.
             pid_path.unlink(missing_ok=True)
             return None
         os.kill(pid, 0)
@@ -1565,15 +1718,54 @@ def start_guard_daemon(
             # non-OSError between write_text and rename used to leak the
             # .pid.tmp orphan; we now unlink it on every failure path.
             try:
+                from .spawn_lock import INIT_SPAWN_DAEMON
+                from datetime import datetime as _dt
                 _tmp_flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
                 if hasattr(os, "O_NOFOLLOW"):
                     _tmp_flags |= os.O_NOFOLLOW
                 _tmp_fd = os.open(str(tmp_path), _tmp_flags, 0o600)
                 try:
-                    os.write(_tmp_fd, f"{proc.pid}\n".encode("utf-8"))
+                    # 3-line payload: pid + iso-timestamp + initiator.
+                    # Mirrors DaemonSpawnClaim._claim and
+                    # reload_lock._ReloadLock._try_create. Operators
+                    # cat-ing the pidfile see immediately who wrote it
+                    # (parent vs daemon) and when (PR #93 item #5).
+                    payload = (
+                        f"{proc.pid}\n"
+                        f"{_dt.now().isoformat(timespec='seconds')}\n"
+                        f"{INIT_SPAWN_DAEMON}\n"
+                    )
+                    os.write(_tmp_fd, payload.encode("utf-8"))
+                    # Fsync the payload to disk BEFORE rename so a power
+                    # loss between rename and parent-dir-fsync can't
+                    # produce a renamed-but-empty pidfile that readers
+                    # then misclassify as garbled (DA round 1 M1).
+                    try:
+                        os.fsync(_tmp_fd)
+                    except OSError:
+                        pass
                 finally:
                     os.close(_tmp_fd)
                 os.rename(str(tmp_path), str(pid_path))
+                # Fsync the parent directory so the rename itself is
+                # durable across abrupt power loss (DA round 1 M1).
+                # Without this, the rename is in the kernel's metadata
+                # journal but not yet on stable storage — a crash
+                # between rename and the next fs commit could roll the
+                # filesystem back to pre-rename state, leaving an
+                # orphan .pid.tmp and no .pid (next spawn would see no
+                # pidfile and start a duplicate daemon).
+                try:
+                    parent_dir = os.path.dirname(str(pid_path)) or "."
+                    _dir_fd = os.open(parent_dir, os.O_RDONLY)
+                    try:
+                        os.fsync(_dir_fd)
+                    finally:
+                        os.close(_dir_fd)
+                except OSError:
+                    # Some filesystems (network FS, tmpfs on certain
+                    # kernels) reject directory fsync — best-effort.
+                    pass
             except Exception:
                 # Unlink any partial .pid.tmp we may have created so a
                 # retry can succeed. unlink is symlink-safe (operates on
@@ -1744,12 +1936,18 @@ def _pid_file_points_to(session_id: str, expected_pid: int) -> bool:
     """CAS helper: return True if the session pid file currently contains
     `expected_pid`. Used before unlink() to avoid clobbering a fresh pid
     file written by a concurrent SessionStart hook.
+
+    Uses ``_parse_pidfile_pid`` so both legacy 1-line and new 3-line
+    pidfile formats parse correctly (PR #93 item #5). A garbled file
+    returns 0 from the parser, which won't match any expected_pid (>0),
+    so the CAS skips the unlink — the conservative behaviour.
     """
     try:
+        from .spawn_lock import _parse_pidfile_pid
         path = _pid_file_for_session(session_id)
         if not path.exists():
             return False
-        return int(path.read_text().strip()) == expected_pid
+        return _parse_pidfile_pid(path) == expected_pid
     except (ValueError, OSError):
         return False
 
@@ -1852,9 +2050,15 @@ def reload_self_daemon(
         pid_path = _pid_file_for_session(session_id)
         try:
             if pid_path.exists():
-                stale_pid = int(pid_path.read_text().strip())
+                from .spawn_lock import _parse_pidfile_pid
+                stale_pid = _parse_pidfile_pid(pid_path)
+                if stale_pid <= 0:
+                    # Garbled or empty — treat as stale and unlink.
+                    pid_path.unlink(missing_ok=True)
+                    stale_pid = 0
                 try:
-                    os.kill(stale_pid, 0)
+                    if stale_pid > 0:
+                        os.kill(stale_pid, 0)
                     # Still alive — leave the pid file alone and let
                     # start_guard_daemon below return already_running.
                 except (ProcessLookupError, PermissionError):
