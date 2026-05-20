@@ -16,6 +16,7 @@ Checkpoint triggers:
 
 from __future__ import annotations
 
+import math
 import os
 import platform
 import re
@@ -90,6 +91,43 @@ def _read_hard_exit_threshold() -> int:
 
 HARD_LOOP_HARD_EXIT_THRESHOLD = _read_hard_exit_threshold()
 
+# ── Watcher poll constants (GAP-B) ───────────────────────────────────────────
+# After osascript fires, the watcher polls for a new claude process for up to
+# RELOAD_WATCHER_POLL_TIMEOUT_SECONDS. 30s matches acquire_with_wait default.
+# On timeout, writes a structured status file read by the next SessionStart hook.
+RELOAD_WATCHER_POLL_TIMEOUT_SECONDS = 30
+RELOAD_WATCHER_POLL_INTERVAL_SECONDS = 1
+
+# ── Futile-reload threshold (GAP-D) ─────────────────────────────────────────
+# Minimum fraction of session bytes that prune must save to justify a reload.
+# If saved_bytes / original_bytes < _MIN_PRUNE_RATIO, the resumed Claude would
+# re-trigger HARD immediately (context dominated by immutable tool-result blocks).
+# Override via env var COZEMPIC_MIN_PRUNE_RATIO. Read at module import time only
+# — restart the daemon to apply a new value.
+_DEFAULT_MIN_PRUNE_RATIO = 0.10
+
+
+def _read_min_prune_ratio() -> float:
+    """Read COZEMPIC_MIN_PRUNE_RATIO env var. Clamps to (0.0, 1.0) exclusive.
+
+    Read at module import time only — restart the daemon to apply a new
+    value. Invalid values (non-numeric, NaN, inf, <= 0.0, >= 1.0) fall
+    back to the default 0.10.
+    """
+    raw = os.environ.get("COZEMPIC_MIN_PRUNE_RATIO")
+    if raw is None:
+        return _DEFAULT_MIN_PRUNE_RATIO
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_MIN_PRUNE_RATIO
+    if not math.isfinite(val) or val <= 0.0 or val >= 1.0:
+        return _DEFAULT_MIN_PRUNE_RATIO
+    return val
+
+
+_MIN_PRUNE_RATIO = _read_min_prune_ratio()
+
 from ._validation import ConfigError
 from .executor import run_prescription
 from .helpers import is_ssh_session, shell_quote
@@ -115,6 +153,10 @@ from .tokens import default_token_thresholds, quick_token_estimate
 # disk when this function runs post-upgrade. Prevents old-daemon/new-updater
 # version skew.
 from .updater import maybe_auto_update, ping_install_if_new
+# NEW-1 sentinel: imported at module level so start_guard_daemon can call
+# _reload_sentinel_active without a nested import, and _terminate_and_resume
+# can call write_reload_sentinel from all code paths (tmux, screen, plain terminal).
+from .reload_lock import write_reload_sentinel, unlink_reload_sentinel, _reload_sentinel_active  # noqa: E402
 
 
 def _normalize_session_id(session_id: str) -> str:
@@ -467,6 +509,9 @@ def start_guard(
     # PR #93 item #4: one-shot flag so the "deferring K=10 exit" log
     # line only emits once per defer-window, not every cycle.
     deferred_exit_announced = False
+    # GAP-D: one-shot flag so the futile-skip diagnostic emits once per
+    # defer-window (mirrors deferred_exit_announced pattern).
+    _futile_skip_announced = False
 
     try:
         while True:
@@ -499,6 +544,11 @@ def start_guard(
                         claude_alive = False
                 if not claude_alive:
                     print(f"  [{_now()}] Claude process exited (PID {claude_pid}). Final checkpoint...")
+                    # Option (b) defense-in-depth: unlink pidfile IMMEDIATELY so a
+                    # concurrent SessionStart for the new Claude doesn't see a stale
+                    # transient-daemon slot. The finally-block call is a no-op after
+                    # this (CAS fails cleanly — we no longer own the file).
+                    _safe_unlink_session_pidfile(sess.get("session_id"))
                     checkpoint_team(session_path=session_path, quiet=False)
                     print(f"  Guard stopping (Claude exited).")
                     break
@@ -614,8 +664,32 @@ def start_guard(
                 if result.get("team_name"):
                     print(f"  Team '{result['team_name']}' state preserved ({result['team_messages']} messages)")
 
-                if result.get("saved_mb", 0) <= 0:
+                if result.get("saved_mb", 0) <= 0 or result.get("futile_reload_skipped"):
                     consecutive_empty_hard_prunes += 1
+
+                    # GAP-D: emit one-shot diagnostic when reload was skipped
+                    # as futile (prune saved too few bytes to justify a reload
+                    # that would immediately re-trigger HARD).
+                    if result.get("futile_reload_skipped") and not _futile_skip_announced:
+                        saved_mb = result.get("saved_mb", 0)
+                        orig_bytes = result.get("original_bytes", 0)
+                        saved_pct = (saved_mb * 1024 * 1024 / orig_bytes * 100
+                                     if orig_bytes > 0 else 0)
+                        checkpoint_ref = (
+                            f" Checkpoint: {result['checkpoint_path']}"
+                            if result.get("checkpoint_path") else ""
+                        )
+                        print(
+                            f"  [{_now()}] Hard prune freed {saved_mb:.3f}MB "
+                            f"(~{saved_pct:.0f}%) — below {int(_MIN_PRUNE_RATIO * 100)}% "
+                            f"threshold. Reload skipped: resumed Claude would re-trigger "
+                            f"HARD immediately. Likely cause: subagent transcripts or large "
+                            f"tool-results dominate context. Recommend: /clear (loses subagent "
+                            f"state) or fresh session with restored team "
+                            f"checkpoint.{checkpoint_ref}",
+                            flush=True,
+                        )
+                        _futile_skip_announced = True
 
                     # Exit path: the daemon is powerless against this context
                     # (live tool-result blocks dominate; HARD prune cannot free
@@ -739,6 +813,9 @@ def start_guard(
                     # reaches K=10-with-agents will emit the notice again
                     # (PR #93 item #4 — operator-friendly).
                     deferred_exit_announced = False
+                    # Reset futile-skip announcement so a fresh K-cycle
+                    # emits the diagnostic again (GAP-D — mirrors above).
+                    _futile_skip_announced = False
                 print()
 
             # ── Phase 2: SOFT (25%) — gentle, no reload (file maintenance only) ──
@@ -868,6 +945,36 @@ def guard_prune_cycle(
                     "checkpoint_path": None,
                     "backup_path": None,
                     "reloading": False,
+                }
+
+            # GAP-D: futile-reload abort. If prune saved less than _MIN_PRUNE_RATIO
+            # of original bytes, the resumed Claude would re-trigger HARD immediately
+            # (context is dominated by immutable tool-result blocks that prune cannot
+            # touch). Skip the reload; persist the prune output; let K-counter advance
+            # so the circuit breaker eventually exits the daemon.
+            if 0 < saved_bytes < original_bytes * _MIN_PRUNE_RATIO:
+                # Still write checkpoint (so user can recover team state via the
+                # checkpoint path surfaced in the diagnostic) and save messages
+                # (prune output is valid — it just won't save enough to avoid
+                # immediate re-trigger).
+                checkpoint_path = None
+                if not team_state.is_empty():
+                    project_dir = session_path.parent
+                    checkpoint_path = write_team_checkpoint(team_state, project_dir)
+                backup = save_messages(session_path, pruned_messages, create_backup=True, snapshot=snap)
+                if backup:
+                    cleanup_old_backups(session_path, keep=3)
+                return {
+                    "saved_mb": saved_bytes / 1024 / 1024,
+                    "original_bytes": original_bytes,
+                    "original_tokens": pre_te.total,
+                    "final_tokens": pre_te.total,  # post_te not computed (early return)
+                    "team_name": team_state.team_name,
+                    "team_messages": team_state.message_count,
+                    "checkpoint_path": str(checkpoint_path) if checkpoint_path else None,
+                    "backup_path": str(backup) if backup else None,
+                    "reloading": False,
+                    "futile_reload_skipped": True,
                 }
 
             # Token estimate after pruning — pass pre-calibrated ratio
@@ -1130,6 +1237,7 @@ def _terminate_and_resume(
     project_dir: str,
     session_id: str | None = None,
     session_path: Path | None = None,
+    **_ignored_kwargs: object,
 ) -> None:
     """Gracefully exit Claude and resume in the same terminal where possible.
 
@@ -1143,6 +1251,10 @@ def _terminate_and_resume(
     watchdog's behaviour. Without this, a forked subshell whose argv drops
     the claude-code marker is recognised as alive by the watchdog but
     rejected by this function, silently skipping the reload.
+
+    ``**_ignored_kwargs`` is accepted for forward-compatibility: test harnesses
+    and future callers may pass rx_name/config/auto_reload without causing a
+    TypeError (blueprint § NEW-1 test compat).
     """
     resume_flag = f"--resume {session_id}" if session_id else "--resume"
 
@@ -1152,18 +1264,50 @@ def _terminate_and_resume(
     term_env = _detect_terminal_env()
     system = platform.system()
 
+    # PR #94 review MED-1/2/3 fold: sentinel is written ONLY in paths that
+    # actually terminate OLD Claude + spawn NEW Claude (tmux, screen, plain
+    # terminal post-SIGTERM via _spawn_reload_watcher). SSH paths + PID-reuse
+    # early returns do NOT write the sentinel, eliminating the 120s
+    # suppression-window UX bug surfaced by reviewer-e2e-pr94 review.
+
     if term_env == "ssh":
         print(f"  SSH session — skipping terminate+resume. Resume manually: {resume_cmd}")
         return
 
-    # Verify the PID still belongs to a Claude process before sending any signal.
-    # claude_pid is captured at daemon start; it may have been recycled.
+    # Anti-resurrection entry gate. The reload watcher resumes UNCONDITIONALLY
+    # once claude_pid dies (`while kill -0 …; do sleep; done; <resume_cmd>`), so
+    # entering here with an already-dead Claude — e.g. the user exited during
+    # the prune window — would reopen a session the user closed. The per-block
+    # checks below only guard each SIGTERM/SIGKILL, NOT the watcher spawn, so
+    # this gate is load-bearing. It returns before any sentinel write too,
+    # consistent with "sentinel only on paths that actually terminate+resume."
+    #
+    # Liveness FIRST, and mtime-IMMUNE: guard_prune_cycle's own save_messages
+    # refreshes the JSONL mtime moments before this call, so _is_claude_process's
+    # mtime fallback can misreport a dead Claude as alive. os.kill is not fooled.
+    if not _pid_is_alive(claude_pid):
+        print(f"  PID {claude_pid} is gone — skipping terminate+resume (no resurrection).")
+        return
+    # Identity (anti-PID-reuse): is this still actually Claude, not a recycled
+    # PID? Per-block checks re-verify before each kill; this is the fail-fast.
     if not _is_claude_process(claude_pid, session_path=session_path):
-        print(f"  WARNING: PID {claude_pid} is no longer a Claude process — skipping terminate+resume.")
+        print(f"  PID {claude_pid} is no longer a Claude process — skipping terminate+resume.")
         return
 
     if term_env == "tmux":
-        # tmux: graceful /exit via send-keys, then resume in same pane
+        # tmux: graceful /exit via send-keys, then resume in same pane.
+        # Verify PID identity before sending keyboard events (PID reuse guard).
+        if not _is_claude_process(claude_pid, session_path=session_path):
+            print(f"  WARNING: PID {claude_pid} is no longer a Claude process — skipping tmux terminate+resume.")
+            return
+        # PID check passed — we ARE going to terminate + auto-resume. Write the
+        # sentinel BEFORE send-keys so the resumed Claude's SessionStart hook
+        # sees it and skips the daemon spawn during the resume window.
+        if session_id:
+            try:
+                write_reload_sentinel(session_id, claude_pid)
+            except OSError:
+                pass  # best-effort; stale-GC clears any leaked sentinel
         pane = os.environ.get("TMUX_PANE", "")
         target = f"-t {pane}" if pane else ""
         print(f"  tmux detected — sending /exit and auto-resuming in same pane...")
@@ -1188,10 +1332,27 @@ def _terminate_and_resume(
              f"cd {shell_quote(project_dir)} && {resume_cmd}", "Enter"],
             capture_output=True, timeout=5,
         )
+        # tmux resume is synchronous (send-keys returns after command starts).
+        # Unlink the sentinel here so the resumed Claude's SessionStart hook
+        # can spawn its own guard without suppression.
+        if session_id:
+            try:
+                unlink_reload_sentinel(session_id)
+            except OSError:
+                pass
         return
 
     if term_env == "screen":
-        # GNU screen: similar to tmux
+        # GNU screen: similar to tmux. Verify PID identity before sending keyboard events.
+        if not _is_claude_process(claude_pid, session_path=session_path):
+            print(f"  WARNING: PID {claude_pid} is no longer a Claude process — skipping screen terminate+resume.")
+            return
+        # PID check passed — write the sentinel before send-keys (see tmux block).
+        if session_id:
+            try:
+                write_reload_sentinel(session_id, claude_pid)
+            except OSError:
+                pass
         screen_session = os.environ.get("STY", "")
         print(f"  screen detected — sending /exit and auto-resuming...")
 
@@ -1212,6 +1373,13 @@ def _terminate_and_resume(
              f"cd {shell_quote(project_dir)} && {resume_cmd}\n"],
             capture_output=True, timeout=5,
         )
+        # screen resume is synchronous. Unlink sentinel so the resumed Claude's
+        # SessionStart hook can spawn its guard.
+        if session_id:
+            try:
+                unlink_reload_sentinel(session_id)
+            except OSError:
+                pass
         return
 
     # Plain terminal — SIGTERM + spawn resume watcher
@@ -1238,20 +1406,48 @@ def _terminate_and_resume(
         except (ProcessLookupError, PermissionError, OSError):
             pass
 
+    # Plain-terminal path: write sentinel here, JUST BEFORE the watcher Popen.
+    # SSH and PID-reuse-fail blocks above return without reaching this point,
+    # so they leave no sentinel. The watcher script will unlink the sentinel
+    # after osascript fires (NEW Claude SessionStart can spawn freely).
+    if session_id:
+        try:
+            write_reload_sentinel(session_id, claude_pid)
+        except OSError:
+            pass  # best-effort; stale-GC clears any leaked sentinel
+
     _spawn_reload_watcher(claude_pid, project_dir, session_id=session_id)
 
 
 def _spawn_reload_watcher(claude_pid: int, project_dir: str, session_id: str | None = None):
-    """Spawn a detached watcher that resumes Claude after exit."""
+    """Spawn a detached watcher that resumes Claude after exit.
+
+    Extended (Phase B):
+    - Unlinks the reload sentinel AFTER osascript fires (NEW-1 option c) so
+      the new Claude's SessionStart hook can spawn its guard without suppression.
+    - Polls for the new Claude process for RELOAD_WATCHER_POLL_TIMEOUT_SECONDS
+      (GAP-B); writes a structured status file to /tmp/cozempic_reload_<sid12>.status
+      on timeout, which the next SessionStart hook surfaces to the operator.
+    """
     resume_flag = f"--resume {session_id}" if session_id else "--resume"
     original_flags = _detect_claude_flags(claude_pid)
     if original_flags:
         resume_flag = f"{original_flags} {resume_flag}"
 
-    # SSH sessions can't open GUI terminals — skip auto-resume
+    # SSH sessions can't open GUI terminals — skip auto-resume.
+    # PR #94 review MED-3: the upstream _terminate_and_resume already wrote
+    # the sentinel for the plain-terminal path before calling us. If we early
+    # return here (double-SSH-disagree edge: _detect_terminal_env said NOT ssh
+    # but is_ssh_session() says yes), the watcher will never fire its unlink.
+    # Clean up the sentinel here so the user's manual re-resume isn't suppressed.
     if is_ssh_session():
         print(f"  SSH session detected — skipping auto-resume.")
         print(f"  Resume manually: cd {project_dir} && claude {resume_flag}")
+        if session_id:
+            try:
+                unlink_reload_sentinel(session_id)
+            except OSError:
+                pass
         return
 
     system = platform.system()
@@ -1259,6 +1455,21 @@ def _spawn_reload_watcher(claude_pid: int, project_dir: str, session_id: str | N
     # log_dir is a bash-safe representation of project_dir for the echo log line.
     # shell_quote wraps in single quotes (POSIX safe); metachars are not executable.
     log_dir = shell_quote(project_dir)
+
+    # Compute sentinel + status paths at generation time so bash script is
+    # self-contained (no Python dependency inside the watcher).
+    # The slug uses reload_lock._slug_for so it matches _reload_sentinel_path_for.
+    from .reload_lock import _slug_for as _rl_slug_for
+    if session_id:
+        sid12 = _rl_slug_for(session_id)[:12]
+        sentinel_path = f"/tmp/cozempic_reload_{sid12}.in-flight"
+        status_path = f"/tmp/cozempic_reload_{sid12}.status"
+        pgrep_pattern = f"claude.*{sid12}"
+    else:
+        sid12 = ""
+        sentinel_path = ""
+        status_path = "/dev/null"
+        pgrep_pattern = "claude"
 
     if system == "Darwin":
         resume_cmd = (
@@ -1286,13 +1497,48 @@ def _spawn_reload_watcher(claude_pid: int, project_dir: str, session_id: str | N
         log_dir = escaped_dir
     else:
         print(f"  WARNING: Auto-resume not supported on {system}.")
+        # MED-3 fold: upstream wrote sentinel for plain path before calling us.
+        # Unsupported OS = no watcher spawn = no unlink fire. Clean up here.
+        if session_id:
+            try:
+                unlink_reload_sentinel(session_id)
+            except OSError:
+                pass
         return
 
+    # Compose the sentinel unlink fragment (empty string when no session_id)
+    _sentinel_unlink = f"rm -f '{sentinel_path}'; " if sentinel_path else ""
+
     watcher_script = (
+        # Phase 1: wait for old Claude to exit
         f"while kill -0 {int(claude_pid)} 2>/dev/null; do sleep 1; done; "
         f"sleep 1; "
+        # Phase 2: fire the resume command (osascript / gnome-terminal / etc)
         f"{resume_cmd}; "
-        f"echo \"$(date): Cozempic guard resumed Claude in {log_dir}\" >> /tmp/cozempic_guard.log"
+        f"RESUME_EXIT=$?; "
+        # Phase 3: unlink sentinel AFTER osascript so the new Claude's SessionStart
+        # can spawn its own guard (sentinel no longer suppresses spawn).
+        f"{_sentinel_unlink}"
+        # Phase 4 (GAP-B): poll for the new claude process for up to
+        # RELOAD_WATCHER_POLL_TIMEOUT_SECONDS. On success: log the new PID.
+        # On timeout: write a structured status file for the next SessionStart.
+        f"deadline=$(( $(date +%s) + {RELOAD_WATCHER_POLL_TIMEOUT_SECONDS} )); "
+        f"new_pid=''; "
+        f"while [ $(date +%s) -lt $deadline ]; do "
+        f"  new_pid=$(pgrep -f '{pgrep_pattern}' 2>/dev/null | head -n 1); "
+        f"  [ -n \"$new_pid\" ] && break; "
+        f"  sleep {RELOAD_WATCHER_POLL_INTERVAL_SECONDS}; "
+        f"done; "
+        f"if [ -n \"$new_pid\" ]; then "
+        f"  echo \"$(date): Cozempic guard resumed Claude in {log_dir} (new PID $new_pid)\" >> /tmp/cozempic_guard.log; "
+        f"else "
+        f"  printf '%s\\n%s\\n%s\\n%s\\n' 'failed' "
+        f"    \"$(date -Iseconds 2>/dev/null || date)\" "
+        f"    \"new Claude did not start within {RELOAD_WATCHER_POLL_TIMEOUT_SECONDS}s after resume_cmd (exit=$RESUME_EXIT)\" "
+        f"    'investigate: Terminal automation permission / claude -r auth / JSONL path / network' "
+        f"    > '{status_path}'; "
+        f"  echo \"$(date): Cozempic guard reload FAILED — no new Claude after {RELOAD_WATCHER_POLL_TIMEOUT_SECONDS}s\" >> /tmp/cozempic_guard.log; "
+        f"fi"
     )
 
     subprocess.Popen(
@@ -1576,6 +1822,21 @@ def start_guard_daemon(
 
     # Migrate: clean up legacy CWD-keyed PID files from pre-1.6.13
     _cleanup_legacy_pid(cwd)
+
+    # NEW-1 sentinel check: if a reload is in flight for this session, skip spawn.
+    # The reload watcher will unlink the sentinel after osascript fires; the new
+    # Claude's own SessionStart then spawns the real guard. This prevents the
+    # transient-daemon race where a concurrent upgrade-chain SessionStart re-fire
+    # claims the pidfile slot for the OLD Claude's dying session.
+    if session_id and _reload_sentinel_active(session_id):
+        return {
+            "started": False,
+            "reason": "reload in flight",
+            "pid": None,
+            "pid_file": None,
+            "log_file": None,
+            "already_running": False,
+        }
 
     # If we have a session_id, check if a guard already exists for THIS session
     if session_id:
@@ -1903,6 +2164,31 @@ def _is_cozempic_guard_process(pid: int) -> bool:
 
 
 _MTIME_LIVENESS_WINDOW_SEC = 60
+
+
+def _pid_is_alive(pid: int) -> bool:
+    """Bare process-liveness probe — does NOT consult the JSONL mtime.
+
+    Anti-resurrection: a dead PID must read as dead even when cozempic's own
+    ``save_messages`` just refreshed the session JSONL moments earlier.
+    ``_is_claude_process``'s mtime fallback would misread that fresh write as a
+    live Claude and let the reload watcher resurrect a session the user closed.
+    ``os.kill(pid, 0)`` answers liveness directly and is not fooled by it.
+    """
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # process exists, owned by another user
+    except OSError:
+        # Windows raises OSError [WinError 87] for a non-existent PID; treat any
+        # Windows os.kill failure as "gone". On POSIX an unexpected OSError here
+        # is rare — assume alive so we never skip a legitimate reload.
+        return os.name != "nt"
 
 
 def _is_claude_process(pid: int, session_path: Path | None = None) -> bool:
