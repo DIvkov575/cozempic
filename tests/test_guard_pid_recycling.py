@@ -227,15 +227,14 @@ class TestRecordClaudeIdentityOnStartGuard(unittest.TestCase):
         fake_pid = 12345
         fake_session_id = "sssssssstttt1111222233334444ssss"
 
-        # We need a real session file so start_guard doesn't bail early.
         with tempfile.TemporaryDirectory() as td:
             jsonl = Path(td) / "session.jsonl"
             jsonl.write_text("{}\n")
 
-            # Patch the world so start_guard runs exactly one cycle then stops.
             fake_session = {
                 "session_id": fake_session_id,
                 "session_path": str(jsonl),
+                "path": jsonl,
                 "project_dir": td,
             }
 
@@ -243,16 +242,26 @@ class TestRecordClaudeIdentityOnStartGuard(unittest.TestCase):
 
             def fake_record(sid, pid):
                 calls.append((sid, pid))
-                # After recording, raise to exit the watchdog loop cleanly.
 
-            with patch("cozempic.guard.find_current_session", return_value=fake_session), \
+            # start_guard calls _resolve_session_by_id (not find_current_session)
+            # when session_id is passed, then load_messages, detect_context_window,
+            # record_session, etc. Patch everything between session resolution and
+            # the watchdog loop so we reach line 503 (_record_claude_identity call).
+            with patch("cozempic.guard._resolve_session_by_id", return_value=fake_session), \
                  patch("cozempic.guard.find_claude_pid", return_value=fake_pid), \
                  patch("cozempic.guard._record_claude_identity", side_effect=fake_record), \
+                 patch("cozempic.guard.load_messages", return_value=[]), \
+                 patch("cozempic.tokens.detect_context_window", return_value=200000), \
+                 patch("cozempic.tokens.default_token_thresholds_4tier", return_value=(50000, 110000, 160000)), \
+                 patch("cozempic.session.record_session"), \
+                 patch("cozempic.guard._cleanup_stale_watchers"), \
+                 patch("cozempic.guard.ping_install_if_new"), \
+                 patch("cozempic.guard.maybe_auto_update"), \
                  patch("cozempic.guard.checkpoint_team"), \
                  patch("cozempic.guard.time.sleep", side_effect=RuntimeError("stop loop")):
                 try:
                     g.start_guard(session_id=fake_session_id, claude_pid=fake_pid)
-                except RuntimeError:
+                except (RuntimeError, SystemExit):
                     pass
 
         self.assertEqual(len(calls), 1, "_record_claude_identity must be called exactly once")

@@ -498,6 +498,10 @@ def start_guard(
     # Resolve Claude before daemonization or other reparenting can obscure it.
     if claude_pid is None:
         claude_pid = find_claude_pid()
+    # Record PID + start_time NOW — earliest point where both claude_pid and
+    # session_id are known and Claude's identity is confirmed by find_claude_pid.
+    if claude_pid and session_id:
+        _record_claude_identity(session_id, claude_pid)
     claude_alive = True
 
     prune_count = 0
@@ -538,12 +542,16 @@ def start_guard(
                     # PID reuse (daemon started hours ago; original Claude exited and
                     # kernel recycled its PID to an unrelated process).
                     try:
-                        if not _is_claude_process(claude_pid, session_path=session_path):
+                        if not _pid_identity_match(claude_pid, session_id) \
+                                or not _is_claude_process(claude_pid, session_path=session_path):
                             claude_alive = False
                     except ProcessLookupError:
                         claude_alive = False
                 if not claude_alive:
                     print(f"  [{_now()}] Claude process exited (PID {claude_pid}). Final checkpoint...")
+                    # Clear start-time record: this session's Claude is gone.
+                    if session_id:
+                        _CLAUDE_IDENTITY.pop(session_id, None)
                     # Option (b) defense-in-depth: unlink pidfile IMMEDIATELY so a
                     # concurrent SessionStart for the new Claude doesn't see a stale
                     # transient-daemon slot. The finally-block call is a no-op after
@@ -1287,6 +1295,14 @@ def _terminate_and_resume(
     # mtime fallback can misreport a dead Claude as alive. os.kill is not fooled.
     if not _pid_is_alive(claude_pid):
         print(f"  PID {claude_pid} is gone — skipping terminate+resume (no resurrection).")
+        return
+    # Start-time identity gate: if the PID was recycled to a different process
+    # after Claude died, the start_time recorded at startup will differ. This
+    # closes the residual resurrection vector left by the mtime fallback even
+    # after Junaid's mtime-immune liveness gate (06f91c3) — a recycled PID IS
+    # alive but is NOT the same Claude. Fails-OPEN when psutil is absent.
+    if not _pid_identity_match(claude_pid, session_id):
+        print(f"  PID {claude_pid} start-time mismatch — PID was recycled, skipping terminate+resume.")
         return
     # Identity (anti-PID-reuse): is this still actually Claude, not a recycled
     # PID? Per-block checks re-verify before each kill; this is the fail-fast.
