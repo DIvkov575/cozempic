@@ -2197,12 +2197,20 @@ def _get_pid_start_time(pid: int) -> float | None:
         return psutil.Process(pid).create_time()
     except ImportError:
         return None
-    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+    except Exception:
+        # psutil.Error subclasses, OSError, and platform-specific oddities all
+        # land here. Match the broad-except pattern used in _is_claude_process.
         return None
 
 
 def _record_claude_identity(session_id: str, pid: int) -> None:
-    """Record (pid, start_time) for the anti-recycling gate. Call once at startup."""
+    """Record (pid, start_time) for the anti-recycling gate. Call once at startup.
+
+    Validates pid is actually Claude (argv check) before recording — defense
+    in depth in case a future caller bypasses find_claude_pid's identity gate.
+    """
+    if not _is_claude_process(pid):
+        return
     start_time = _get_pid_start_time(pid)
     if start_time is not None and session_id:
         _CLAUDE_IDENTITY[session_id] = (pid, start_time)
@@ -2230,6 +2238,8 @@ def _pid_identity_match(pid: int, session_id: str | None) -> bool:
     current_start_time = _get_pid_start_time(pid)
     if current_start_time is None:
         return True  # psutil unavailable — degrade gracefully
+    # 0.1s tolerance absorbs float-precision noise across psutil's kernel-clock
+    # conversion; real PID-recycle gaps are seconds-to-hours, never sub-second.
     return abs(current_start_time - recorded_start_time) < 0.1
 
 

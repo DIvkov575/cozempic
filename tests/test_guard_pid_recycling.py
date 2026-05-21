@@ -46,9 +46,12 @@ class TestPidIdentityMatchRecycledPid(unittest.TestCase):
         import cozempic.guard as g
 
         # Use a real live PID (ourselves) and record its real start_time.
+        # _record_claude_identity now validates the PID is Claude (MED-1 hardening);
+        # mock that gate True for the test since pytest is not Claude.
         pid = os.getpid()
         session_id = "aaaa1111bbbb2222cccc3333dddd4444"
-        g._record_claude_identity(session_id, pid)
+        with patch.object(g, "_is_claude_process", return_value=True):
+            g._record_claude_identity(session_id, pid)
 
         # Confirm identity was recorded.
         self.assertIn(session_id, g._CLAUDE_IDENTITY)
@@ -70,7 +73,8 @@ class TestPidIdentityMatchRecycledPid(unittest.TestCase):
 
         pid = os.getpid()
         session_id = "aaaa1111bbbb2222cccc3333dddd5555"
-        g._record_claude_identity(session_id, pid)
+        with patch.object(g, "_is_claude_process", return_value=True):
+            g._record_claude_identity(session_id, pid)
 
         recorded_pid, recorded_start_time = g._CLAUDE_IDENTITY[session_id]
 
@@ -85,7 +89,8 @@ class TestPidIdentityMatchRecycledPid(unittest.TestCase):
 
         pid = os.getpid()
         session_id = "aaaa1111bbbb2222cccc3333dddd6666"
-        g._record_claude_identity(session_id, pid)
+        with patch.object(g, "_is_claude_process", return_value=True):
+            g._record_claude_identity(session_id, pid)
 
         # Pass a completely different PID.
         with patch("cozempic.guard._get_pid_start_time", return_value=9999999.0):
