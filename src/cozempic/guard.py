@@ -2165,6 +2165,57 @@ def _is_cozempic_guard_process(pid: int) -> bool:
 
 _MTIME_LIVENESS_WINDOW_SEC = 60
 
+# ── PID start-time identity store (anti-recycling gate) ─────────────────────
+# Keyed by session_id → (expected_pid, expected_start_time_float).
+# Populated once at start_guard startup after Claude PID is confirmed.
+# Cleared when Claude exits (watchdog break path).
+# In-memory is sufficient: the recycled-PID race occurs within one daemon
+# lifecycle. Daemon restart → fresh find_claude_pid() → fresh recording.
+_CLAUDE_IDENTITY: dict[str, tuple[int, float]] = {}
+
+
+def _get_pid_start_time(pid: int) -> float | None:
+    """Return process creation time in seconds since epoch via psutil, or None."""
+    try:
+        import psutil
+        return psutil.Process(pid).create_time()
+    except ImportError:
+        return None
+    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+        return None
+
+
+def _record_claude_identity(session_id: str, pid: int) -> None:
+    """Record (pid, start_time) for the anti-recycling gate. Call once at startup."""
+    start_time = _get_pid_start_time(pid)
+    if start_time is not None and session_id:
+        _CLAUDE_IDENTITY[session_id] = (pid, start_time)
+
+
+def _pid_identity_match(pid: int, session_id: str | None) -> bool:
+    """True if pid matches the recorded identity (same PID + same start_time).
+
+    Returns True conservatively when:
+    - session_id is None (no session context — backward compat)
+    - no identity has been recorded for this session_id (daemon restarted)
+    - psutil is unavailable (can't get start_time — degrade gracefully)
+
+    Fail-OPEN rationale: in all these cases we fall through to the existing
+    _pid_is_alive + _is_claude_process layers. No regression vs v1.8.16.
+    """
+    if not session_id:
+        return True
+    identity = _CLAUDE_IDENTITY.get(session_id)
+    if identity is None:
+        return True
+    recorded_pid, recorded_start_time = identity
+    if pid != recorded_pid:
+        return False
+    current_start_time = _get_pid_start_time(pid)
+    if current_start_time is None:
+        return True  # psutil unavailable — degrade gracefully
+    return abs(current_start_time - recorded_start_time) < 0.1
+
 
 def _pid_is_alive(pid: int) -> bool:
     """Bare process-liveness probe — does NOT consult the JSONL mtime.
