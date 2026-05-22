@@ -2190,17 +2190,74 @@ _MTIME_LIVENESS_WINDOW_SEC = 60
 _CLAUDE_IDENTITY: dict[str, tuple[int, float]] = {}
 
 
-def _get_pid_start_time(pid: int) -> float | None:
-    """Return process creation time in seconds since epoch via psutil, or None."""
+def _get_pid_start_time_linux(pid: int) -> float | None:
+    """Linux: read start_time from /proc/<pid>/stat + /proc/stat btime. No subprocess."""
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text()
+        # comm field may contain spaces and ')'; rfind(")") finds end of comm safely.
+        # After "pid (comm) ", fields are 0-indexed: index 19 = starttime (field 22).
+        after_comm = stat_text[stat_text.rfind(")") + 2:]
+        starttime_ticks = int(after_comm.split()[19])
+        btime_line = next(
+            line for line in Path("/proc/stat").read_text().splitlines()
+            if line.startswith("btime ")
+        )
+        btime = int(btime_line.split()[1])
+        return float(btime + starttime_ticks / os.sysconf("SC_CLK_TCK"))
+    except Exception:
+        return None
+
+
+def _get_pid_start_time_macos(pid: int) -> float | None:
+    """macOS: parse ps -o lstart= output. 1-second resolution; LC_ALL=C for locale safety."""
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "lstart="],
+            capture_output=True, text=True, timeout=2.0, check=False,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        # Normalize whitespace: single-digit days produce double-space ("May  1").
+        normalized = re.sub(r"\s+", " ", result.stdout.strip()).strip()
+        return float(time.mktime(time.strptime(normalized, "%a %b %d %H:%M:%S %Y")))
+    except Exception:
+        return None
+
+
+def _get_pid_start_time_psutil(pid: int) -> float | None:
+    """psutil fallback: microsecond precision; lazy-import (no required dep)."""
     try:
         import psutil
         return psutil.Process(pid).create_time()
     except ImportError:
         return None
     except Exception:
-        # psutil.Error subclasses, OSError, and platform-specific oddities all
-        # land here. Match the broad-except pattern used in _is_claude_process.
         return None
+
+
+def _get_pid_start_time(pid: int) -> float | None:
+    """Return process creation time in seconds since epoch, or None.
+
+    Platform-ordered chain (zero required deps):
+      Linux  → /proc/<pid>/stat  (10ms resolution, no subprocess)
+      macOS  → ps -p <pid> -o lstart=  (1s resolution, subprocess)
+      psutil → lazy-import fallback    (microsecond precision, all platforms)
+
+    Falls through to psutil if the platform-native backend fails (e.g.,
+    restricted /proc on containerised Linux, ps absent, permission error).
+    Returns None only when all backends fail → _pid_identity_match fails-OPEN.
+    """
+    _sys = platform.system()
+    if _sys == "Linux":
+        result = _get_pid_start_time_linux(pid)
+        if result is not None:
+            return result
+    elif _sys == "Darwin":
+        result = _get_pid_start_time_macos(pid)
+        if result is not None:
+            return result
+    return _get_pid_start_time_psutil(pid)
 
 
 def _record_claude_identity(session_id: str, pid: int) -> None:
@@ -2222,7 +2279,7 @@ def _pid_identity_match(pid: int, session_id: str | None) -> bool:
     Returns True conservatively when:
     - session_id is None (no session context — backward compat)
     - no identity has been recorded for this session_id (daemon restarted)
-    - psutil is unavailable (can't get start_time — degrade gracefully)
+    - all start-time backends fail (can't get start_time — degrade gracefully)
 
     Fail-OPEN rationale: in all these cases we fall through to the existing
     _pid_is_alive + _is_claude_process layers. No regression vs v1.8.16.
@@ -2237,7 +2294,7 @@ def _pid_identity_match(pid: int, session_id: str | None) -> bool:
         return False
     current_start_time = _get_pid_start_time(pid)
     if current_start_time is None:
-        return True  # psutil unavailable — degrade gracefully
+        return True  # all backends failed — degrade gracefully (fail-OPEN)
     # 0.1s tolerance absorbs float-precision noise across psutil's kernel-clock
     # conversion; real PID-recycle gaps are seconds-to-hours, never sub-second.
     return abs(current_start_time - recorded_start_time) < 0.1
