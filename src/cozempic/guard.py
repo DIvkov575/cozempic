@@ -2196,7 +2196,12 @@ def _get_pid_start_time_linux(pid: int) -> float | None:
         stat_text = Path(f"/proc/{pid}/stat").read_text()
         # comm field may contain spaces and ')'; rfind(")") finds end of comm safely.
         # After "pid (comm) ", fields are 0-indexed: index 19 = starttime (field 22).
-        after_comm = stat_text[stat_text.rfind(")") + 2:]
+        # Guard malformed /proc (fuse / WSL1 / BSD emulation); kernel /proc always
+        # has parens but the slice would silently misalign on no-parens input.
+        close_paren = stat_text.rfind(")")
+        if close_paren < 0:
+            return None
+        after_comm = stat_text[close_paren + 2:]
         starttime_ticks = int(after_comm.split()[19])
         btime_line = next(
             line for line in Path("/proc/stat").read_text().splitlines()
