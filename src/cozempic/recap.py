@@ -6,7 +6,7 @@ import re
 from collections import Counter
 from pathlib import Path
 
-from .helpers import get_content_blocks, get_msg_type, text_of
+from .helpers import atomic_write_text, get_content_blocks, get_msg_type, text_of
 from .types import Message
 
 # Common words that don't make good theme labels
@@ -185,5 +185,5 @@ def generate_recap(messages: list[Message], max_turns: int = 40) -> str:
 def save_recap(messages: list[Message], dest: Path, max_turns: int = 40) -> Path:
     """Generate and save recap to a file. Returns the path."""
     recap = generate_recap(messages, max_turns)
-    dest.write_text(recap, encoding="utf-8")
+    atomic_write_text(dest, recap)
     return dest
