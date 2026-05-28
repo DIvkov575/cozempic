@@ -11,7 +11,6 @@ from __future__ import annotations
 import os
 import sys
 import time
-from pathlib import Path
 from typing import Callable
 
 try:
@@ -68,9 +67,12 @@ class JsonlWatcher:
             # File not yet created — poll path handles OSError gracefully
             self._watch_poll()
             return
-        kq = select.kqueue()
+        # kq = None sentinel: if select.kqueue() raises (e.g. EMFILE), the finally
+        # block below must still close fd — deterministic, not GC-dependent.
+        kq = None
         inode_replaced = False
         try:
+            kq = select.kqueue()
             ev = select.kevent(
                 fd,
                 filter=select.KQ_FILTER_VNODE,
@@ -99,7 +101,8 @@ class JsonlWatcher:
                 if inode_replaced:
                     break
         finally:
-            kq.close()
+            if kq is not None:
+                kq.close()
             os.close(fd)
         if inode_replaced and self._running:
             self._watch_poll()
