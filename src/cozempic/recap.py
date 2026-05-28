@@ -65,9 +65,11 @@ def _clean_user_text(text: str) -> str:
 
 def _truncate(text: str, max_len: int = 70) -> str:
     """Truncate text to max_len, adding ellipsis if needed."""
-    if len(text) > max_len:
-        return text[: max_len - 3] + "..."
-    return text
+    if len(text) <= max_len:
+        return text
+    if max_len <= 3:
+        return text[:max_len]
+    return text[: max_len - 3] + "..."
 
 
 def _extract_themes(topics: list[str], max_themes: int = 5) -> list[tuple[str, int]]:
