@@ -14,6 +14,12 @@ import time
 from pathlib import Path
 from typing import Callable
 
+try:
+    import select as _select
+    _HAS_KQUEUE = hasattr(_select, "kqueue")
+except ImportError:
+    _HAS_KQUEUE = False
+
 
 class JsonlWatcher:
     """Watch a JSONL file for size growth. Sub-second on macOS via kqueue."""
@@ -23,7 +29,7 @@ class JsonlWatcher:
         self.on_growth = on_growth
         self._running = False
         self._last_size = self._get_size()
-        self._use_kqueue = hasattr(__import__("select"), "kqueue")
+        self._use_kqueue = _HAS_KQUEUE
         self._cb_error_logged = False
 
     def _get_size(self) -> int:
