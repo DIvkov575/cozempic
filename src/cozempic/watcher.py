@@ -9,6 +9,7 @@ Stdlib only — no dependencies.
 from __future__ import annotations
 
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Callable
@@ -23,6 +24,7 @@ class JsonlWatcher:
         self._running = False
         self._last_size = self._get_size()
         self._use_kqueue = hasattr(__import__("select"), "kqueue")
+        self._cb_error_logged = False
 
     def _get_size(self) -> int:
         try:
@@ -40,6 +42,12 @@ class JsonlWatcher:
 
     def stop(self) -> None:
         self._running = False
+
+    def _log_cb_error(self, exc: Exception) -> None:
+        """Log the first on_growth callback error to stderr; suppress repeats."""
+        if not self._cb_error_logged:
+            print(f"  [watcher] on_growth error: {exc}", file=sys.stderr)
+            self._cb_error_logged = True
 
     def _watch_kqueue(self) -> None:
         """macOS kqueue watcher — 0.04ms wake latency, 0% CPU idle."""
@@ -64,12 +72,15 @@ class JsonlWatcher:
                 events = kq.control([ev], 1, 1.0)
                 if events:
                     new_size = self._get_size()
+                    if new_size < self._last_size:
+                        # File shrank (prune completed) — reset baseline
+                        self._last_size = new_size
                     if new_size > self._last_size:
                         self._last_size = new_size
                         try:
                             self.on_growth(self.filepath, new_size)
-                        except Exception:
-                            pass  # Don't crash the watcher thread
+                        except Exception as exc:
+                            self._log_cb_error(exc)  # don't crash the watcher thread
         finally:
             kq.close()
             os.close(fd)
@@ -79,9 +90,12 @@ class JsonlWatcher:
         while self._running:
             time.sleep(0.2)
             new_size = self._get_size()
+            if new_size < self._last_size:
+                # File shrank (prune completed) — reset baseline
+                self._last_size = new_size
             if new_size > self._last_size:
                 self._last_size = new_size
                 try:
                     self.on_growth(self.filepath, new_size)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    self._log_cb_error(exc)  # don't crash the watcher thread
