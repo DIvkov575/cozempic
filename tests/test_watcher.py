@@ -1,10 +1,11 @@
-"""RED tests for JsonlWatcher bugs W1-W5.
+"""Tests for JsonlWatcher bugs W1-W5.
 
-W1 — kqueue fd leak (kq never closed in finally)
+W1 — kqueue fd must be closed deterministically (not relying on GC / CPython refcount)
 W2 — FileNotFoundError crash when file missing at start
 W3 — _last_size not reset after shrink → growth blindness post-prune
-W4 — on_growth exceptions silently swallowed; must log to stderr
+W4 — on_growth exceptions silently swallowed; must log to stderr (one-shot)
 W5 — kqueue watches orphaned inode after os.replace → blind post-prune (kqueue only)
+W6 — module-level _HAS_KQUEUE constant (no __import__ idiom in __init__)
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import MagicMock, call, patch
 
 from cozempic.watcher import JsonlWatcher
 
@@ -23,18 +25,6 @@ from cozempic.watcher import JsonlWatcher
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def _open_fd_count() -> int:
-    """Return number of open fds for current process (macOS/Linux)."""
-    import subprocess
-    pid = os.getpid()
-    try:
-        # macOS / BSD
-        out = subprocess.check_output(["lsof", "-p", str(pid), "-n"], text=True)
-        return len(out.strip().splitlines()) - 1  # strip header
-    except Exception:
-        return -1
-
 
 def _make_watcher(path: str, callback, *, use_kqueue: bool) -> JsonlWatcher:
     """Create a JsonlWatcher with an overridden _use_kqueue flag."""
@@ -50,51 +40,89 @@ def _start_thread(watcher: JsonlWatcher) -> threading.Thread:
 
 
 # ---------------------------------------------------------------------------
-# W1 — kqueue fd leak
+# W1 — kqueue fd must close deterministically; must not rely on GC
 # ---------------------------------------------------------------------------
 
 @unittest.skipUnless(sys.platform == "darwin", "kqueue macOS only")
 class TestJsonlWatcherFdLeak(unittest.TestCase):
-    """W1: kq.close() must be called in finally or kqueue fd leaks."""
+    """W1: kq.close() must be called in finally — not left to GC.
 
-    def test_kqueue_fd_closed_after_normal_stop(self):
-        """Each start/stop cycle must NOT leak a kqueue fd."""
+    Tests use mock-spy so they are deterministic and RED if kq.close() is
+    removed from the finally block (CPython GC happens to call __del__ in
+    the simple case, making lsof-count tests unreliable as regression guards).
+    """
+
+    def test_kqueue_close_called_after_normal_stop(self):
+        """kq.close() must be called deterministically when watcher stops normally.
+
+        select.kqueue is a C extension — its .close attribute is read-only, so we
+        cannot monkey-patch the method on the instance directly. Instead, wrap the
+        real kqueue object in a MagicMock that proxies control() and tracks close().
+        """
+        import select as _sel
+
         with tempfile.NamedTemporaryFile(delete=False, suffix=".jsonl") as f:
             path = f.name
         try:
-            before = _open_fd_count()
-            w = _make_watcher(path, lambda p, s: None, use_kqueue=True)
-            t = _start_thread(w)
-            time.sleep(0.2)
-            w.stop()
-            t.join(timeout=2)
-            after = _open_fd_count()
-            # Allow ±2 slack for any incidental fd (e.g. lsof itself)
-            delta = after - before
-            self.assertLessEqual(delta, 2,
-                f"fd delta={delta} — kqueue fd may be leaking (W1 not fixed)")
+            close_called = threading.Event()
+
+            real_kqueue_cls = _sel.kqueue
+
+            def spy_kqueue():
+                real_kq = real_kqueue_cls()
+                mock_kq = MagicMock()
+                # Proxy control() through to the real kqueue so the watcher loop works
+                mock_kq.control.side_effect = real_kq.control
+                # Track close() and also close the real fd to avoid leaking it
+                def tracked_close():
+                    close_called.set()
+                    real_kq.close()
+                mock_kq.close.side_effect = tracked_close
+                return mock_kq
+
+            with patch("select.kqueue", side_effect=spy_kqueue):
+                w = _make_watcher(path, lambda p, s: None, use_kqueue=True)
+                t = _start_thread(w)
+                time.sleep(0.2)
+                w.stop()
+                t.join(timeout=2)
+
+            self.assertTrue(close_called.is_set(),
+                "kq.close() never called after normal stop. "
+                "W1 not fixed: deterministic close absent (matters on PyPy / ref-cycles).")
         finally:
             os.unlink(path)
 
-    def test_kqueue_fd_closed_on_file_disappear(self):
-        """Even if the watched file is deleted mid-watch, no fd should leak."""
+    def test_kqueue_fd_closed_if_kqueue_constructor_raises(self):
+        """If select.kqueue() raises, the file fd opened before it must still be closed.
+
+        This is H-2: `kq = select.kqueue()` sits outside the try whose finally
+        closes fd — if kqueue() raises (EMFILE / OSError), fd leaks.
+        Fix requires kq = None sentinel so finally always closes fd.
+        """
+        import select as _sel
+
         with tempfile.NamedTemporaryFile(delete=False, suffix=".jsonl") as f:
             path = f.name
         try:
-            before = _open_fd_count()
-            w = _make_watcher(path, lambda p, s: None, use_kqueue=True)
-            t = _start_thread(w)
-            time.sleep(0.15)
+            fd_closed = threading.Event()
+            real_os_close = os.close
+
+            def spy_close(fd: int) -> None:
+                fd_closed.set()
+                real_os_close(fd)
+
+            with patch("select.kqueue", side_effect=OSError("EMFILE simulated")), \
+                 patch("os.close", side_effect=spy_close):
+                w = _make_watcher(path, lambda p, s: None, use_kqueue=True)
+                t = _start_thread(w)
+                t.join(timeout=2)
+
+            self.assertTrue(fd_closed.is_set(),
+                "os.close(fd) not called after select.kqueue() raised OSError. "
+                "H-2: fd leaks when kqueue constructor fails.")
+        finally:
             os.unlink(path)
-            time.sleep(0.15)
-            w.stop()
-            t.join(timeout=2)
-            after = _open_fd_count()
-            delta = after - before
-            self.assertLessEqual(delta, 2,
-                f"fd delta={delta} — kqueue fd leaked on file disappear (W1 not fixed)")
-        except FileNotFoundError:
-            pass  # already deleted
 
 
 # ---------------------------------------------------------------------------
@@ -107,20 +135,16 @@ class TestJsonlWatcherMissingFileKqueue(unittest.TestCase):
 
     def test_kqueue_falls_back_to_poll_when_file_missing(self):
         """Watcher thread must stay alive when file doesn't exist at start (kqueue)."""
-        path = "/tmp/_cozempic_test_nonexistent_watcher_kqueue.jsonl"
-        # Ensure it doesn't exist
-        try:
-            os.unlink(path)
-        except FileNotFoundError:
-            pass
-        w = _make_watcher(path, lambda p, s: None, use_kqueue=True)
-        t = _start_thread(w)
-        t.join(timeout=1.0)
-        # Thread should still be alive (poll loop keeps running)
-        self.assertTrue(t.is_alive(),
-            "Watcher thread died immediately on missing file (W2 not fixed: os.open unguarded)")
-        w.stop()
-        t.join(timeout=2)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "nonexistent.jsonl")
+            w = _make_watcher(path, lambda p, s: None, use_kqueue=True)
+            t = _start_thread(w)
+            t.join(timeout=1.0)
+            # Thread should still be alive (fell back to poll loop, which returns 0 for OSError)
+            self.assertTrue(t.is_alive(),
+                "Watcher thread died immediately on missing file (W2 not fixed: os.open unguarded)")
+            w.stop()
+            t.join(timeout=2)
 
 
 class TestJsonlWatcherMissingFilePoll(unittest.TestCase):
@@ -128,18 +152,15 @@ class TestJsonlWatcherMissingFilePoll(unittest.TestCase):
 
     def test_poll_handles_missing_file_gracefully(self):
         """Poll-mode watcher must stay alive when file doesn't exist."""
-        path = "/tmp/_cozempic_test_nonexistent_watcher_poll.jsonl"
-        try:
-            os.unlink(path)
-        except FileNotFoundError:
-            pass
-        w = _make_watcher(path, lambda p, s: None, use_kqueue=False)
-        t = _start_thread(w)
-        time.sleep(0.35)
-        self.assertTrue(t.is_alive(),
-            "Poll watcher thread died on missing file")
-        w.stop()
-        t.join(timeout=2)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "nonexistent.jsonl")
+            w = _make_watcher(path, lambda p, s: None, use_kqueue=False)
+            t = _start_thread(w)
+            time.sleep(0.35)
+            self.assertTrue(t.is_alive(),
+                "Poll watcher thread died on missing file")
+            w.stop()
+            t.join(timeout=2)
 
 
 # ---------------------------------------------------------------------------
@@ -283,25 +304,28 @@ class TestJsonlWatcherCallbackErrorLoggedPoll(unittest.TestCase):
             f.write(b"a" * 100)
 
         try:
+            logged = threading.Event()
+
             def bad_cb(path: str, size: int) -> None:
                 raise RuntimeError("boom from test")
 
             w = _make_watcher(path, bad_cb, use_kqueue=False)
 
             captured = io.StringIO()
-            old_stderr = sys.stderr
-            sys.stderr = captured
+            # Patch sys.stderr in the watcher module so the background thread sees it
+            import cozempic.watcher as watcher_mod
+            old_stderr = watcher_mod.sys.stderr
+            watcher_mod.sys.stderr = captured
 
             try:
                 t = _start_thread(w)
-                # Trigger growth
                 with open(path, "ab") as f:
                     f.write(b"b" * 200)
                 time.sleep(0.6)
                 w.stop()
                 t.join(timeout=2)
             finally:
-                sys.stderr = old_stderr
+                watcher_mod.sys.stderr = old_stderr
 
             err_output = captured.getvalue()
             self.assertIn("[watcher]", err_output,
@@ -319,10 +343,7 @@ class TestJsonlWatcherCallbackErrorLoggedPoll(unittest.TestCase):
             f.write(b"a" * 100)
 
         try:
-            call_count = [0]
-
             def bad_cb(path: str, size: int) -> None:
-                call_count[0] += 1
                 raise RuntimeError("crash me")
 
             w = _make_watcher(path, bad_cb, use_kqueue=False)
@@ -354,12 +375,12 @@ class TestJsonlWatcherCallbackErrorLoggedPoll(unittest.TestCase):
             w = _make_watcher(path, bad_cb, use_kqueue=False)
 
             captured = io.StringIO()
-            old_stderr = sys.stderr
-            sys.stderr = captured
+            import cozempic.watcher as watcher_mod
+            old_stderr = watcher_mod.sys.stderr
+            watcher_mod.sys.stderr = captured
 
             try:
                 t = _start_thread(w)
-                # Trigger multiple growth events
                 for i in range(3):
                     with open(path, "ab") as f:
                         f.write(b"x" * 100)
@@ -367,14 +388,62 @@ class TestJsonlWatcherCallbackErrorLoggedPoll(unittest.TestCase):
                 w.stop()
                 t.join(timeout=2)
             finally:
-                sys.stderr = old_stderr
+                watcher_mod.sys.stderr = old_stderr
 
             err_output = captured.getvalue()
-            # Should log exactly once — count occurrences of the sentinel
             occurrences = err_output.count("[watcher]")
             self.assertEqual(occurrences, 1,
                 f"Expected exactly 1 '[watcher]' log line, got {occurrences}. "
                 "One-shot suppression (W4) not implemented.")
+        finally:
+            os.unlink(path)
+
+    def test_error_log_resets_after_successful_callback(self):
+        """_cb_error_logged must reset to False after a successful on_growth call.
+
+        Without reset, one transient error permanently silences logging for
+        an hours-long daemon. Reset on success re-enables visibility after recovery.
+        """
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jsonl",
+                                         mode="wb") as f:
+            path = f.name
+            f.write(b"a" * 50)
+
+        try:
+            call_count = [0]
+            # First call raises, second call succeeds, third call raises again
+            def intermittent_cb(path: str, size: int) -> None:
+                n = call_count[0]
+                call_count[0] += 1
+                if n == 0 or n == 2:
+                    raise RuntimeError(f"transient error #{n}")
+                # n == 1: success — should reset _cb_error_logged
+
+            w = _make_watcher(path, intermittent_cb, use_kqueue=False)
+
+            captured = io.StringIO()
+            import cozempic.watcher as watcher_mod
+            old_stderr = watcher_mod.sys.stderr
+            watcher_mod.sys.stderr = captured
+
+            try:
+                t = _start_thread(w)
+                # Trigger 3 growth events: error, success, error
+                for i in range(3):
+                    with open(path, "ab") as f:
+                        f.write(b"x" * 100)
+                    time.sleep(0.4)
+                w.stop()
+                t.join(timeout=2)
+            finally:
+                watcher_mod.sys.stderr = old_stderr
+
+            err_output = captured.getvalue()
+            occurrences = err_output.count("[watcher]")
+            # First error logged, success resets flag, third error logged again → 2
+            self.assertEqual(occurrences, 2,
+                f"Expected 2 '[watcher]' log lines (reset on success), got {occurrences}. "
+                "M-3 not fixed: _cb_error_logged not reset after successful callback.")
         finally:
             os.unlink(path)
 
@@ -397,8 +466,9 @@ class TestJsonlWatcherCallbackErrorLoggedKqueue(unittest.TestCase):
             w = _make_watcher(path, bad_cb, use_kqueue=True)
 
             captured = io.StringIO()
-            old_stderr = sys.stderr
-            sys.stderr = captured
+            import cozempic.watcher as watcher_mod
+            old_stderr = watcher_mod.sys.stderr
+            watcher_mod.sys.stderr = captured
 
             try:
                 t = _start_thread(w)
@@ -408,7 +478,7 @@ class TestJsonlWatcherCallbackErrorLoggedKqueue(unittest.TestCase):
                 w.stop()
                 t.join(timeout=2)
             finally:
-                sys.stderr = old_stderr
+                watcher_mod.sys.stderr = old_stderr
 
             err_output = captured.getvalue()
             self.assertIn("[watcher]", err_output,
@@ -429,34 +499,41 @@ class TestJsonlWatcherInodeReplacement(unittest.TestCase):
     """W5: after os.replace (atomic prune), watcher must still detect growth."""
 
     def test_kqueue_detects_growth_after_atomic_replace(self):
-        """Growth after os.replace must fire on_growth (via poll fallback)."""
+        """Growth after os.replace must fire on_growth (via poll fallback).
+
+        The new file after os.replace is grown ABOVE the original size (800B > 500B)
+        so the callback fires unambiguously regardless of what _last_size inherited
+        from the kqueue phase.
+        """
         fired: list[int] = []
         growth_after_replace = threading.Event()
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=".jsonl",
                                          mode="wb") as f:
             path = f.name
-            f.write(b"x" * 500)
+            f.write(b"x" * 500)  # original: 500 bytes
 
         try:
             def cb(p: str, size: int) -> None:
                 fired.append(size)
-                growth_after_replace.set()
+                if size > 500:
+                    growth_after_replace.set()
 
             w = _make_watcher(path, cb, use_kqueue=True)
+            # _last_size = 500 at __init__
             t = _start_thread(w)
             time.sleep(0.2)  # let kqueue register
 
-            # Simulate atomic prune: write smaller content to tmp, replace
+            # Simulate atomic prune: replace with 50B (shrink), then grow to 800B
             tmp_path = path + ".tmp"
             with open(tmp_path, "wb") as f:
                 f.write(b"y" * 50)
-            os.replace(tmp_path, path)
-            time.sleep(0.2)  # let DELETE/RENAME event fire
+            os.replace(tmp_path, path)   # DELETE/RENAME event → poll takeover
+            time.sleep(0.3)              # let poll takeover complete
 
-            # Now grow the new file
+            # Grow new file well above original 500B
             with open(path, "ab") as f:
-                f.write(b"z" * 300)
+                f.write(b"z" * 750)     # total ~800B > 500B original
 
             growth_after_replace.wait(timeout=3.0)
             w.stop()
@@ -464,7 +541,7 @@ class TestJsonlWatcherInodeReplacement(unittest.TestCase):
 
             self.assertTrue(
                 growth_after_replace.is_set(),
-                f"on_growth did not fire after os.replace+growth. "
+                f"on_growth did not fire with size>500 after os.replace+growth. "
                 f"fired={fired}. W5 not fixed: kqueue watches orphaned inode.",
             )
         finally:
@@ -478,15 +555,44 @@ class TestJsonlWatcherInodeReplacement(unittest.TestCase):
                 pass
 
     def test_kqueue_registers_delete_rename_fflags(self):
-        """kqueue kevent must include KQ_NOTE_DELETE and KQ_NOTE_RENAME in fflags."""
-        import select
-        # This test verifies the fix design by checking the module-level constants
-        # are accessible (belt-and-braces: validates the test environment).
-        self.assertTrue(hasattr(select, "KQ_NOTE_DELETE"),
-            "select.KQ_NOTE_DELETE not available")
-        self.assertTrue(hasattr(select, "KQ_NOTE_RENAME"),
-            "select.KQ_NOTE_RENAME not available")
-        # The actual fflags check is covered by test_kqueue_detects_growth_after_atomic_replace
+        """kqueue kevent fflags arg must include KQ_NOTE_DELETE and KQ_NOTE_RENAME.
+
+        Uses mock to intercept select.kevent construction and inspect the fflags
+        keyword argument. RED at base if KQ_NOTE_DELETE/RENAME absent from fflags.
+        """
+        import select as _sel
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jsonl",
+                                         mode="wb") as f:
+            path = f.name
+            f.write(b"x" * 100)
+
+        try:
+            kevent_calls: list[dict] = []
+            real_kevent = _sel.kevent
+
+            def spy_kevent(*args, **kwargs):
+                kevent_calls.append(kwargs)
+                return real_kevent(*args, **kwargs)
+
+            with patch("select.kevent", side_effect=spy_kevent):
+                w = _make_watcher(path, lambda p, s: None, use_kqueue=True)
+                t = _start_thread(w)
+                time.sleep(0.2)
+                w.stop()
+                t.join(timeout=2)
+
+            self.assertTrue(kevent_calls, "select.kevent was never called (test setup issue)")
+            fflags = kevent_calls[0].get("fflags", 0)
+            self.assertTrue(fflags & _sel.KQ_NOTE_DELETE,
+                f"KQ_NOTE_DELETE not in fflags={fflags:#x}. W5 incomplete.")
+            self.assertTrue(fflags & _sel.KQ_NOTE_RENAME,
+                f"KQ_NOTE_RENAME not in fflags={fflags:#x}. W5 incomplete.")
+        finally:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -508,8 +614,6 @@ class TestJsonlWatcherImportIdiom(unittest.TestCase):
     def test_init_uses_module_constant_not_import_idiom(self):
         """JsonlWatcher._use_kqueue must be derived from _HAS_KQUEUE, not inline __import__."""
         import cozempic.watcher as watcher_mod
-        # The __import__ idiom is gone when _HAS_KQUEUE exists at module level.
-        # We verify by instantiating without a real file and checking the flag.
         with tempfile.NamedTemporaryFile(delete=False, suffix=".jsonl") as f:
             path = f.name
         try:
