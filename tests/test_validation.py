@@ -274,6 +274,14 @@ class TestParseEnvBool(unittest.TestCase):
         """Leading/trailing whitespace must be stripped before token lookup."""
         self.assertTrue(self._call(raw="  true  "))
 
+    def test_whitespace_stripped_numeric(self):
+        """Whitespace around a numeric truthy token must also be stripped."""
+        self.assertTrue(self._call(raw="  1  "))
+
+    def test_whitespace_stripped_uppercase_on(self):
+        """Whitespace + uppercase truthy token 'ON' → True (strip + lower)."""
+        self.assertTrue(self._call(raw="  ON  "))
+
     # ── warn=False suppresses stderr on unrecognized ─────────────────────────
 
     def test_warn_false_suppresses_warning(self):

@@ -401,3 +401,17 @@ class TestDigestSessionResolution:
                 assert False, "expected SystemExit(1)"
             except SystemExit as exc:
                 assert exc.code == 1, f"expected exit 1, got {exc.code}"
+
+    def test_current_literal_uses_cwd_find_current(self):
+        """args.session='current' → uses cwd-based find_current_session (same as
+        no-session path), NOT resolve_session('current') which uses process-detection.
+        C3: keeps both paths consistent."""
+        fake_sess = {"path": Path("/y/curr.jsonl"), "session_id": "curr"}
+        with patch("cozempic.session.find_current_session", return_value=fake_sess) as mock_fc, \
+             patch("cozempic.session.resolve_session") as mock_rs:
+            path, session_id, cwd = _digest_session(self._make_args(session="current"))
+        # Must use find_current_session (cwd-based), NOT resolve_session
+        mock_fc.assert_called_once()
+        mock_rs.assert_not_called()
+        assert path == Path("/y/curr.jsonl")
+        assert session_id == "curr"

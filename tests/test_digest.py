@@ -2758,6 +2758,21 @@ class TestDebugFlagTokens(unittest.TestCase):
     import-time assignment also picks up `true`/`yes`/`on`.
     """
 
+    def setUp(self):
+        """Ensure each test starts with a clean slate:
+        - module-level _DEBUG forced to False (so tests don't inherit a True
+          state left by the Strategy C reload test or a prior test run)
+        - COZEMPIC_DEBUG removed from env (so a shell-inherited value
+          doesn't poison tests that expect env to be absent)
+        """
+        _digest_module._DEBUG = False
+        os.environ.pop("COZEMPIC_DEBUG", None)
+
+    def tearDown(self):
+        """Restore module state after each test (mirrors setUp for symmetry)."""
+        _digest_module._DEBUG = False
+        os.environ.pop("COZEMPIC_DEBUG", None)
+
     def _capture_debug(self, env_val: str | None) -> str:
         """Call `_debug()` with `_DEBUG=False` (monkeypatched) and the
         given env var, return captured stderr."""

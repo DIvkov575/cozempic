@@ -1089,7 +1089,11 @@ def _digest_session(args):
     from .session import find_current_session, resolve_session
     cwd = getattr(args, "cwd", None) or os.getcwd()
     session_arg = getattr(args, "session", None)
-    if not session_arg:
+    if not session_arg or session_arg == "current":
+        # Both absent and explicit "current" use cwd-based auto-detection,
+        # consistent with how the rest of cli.py resolves the current session.
+        # Routing "current" through resolve_session() would use process-detection
+        # (find_current_session(strict=False)) which is a different strategy.
         sess = find_current_session(cwd)
         if not sess:
             # Changed to stderr: consistent with resolve_session error output
@@ -1097,7 +1101,7 @@ def _digest_session(args):
             print("No active session found.", file=sys.stderr)
             sys.exit(1)
         return sess["path"], sess.get("session_id", ""), cwd
-    # resolve_session handles: explicit path, UUID, UUID prefix, "current"
+    # resolve_session handles: explicit path, UUID, UUID prefix
     resolved = resolve_session(session_arg)
     session_id = resolved.stem  # filename stem IS the session UUID
     return resolved, session_id, cwd
