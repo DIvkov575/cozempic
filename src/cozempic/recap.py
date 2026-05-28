@@ -111,8 +111,12 @@ def generate_recap(messages: list[Message], max_turns: int = 40) -> str:
 
     Shows: exchange count, theme clusters, recent topics, and where things left off.
     Target: ~12-16 lines.
+
+    max_turns: how many most-recent user turns to consider for topic analysis
+    (default 40). Older turns beyond max_turns are excluded from topics and
+    theme extraction, but the exchange count still reflects the full session.
     """
-    user_turns: list[str] = []
+    all_user_turns: list[str] = []
     last_assistant: str = ""
 
     for _, msg, _ in messages:
@@ -122,16 +126,25 @@ def generate_recap(messages: list[Message], max_turns: int = 40) -> str:
             text = _extract_text(msg)
             text = _clean_user_text(text)
             if text and len(text) >= 3:
-                user_turns.append(text)
+                all_user_turns.append(text)
 
         elif msg_type == "assistant":
             text = _extract_text(msg)
-            text = re.sub(r"\s+", " ", text).strip()
+            text = _clean_user_text(text)
             if text and len(text) >= 3:
                 last_assistant = text
 
-    if not user_turns:
+    if not all_user_turns:
         return ""
+
+    total_exchanges = len(all_user_turns)
+
+    # Limit topic analysis to the most-recent max_turns user turns
+    user_turns = (
+        all_user_turns[-max_turns:]
+        if len(all_user_turns) > max_turns
+        else all_user_turns
+    )
 
     # Deduplicate: keep unique user requests (by first 40 chars)
     seen: set[str] = set()
@@ -146,7 +159,7 @@ def generate_recap(messages: list[Message], max_turns: int = 40) -> str:
     lines = [
         "",
         "  PREVIOUSLY ON THIS SESSION",
-        f"  {len(user_turns)} exchanges | {len(unique_topics)} topics",
+        f"  {total_exchanges} exchanges | {len(unique_topics)} topics",
         "",
     ]
 
