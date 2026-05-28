@@ -206,3 +206,40 @@ def parse_env_non_negative_int(name: str) -> int | None:
         _env_warn(name, raw, "must be non-negative")
         return None
     return value
+
+
+# Token sets are module-level constants so tests can import and inspect them.
+_BOOL_TRUE_TOKENS: frozenset[str] = frozenset({"1", "true", "yes", "on"})
+_BOOL_FALSE_TOKENS: frozenset[str] = frozenset({"0", "false", "no", "off"})
+
+
+def parse_env_bool(name: str, default: bool = False, warn: bool = True) -> bool:
+    """Read env var `name`, parse as boolean, return `default` if absent.
+
+    Truthy tokens (case-insensitive, whitespace stripped): 1, true, yes, on
+    Falsy tokens  (case-insensitive, whitespace stripped): 0, false, no, off
+    Unrecognized non-empty value: if `warn`, emits a warning to stderr and
+    returns `default`.  Empty / absent: returns `default` silently.
+
+    Follows the warn+fallback contract of parse_env_positive_int:
+    env vars are ambient config; an unrecognized value must not crash.
+
+    The `warn` parameter suppresses the warning when set to False — useful
+    for in-body re-reads that run on every call (e.g. _debug()) where a
+    single module-load warning is enough and per-call spam would drown output.
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    normalized = raw.strip().lower()
+    if normalized in _BOOL_TRUE_TOKENS:
+        return True
+    if normalized in _BOOL_FALSE_TOKENS:
+        return False
+    if warn:
+        _env_warn(
+            name,
+            raw,
+            f"must be one of {sorted(_BOOL_TRUE_TOKENS | _BOOL_FALSE_TOKENS)}",
+        )
+    return default
