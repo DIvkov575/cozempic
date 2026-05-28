@@ -50,7 +50,10 @@ class JsonlWatcher:
             self._cb_error_logged = True
 
     def _watch_kqueue(self) -> None:
-        """macOS kqueue watcher — 0.04ms wake latency, 0% CPU idle."""
+        """macOS kqueue watcher — 0.04ms wake latency, 0% CPU idle.
+
+        Falls back to poll if the watched inode is replaced (os.replace / atomic prune).
+        """
         import select
 
         try:
@@ -60,17 +63,23 @@ class JsonlWatcher:
             self._watch_poll()
             return
         kq = select.kqueue()
+        inode_replaced = False
         try:
             ev = select.kevent(
                 fd,
                 filter=select.KQ_FILTER_VNODE,
                 flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR,
-                fflags=select.KQ_NOTE_WRITE | select.KQ_NOTE_EXTEND,
+                fflags=(select.KQ_NOTE_WRITE | select.KQ_NOTE_EXTEND
+                        | select.KQ_NOTE_DELETE | select.KQ_NOTE_RENAME),
             )
             while self._running:
                 # Block up to 1s, then re-check _running
                 events = kq.control([ev], 1, 1.0)
-                if events:
+                for event in events:
+                    if event.fflags & (select.KQ_NOTE_DELETE | select.KQ_NOTE_RENAME):
+                        # Inode replaced (atomic prune via os.replace); drop to poll
+                        inode_replaced = True
+                        break
                     new_size = self._get_size()
                     if new_size < self._last_size:
                         # File shrank (prune completed) — reset baseline
@@ -81,9 +90,13 @@ class JsonlWatcher:
                             self.on_growth(self.filepath, new_size)
                         except Exception as exc:
                             self._log_cb_error(exc)  # don't crash the watcher thread
+                if inode_replaced:
+                    break
         finally:
             kq.close()
             os.close(fd)
+        if inode_replaced and self._running:
+            self._watch_poll()
 
     def _watch_poll(self) -> None:
         """Fallback polling watcher — 200ms interval."""
