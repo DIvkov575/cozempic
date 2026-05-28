@@ -83,7 +83,7 @@ def _extract_themes(topics: list[str], max_themes: int = 5) -> list[tuple[str, i
     word_to_topics: dict[str, set[int]] = {}
 
     for i, topic in enumerate(topics):
-        words = set(re.findall(r"[a-z][a-z_-]+", topic.lower()))
+        words = {w.rstrip("_-") for w in re.findall(r"[a-z][a-z_-]+", topic.lower())}
         words -= _STOP_WORDS
         words = {w for w in words if len(w) > 2}
         for word in words:
