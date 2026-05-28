@@ -45,7 +45,12 @@ class JsonlWatcher:
         """macOS kqueue watcher — 0.04ms wake latency, 0% CPU idle."""
         import select
 
-        fd = os.open(self.filepath, os.O_RDONLY)
+        try:
+            fd = os.open(self.filepath, os.O_RDONLY)
+        except FileNotFoundError:
+            # File not yet created — poll path handles OSError gracefully
+            self._watch_poll()
+            return
         kq = select.kqueue()
         try:
             ev = select.kevent(
