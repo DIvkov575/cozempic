@@ -46,8 +46,8 @@ class JsonlWatcher:
         import select
 
         fd = os.open(self.filepath, os.O_RDONLY)
+        kq = select.kqueue()
         try:
-            kq = select.kqueue()
             ev = select.kevent(
                 fd,
                 filter=select.KQ_FILTER_VNODE,
@@ -66,6 +66,7 @@ class JsonlWatcher:
                         except Exception:
                             pass  # Don't crash the watcher thread
         finally:
+            kq.close()
             os.close(fd)
 
     def _watch_poll(self) -> None:
