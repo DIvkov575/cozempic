@@ -96,6 +96,7 @@ class JsonlWatcher:
                         self._last_size = new_size
                         try:
                             self.on_growth(self.filepath, new_size)
+                            self._cb_error_logged = False  # reset on success
                         except Exception as exc:
                             self._log_cb_error(exc)  # don't crash the watcher thread
                 if inode_replaced:
@@ -119,5 +120,6 @@ class JsonlWatcher:
                 self._last_size = new_size
                 try:
                     self.on_growth(self.filepath, new_size)
+                    self._cb_error_logged = False  # reset on success
                 except Exception as exc:
                     self._log_cb_error(exc)  # don't crash the watcher thread
