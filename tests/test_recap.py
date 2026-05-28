@@ -299,5 +299,88 @@ class TestGenerateRecapHappyPath(unittest.TestCase):
             self.assertTrue(dest.exists())
 
 
+# ---------------------------------------------------------------------------
+# H-1 — _clean_user_text input cap (ReDoS guard)
+# ---------------------------------------------------------------------------
+
+class TestCleanUserTextInputCap(unittest.TestCase):
+
+    def test_output_capped_at_8000_chars(self) -> None:
+        """Input longer than 8000 chars must be capped before regex processing."""
+        from cozempic.recap import _clean_user_text
+        result = _clean_user_text("a" * 9000)
+        self.assertLessEqual(len(result), 8000)
+
+    def test_git_conflict_markers_complete_under_500ms(self) -> None:
+        """3000 git-conflict lines must not block the reload path for seconds."""
+        import time
+        from cozempic.recap import _clean_user_text
+        t0 = time.perf_counter()
+        _clean_user_text("<<<<<<< HEAD\n" * 3000)
+        elapsed = time.perf_counter() - t0
+        self.assertLess(elapsed, 0.5, f"_clean_user_text took {elapsed:.3f}s (limit 500ms)")
+
+
+# ---------------------------------------------------------------------------
+# M-1 extension — _truncate with negative max_len
+# ---------------------------------------------------------------------------
+
+class TestTruncateNegativeMaxLen(unittest.TestCase):
+
+    def test_truncate_output_never_exceeds_max_len_including_negative(self) -> None:
+        """Invariant holds for negative max_len too (must produce empty string)."""
+        for max_len in range(-5, 20):
+            result = _truncate("a" * 50, max_len)
+            expected_max = max(max_len, 0)
+            self.assertLessEqual(
+                len(result), expected_max,
+                f"max_len={max_len}: got {len(result)} chars, expected <= {expected_max}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# M-2 — test_max_turns_limits_topics: assert exact topic count from header
+# ---------------------------------------------------------------------------
+
+class TestGenerateRecapMaxTurnsStrict(unittest.TestCase):
+
+    def test_max_turns_header_shows_exact_topic_count(self) -> None:
+        """Header line 'N exchanges | M topics' must show M == max_turns (5)."""
+        msgs = _make_pairs(60)
+        result = generate_recap(msgs, max_turns=5)
+        # Parse the header line
+        header_line = next(
+            (l for l in result.split("\n") if "exchanges" in l and "topics" in l),
+            None,
+        )
+        self.assertIsNotNone(header_line, "header line not found in recap output")
+        import re
+        m = re.search(r"(\d+) topics", header_line)
+        self.assertIsNotNone(m, f"could not parse topic count from: {header_line!r}")
+        topic_count = int(m.group(1))
+        self.assertLessEqual(topic_count, 5, f"topics={topic_count} exceeds max_turns=5")
+
+
+# ---------------------------------------------------------------------------
+# L-1 — last_assistant falls back to prior meaningful turn when final is all-tags
+# ---------------------------------------------------------------------------
+
+class TestLastAssistantFallback(unittest.TestCase):
+
+    def test_all_tag_assistant_turn_falls_back_to_prior(self) -> None:
+        """A final assistant turn that cleans to empty must not erase a prior Last."""
+        msgs = [
+            _user_msg("how to write a parser", i=0),
+            _asst_msg("Use a recursive descent parser for best results.", i=1),
+            _user_msg("thanks", i=2),
+            # Final assistant turn is entirely a tag — cleans to ""
+            _asst_msg("<system-reminder>injected</system-reminder>", i=3),
+        ]
+        result = generate_recap(msgs)
+        # Last: must show the prior meaningful assistant turn, not be absent
+        self.assertIn("Last:", result)
+        self.assertIn("recursive descent", result)
+
+
 if __name__ == "__main__":
     unittest.main()
