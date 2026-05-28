@@ -1086,16 +1086,21 @@ def cmd_formulary(args):
 
 def _digest_session(args):
     """Resolve session path and ID from args."""
-    from .session import find_current_session
+    from .session import find_current_session, resolve_session
     cwd = getattr(args, "cwd", None) or os.getcwd()
-    session_path = getattr(args, "session", None)
-    if not session_path:
+    session_arg = getattr(args, "session", None)
+    if not session_arg:
         sess = find_current_session(cwd)
         if not sess:
-            print("No active session found.")
+            # Changed to stderr: consistent with resolve_session error output
+            # and all other error paths in cli.py.
+            print("No active session found.", file=sys.stderr)
             sys.exit(1)
         return sess["path"], sess.get("session_id", ""), cwd
-    return session_path, "", cwd
+    # resolve_session handles: explicit path, UUID, UUID prefix, "current"
+    resolved = resolve_session(session_arg)
+    session_id = resolved.stem  # filename stem IS the session UUID
+    return resolved, session_id, cwd
 
 
 def cmd_digest(args):
