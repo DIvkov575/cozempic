@@ -42,16 +42,20 @@ def _extract_text(msg: dict) -> str:
 
 def _clean_user_text(text: str) -> str:
     """Remove system tags, command noise, and whitespace from user text."""
-    # Cap input to bound the O(n²) tag regexes below. A git-conflict-heavy
-    # assistant turn (e.g. `<<<<<<< HEAD` × 3000) otherwise blocks the
-    # reload path for seconds. 8000 chars >> any displayed snippet (~72 chars).
-    text = text[:8000]
+    # Strip NAMED system/command tags on the FULL text first so that an injection
+    # tag whose close-tag lies past the cap below is still removed (N-1).
+    # These regexes are anchored on literal tag names → linear on realistic input.
+    # LOW residual: a pathological <named-tag>×N flood would be O(n²) here too,
+    # but that is a perf-only concern (not an injection vector) and absurd in practice.
     text = re.sub(r"<system-reminder>.*?</system-reminder>", "", text, flags=re.DOTALL)
     text = re.sub(r"<local-command-caveat>.*?</local-command-caveat>", "", text, flags=re.DOTALL)
     text = re.sub(r"<command-name>.*?</command-name>", "", text, flags=re.DOTALL)
     text = re.sub(r"<command-message>.*?</command-message>", "", text, flags=re.DOTALL)
     text = re.sub(r"<command-args>.*?</command-args>", "", text, flags=re.DOTALL)
     text = re.sub(r"<local-command-stdout>.*?</local-command-stdout>", "", text, flags=re.DOTALL)
+    # Cap before the GENERIC tag regexes (the true O(n²) ones). Recap displays
+    # ~72-char snippets so the cap loses no displayed info.
+    text = text[:8000]
     text = re.sub(r"<[^>]+>.*?</[^>]+>", "", text, flags=re.DOTALL)
     text = re.sub(r"<[^>]+/?>", "", text)
     text = re.sub(r"SessionStart:.*", "", text)
