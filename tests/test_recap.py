@@ -14,10 +14,10 @@ from cozempic.recap import (
     save_recap,
 )
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _user_msg(text: str, i: int = 0) -> tuple:
     return (
@@ -60,6 +60,7 @@ def _make_pairs(n: int) -> list:
 # B4 — _truncate negative-index slice
 # ---------------------------------------------------------------------------
 
+
 class TestTruncate(unittest.TestCase):
 
     def test_truncate_max_len_zero_returns_empty(self) -> None:
@@ -85,8 +86,7 @@ class TestTruncate(unittest.TestCase):
         for max_len in range(0, 20):
             result = _truncate("a" * 50, max_len)
             self.assertLessEqual(
-                len(result), max_len,
-                f"max_len={max_len}: got {len(result)} chars"
+                len(result), max_len, f"max_len={max_len}: got {len(result)} chars"
             )
 
     def test_truncate_no_change_when_under_max(self) -> None:
@@ -102,6 +102,7 @@ class TestTruncate(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # B2 — save_recap must use atomic_write_text
 # ---------------------------------------------------------------------------
+
 
 class TestSaveRecapAtomic(unittest.TestCase):
 
@@ -136,6 +137,7 @@ class TestSaveRecapAtomic(unittest.TestCase):
 # B1 — max_turns parameter is honoured
 # ---------------------------------------------------------------------------
 
+
 class TestGenerateRecapMaxTurns(unittest.TestCase):
 
     def test_max_turns_limits_topics_not_exchange_count(self) -> None:
@@ -146,7 +148,8 @@ class TestGenerateRecapMaxTurns(unittest.TestCase):
         self.assertIn("60 exchanges", result)
         # Topic lines capped at max_turns (5)
         topic_lines = [
-            line for line in result.split("\n")
+            line
+            for line in result.split("\n")
             if line.strip().startswith("- ") and "topic" in line
         ]
         self.assertLessEqual(len(topic_lines), 5)
@@ -167,6 +170,7 @@ class TestGenerateRecapMaxTurns(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # B3 — last_assistant injection sanitization
 # ---------------------------------------------------------------------------
+
 
 class TestRecapInjectionSanitization(unittest.TestCase):
 
@@ -212,6 +216,7 @@ class TestRecapInjectionSanitization(unittest.TestCase):
 # A1 — _extract_themes: no trailing underscore/hyphen in labels
 # ---------------------------------------------------------------------------
 
+
 class TestExtractThemesEdgeCases(unittest.TestCase):
 
     def test_empty_topics(self) -> None:
@@ -232,12 +237,10 @@ class TestExtractThemesEdgeCases(unittest.TestCase):
         themes = _extract_themes(topics)
         for label, _ in themes:
             self.assertFalse(
-                label.endswith("_"),
-                f"label has trailing underscore: {label!r}"
+                label.endswith("_"), f"label has trailing underscore: {label!r}"
             )
             self.assertFalse(
-                label.endswith("-"),
-                f"label has trailing hyphen: {label!r}"
+                label.endswith("-"), f"label has trailing hyphen: {label!r}"
             )
 
     def test_normal_themes_extracted_correctly(self) -> None:
@@ -256,6 +259,7 @@ class TestExtractThemesEdgeCases(unittest.TestCase):
 # Integration — happy-path smoke tests
 # ---------------------------------------------------------------------------
 
+
 class TestGenerateRecapHappyPath(unittest.TestCase):
 
     def _make_session(self, n_pairs: int = 10) -> list:
@@ -264,9 +268,7 @@ class TestGenerateRecapHappyPath(unittest.TestCase):
             msgs.append(
                 _user_msg(f"fix the {chr(ord('a') + i)} bug in module", i=i * 2)
             )
-            msgs.append(
-                _asst_msg("I have fixed the issue.", i=i * 2 + 1)
-            )
+            msgs.append(_asst_msg("I have fixed the issue.", i=i * 2 + 1))
         return msgs
 
     def test_output_contains_header(self) -> None:
@@ -286,9 +288,7 @@ class TestGenerateRecapHappyPath(unittest.TestCase):
         self.assertIn("Last:", result)
 
     def test_no_user_turns_returns_empty_string(self) -> None:
-        assistant_only = [
-            _asst_msg("hello", i=0)
-        ]
+        assistant_only = [_asst_msg("hello", i=0)]
         self.assertEqual(generate_recap(assistant_only), "")
 
     def test_returns_path_from_save_recap(self) -> None:
@@ -303,11 +303,13 @@ class TestGenerateRecapHappyPath(unittest.TestCase):
 # H-1 — _clean_user_text input cap (ReDoS guard)
 # ---------------------------------------------------------------------------
 
+
 class TestCleanUserTextInputCap(unittest.TestCase):
 
     def test_output_capped_at_8000_chars(self) -> None:
         """Input longer than 8000 chars must be capped before regex processing."""
         from cozempic.recap import _clean_user_text
+
         result = _clean_user_text("a" * 9000)
         self.assertLessEqual(len(result), 8000)
 
@@ -315,15 +317,19 @@ class TestCleanUserTextInputCap(unittest.TestCase):
         """3000 git-conflict lines must not block the reload path for seconds."""
         import time
         from cozempic.recap import _clean_user_text
+
         t0 = time.perf_counter()
         _clean_user_text("<<<<<<< HEAD\n" * 3000)
         elapsed = time.perf_counter() - t0
-        self.assertLess(elapsed, 0.5, f"_clean_user_text took {elapsed:.3f}s (limit 500ms)")
+        self.assertLess(
+            elapsed, 0.5, f"_clean_user_text took {elapsed:.3f}s (limit 500ms)"
+        )
 
 
 # ---------------------------------------------------------------------------
 # M-1 extension — _truncate with negative max_len
 # ---------------------------------------------------------------------------
+
 
 class TestTruncateNegativeMaxLen(unittest.TestCase):
 
@@ -333,14 +339,16 @@ class TestTruncateNegativeMaxLen(unittest.TestCase):
             result = _truncate("a" * 50, max_len)
             expected_max = max(max_len, 0)
             self.assertLessEqual(
-                len(result), expected_max,
-                f"max_len={max_len}: got {len(result)} chars, expected <= {expected_max}"
+                len(result),
+                expected_max,
+                f"max_len={max_len}: got {len(result)} chars, expected <= {expected_max}",
             )
 
 
 # ---------------------------------------------------------------------------
 # M-2 — test_max_turns_limits_topics: assert exact topic count from header
 # ---------------------------------------------------------------------------
+
 
 class TestGenerateRecapMaxTurnsStrict(unittest.TestCase):
 
@@ -355,15 +363,19 @@ class TestGenerateRecapMaxTurnsStrict(unittest.TestCase):
         )
         self.assertIsNotNone(header_line, "header line not found in recap output")
         import re
+
         m = re.search(r"(\d+) topics", header_line)
         self.assertIsNotNone(m, f"could not parse topic count from: {header_line!r}")
         topic_count = int(m.group(1))
-        self.assertLessEqual(topic_count, 5, f"topics={topic_count} exceeds max_turns=5")
+        self.assertLessEqual(
+            topic_count, 5, f"topics={topic_count} exceeds max_turns=5"
+        )
 
 
 # ---------------------------------------------------------------------------
 # L-1 — last_assistant falls back to prior meaningful turn when final is all-tags
 # ---------------------------------------------------------------------------
+
 
 class TestLastAssistantFallback(unittest.TestCase):
 

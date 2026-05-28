@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import re
-from collections import Counter
 from pathlib import Path
 
 from .helpers import atomic_write_text, get_content_blocks, get_msg_type, text_of
@@ -43,6 +42,10 @@ def _extract_text(msg: dict) -> str:
 
 def _clean_user_text(text: str) -> str:
     """Remove system tags, command noise, and whitespace from user text."""
+    # Cap input to bound the O(n²) tag regexes below. A git-conflict-heavy
+    # assistant turn (e.g. `<<<<<<< HEAD` × 3000) otherwise blocks the
+    # reload path for seconds. 8000 chars >> any displayed snippet (~72 chars).
+    text = text[:8000]
     text = re.sub(r"<system-reminder>.*?</system-reminder>", "", text, flags=re.DOTALL)
     text = re.sub(r"<local-command-caveat>.*?</local-command-caveat>", "", text, flags=re.DOTALL)
     text = re.sub(r"<command-name>.*?</command-name>", "", text, flags=re.DOTALL)
@@ -68,7 +71,7 @@ def _truncate(text: str, max_len: int = 70) -> str:
     if len(text) <= max_len:
         return text
     if max_len <= 3:
-        return text[:max_len]
+        return text[:max(max_len, 0)]
     return text[: max_len - 3] + "..."
 
 
@@ -131,6 +134,9 @@ def generate_recap(messages: list[Message], max_turns: int = 40) -> str:
         elif msg_type == "assistant":
             text = _extract_text(msg)
             text = _clean_user_text(text)
+            # Only update last_assistant when text is meaningful after cleaning;
+            # all-tag turns (tool noise) clean to "" and are intentionally skipped,
+            # so last_assistant naturally holds the prior meaningful turn.
             if text and len(text) >= 3:
                 last_assistant = text
 
