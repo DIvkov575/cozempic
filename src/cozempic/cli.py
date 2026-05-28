@@ -1085,7 +1085,16 @@ def cmd_formulary(args):
 
 
 def _digest_session(args):
-    """Resolve session path and ID from args."""
+    """Resolve session path and ID from args.
+
+    Resolution strategy:
+      - absent / "current"  → cwd-based auto-detect via find_current_session(cwd);
+                              exits 1 with a stderr message if none found.
+      - explicit UUID / UUID prefix / file path → resolve_session(session_arg);
+                              session_id recovered from resolved path stem.
+
+    Returns (path, session_id, cwd).
+    """
     from .session import find_current_session, resolve_session
     cwd = getattr(args, "cwd", None) or os.getcwd()
     session_arg = getattr(args, "session", None)
@@ -1276,7 +1285,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_digest.add_argument("digest_action", nargs="?", default="show",
                           choices=["show", "update", "clear", "flush", "recover", "inject"],
                           help="Action: show (default), update, clear, flush, recover, inject")
-    p_digest.add_argument("--session", help="Session ID or path")
+    p_digest.add_argument("--session", help=session_help)
     p_digest.add_argument("--cwd", help="Working directory (default: current)")
 
     return parser

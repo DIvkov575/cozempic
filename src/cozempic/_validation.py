@@ -211,6 +211,11 @@ def parse_env_non_negative_int(name: str) -> int | None:
 # Token sets are module-level constants so tests can import and inspect them.
 _BOOL_TRUE_TOKENS: frozenset[str] = frozenset({"1", "true", "yes", "on"})
 _BOOL_FALSE_TOKENS: frozenset[str] = frozenset({"0", "false", "no", "off"})
+# Pre-computed help string — avoids recomputing sorted() on every warn call
+# and keeps truthy/falsy groups distinct so users can self-correct.
+_BOOL_TOKENS_HELP = (
+    f"truthy: {sorted(_BOOL_TRUE_TOKENS)}; falsy: {sorted(_BOOL_FALSE_TOKENS)}"
+)
 
 
 def parse_env_bool(name: str, default: bool = False, warn: bool = True) -> bool:
@@ -219,7 +224,8 @@ def parse_env_bool(name: str, default: bool = False, warn: bool = True) -> bool:
     Truthy tokens (case-insensitive, whitespace stripped): 1, true, yes, on
     Falsy tokens  (case-insensitive, whitespace stripped): 0, false, no, off
     Unrecognized non-empty value: if `warn`, emits a warning to stderr and
-    returns `default`.  Empty / absent: returns `default` silently.
+    returns `default`.  Empty / absent / whitespace-only: returns `default`
+    silently.
 
     Follows the warn+fallback contract of parse_env_positive_int:
     env vars are ambient config; an unrecognized value must not crash.
@@ -229,7 +235,7 @@ def parse_env_bool(name: str, default: bool = False, warn: bool = True) -> bool:
     single module-load warning is enough and per-call spam would drown output.
     """
     raw = os.environ.get(name)
-    if raw is None or raw == "":
+    if raw is None or raw.strip() == "":
         return default
     normalized = raw.strip().lower()
     if normalized in _BOOL_TRUE_TOKENS:
@@ -237,9 +243,5 @@ def parse_env_bool(name: str, default: bool = False, warn: bool = True) -> bool:
     if normalized in _BOOL_FALSE_TOKENS:
         return False
     if warn:
-        _env_warn(
-            name,
-            raw,
-            f"must be one of {sorted(_BOOL_TRUE_TOKENS | _BOOL_FALSE_TOKENS)}",
-        )
+        _env_warn(name, raw, f"must be a boolean ({_BOOL_TOKENS_HELP})")
     return default

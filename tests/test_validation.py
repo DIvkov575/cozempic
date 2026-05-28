@@ -297,6 +297,24 @@ class TestParseEnvBool(unittest.TestCase):
         """warn=False must not suppress recognized-token parsing."""
         self.assertTrue(self._call(raw="yes", warn=False))
 
+    # ── whitespace-only input ────────────────────────────────────────────────
+
+    def test_whitespace_only_returns_default_silently(self):
+        """COZEMPIC_DEBUG='   ' must return default WITHOUT a warning.
+
+        The bug: raw == "" guard fires BEFORE strip(), so '   ' slips
+        through as non-empty → normalized="" → not in token sets → spurious
+        warning on stderr. Fix: check raw.strip() == "" instead of raw == "".
+        """
+        import io
+        import contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            result = self._call(raw="   ")
+        self.assertFalse(result, "whitespace-only must return default (False)")
+        self.assertEqual(buf.getvalue(), "",
+                         "whitespace-only must produce NO warning on stderr")
+
 
 if __name__ == "__main__":
     unittest.main()
