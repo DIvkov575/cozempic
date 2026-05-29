@@ -110,12 +110,17 @@ class JsonlWatcher:
             # kqueue setup or control() failed (e.g. EMFILE) — degrade to poll
             kqueue_error = True
         finally:
-            # Nested try ensures os.close(fd) always runs even if kq.close() raises
-            try:
-                if kq is not None:
+            # Swallow cleanup-close errors: neither close must kill the thread or
+            # prevent the poll-fallback tail line from being reached.
+            if kq is not None:
+                try:
                     kq.close()
-            finally:
+                except OSError:
+                    pass  # cleanup only — never let it kill the thread
+            try:
                 os.close(fd)
+            except OSError:
+                pass  # cleanup only (fd opened once, closed once; defensive)
         if (inode_replaced or kqueue_error) and self._running:
             self._watch_poll()
 
