@@ -2884,7 +2884,14 @@ class TestGetMemdirUnderscoreProject(unittest.TestCase):
         self.assertEqual(result, mem_dir)
 
     def test_get_memdir_no_prefix_collision(self):
-        """_get_memdir must resolve '-Users-x-foo', not '-Users-x-foobar'."""
+        """_get_memdir('/Users/x/foo') must resolve '-Users-x-foo/memory', never '-Users-x-foobar/memory'.
+
+        Both project dirs and their memory subdirs exist. The old substring fallback
+        `slug in d.name` would match '-Users-x-foobar' for slug '-Users-x-foo' and
+        could return the wrong memdir depending on iteration order. The primary path
+        claude_dir/slug finds '-Users-x-foo' directly (exact), so this test
+        validates the primary-path exact lookup is in force.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             cwd = "/Users/x/foo"
@@ -2900,7 +2907,32 @@ class TestGetMemdirUnderscoreProject(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(
             result, mem_foo,
-            f"Expected {mem_foo}, got {result}. Prefix collision: 'bar' suffix is leaking."
+            f"Expected {mem_foo}, got {result}. "
+            "Prefix collision: '-foobar' dir is being returned for '-foo' slug."
+        )
+        self.assertNotEqual(
+            result, mem_foobar,
+            "Returned foobar's memdir instead of foo's — prefix collision not closed."
+        )
+
+    def test_get_memdir_returns_none_when_project_dir_absent(self):
+        """_get_memdir returns None (not a neighbor's memdir) when project dir missing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            cwd = "/Users/x/foo"
+            slug = _correct_slug_for_test(cwd)    # "-Users-x-foo"
+            # Only foobar exists — foo's project dir is absent
+            mem_foobar = tmp_path / f"{slug}bar" / "memory"
+            mem_foobar.mkdir(parents=True)
+
+            with patch("cozempic.session.get_projects_dir", return_value=tmp_path):
+                result = _get_memdir(cwd)
+
+        self.assertIsNone(
+            result,
+            f"_get_memdir returned {result} instead of None when project dir absent. "
+            "The old substring fallback loop may still be matching '-Users-x-foobar' "
+            "for slug '-Users-x-foo' (substring match)."
         )
 
     def test_get_memdir_dot_project(self):

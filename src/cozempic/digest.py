@@ -905,12 +905,9 @@ def _get_memdir(cwd: str = "") -> Path | None:
     slug = cwd_to_project_slug(cwd)
     project_dir = claude_dir / slug
     if not project_dir.exists():
-        for d in claude_dir.iterdir():
-            if d.is_dir() and d.name == slug:
-                project_dir = d
-                break
-        else:
-            return None
+        # No fallback iteration: if `claude_dir / slug` does not exist, no other
+        # dir in claude_dir can have that exact name — the scan would be dead code.
+        return None
     mem_dir = project_dir / "memory"
     return mem_dir if mem_dir.exists() else None
 
