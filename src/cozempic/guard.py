@@ -621,7 +621,10 @@ def start_guard(
                     print(f"  Reload triggered. Guard exiting.")
                     break
 
-                print(f"  Pruned: {_fmt_prune_result(result)}")
+                if result.get("live_write_skipped"):
+                    print(f"  Read-only — live session not rewritten (#106).")
+                else:
+                    print(f"  Pruned: {_fmt_prune_result(result)}")
                 if result.get("team_name"):
                     print(f"  Team '{result['team_name']}' state preserved ({result['team_messages']} messages)")
                 print()
@@ -634,9 +637,12 @@ def start_guard(
                 reason = f"{current_tokens:,} tokens >= {threshold_tokens:,} (55%)"
 
                 if agents_active:
-                    # Agents running — prune file only, no reload (don't kill active work)
+                    # Agents running — read-only checkpoint, no reload (don't kill
+                    # active work) and no live write (#106: rewriting the file
+                    # Claude holds open races the harness). HARD2 (80%) force-
+                    # reloads later if context keeps growing, terminating first.
                     print(f"  [{_now()}] HARD THRESHOLD (55%): {reason}")
-                    print(f"  Agents active — prune file only, deferring reload (cycle #{prune_count})...")
+                    print(f"  Agents active — read-only checkpoint, deferring prune+reload (cycle #{prune_count})...")
 
                     result = guard_prune_cycle(
                         session_path=session_path,
@@ -645,6 +651,7 @@ def start_guard(
                         auto_reload=False,  # Don't reload — agents are working
                         cwd=cwd or os.getcwd(),
                         session_id=sess["session_id"],
+                        read_only_live=True,
                     )
                 else:
                     print(f"  [{_now()}] HARD THRESHOLD (55%): {reason}")
@@ -668,11 +675,22 @@ def start_guard(
                     print(f"  Reload triggered. Guard exiting.")
                     break
 
-                print(f"  Pruned: {_fmt_prune_result(result)}")
+                if result.get("live_write_skipped"):
+                    print(f"  Read-only — live session not rewritten (#106).")
+                else:
+                    print(f"  Pruned: {_fmt_prune_result(result)}")
                 if result.get("team_name"):
                     print(f"  Team '{result['team_name']}' state preserved ({result['team_messages']} messages)")
 
-                if result.get("saved_mb", 0) <= 0 or result.get("futile_reload_skipped"):
+                if result.get("live_write_skipped"):
+                    # #106 read-only deferral (agents active at 55%): we
+                    # intentionally did not prune the live file. This is neither a
+                    # successful prune nor a futile one — leave the futile-loop
+                    # circuit breaker untouched so a long agent run doesn't trip
+                    # the K-exit or emit the misleading "guard is powerless"
+                    # diagnostic. HARD2 (80%) still force-reloads if needed.
+                    pass
+                elif result.get("saved_mb", 0) <= 0 or result.get("futile_reload_skipped"):
                     consecutive_empty_hard_prunes += 1
 
                     # GAP-D: emit one-shot diagnostic when reload was skipped
@@ -838,7 +856,7 @@ def start_guard(
                     soft_prune_count += 1
                     reason = f"{current_tokens:,} tokens >= {soft_threshold_tokens:,} (25%)" if soft_tokens_hit else f"{current_size / 1024 / 1024:.1f}MB"
                     print(f"  [{_now()}] SOFT THRESHOLD (25%): {reason}")
-                    print(f"  Gentle file cleanup, no reload (cycle #{soft_prune_count})...")
+                    print(f"  Read-only checkpoint — live prune deferred to reload tier (#106) (cycle #{soft_prune_count})...")
 
                     result = guard_prune_cycle(
                         session_path=session_path,
@@ -847,9 +865,11 @@ def start_guard(
                         auto_reload=False,
                         cwd=cwd or os.getcwd(),
                         session_id=sess["session_id"],
+                        read_only_live=True,
                     )
 
-                    print(f"  Trimmed: {_fmt_prune_result(result)}")
+                    if result.get("team_name"):
+                        print(f"  Team '{result['team_name']}' checkpointed ({result['team_messages']} messages)")
                     print()
 
     except KeyboardInterrupt:
@@ -892,6 +912,7 @@ def guard_prune_cycle(
     cwd: str = "",
     session_id: str | None = None,
     claude_pid: int | None = None,
+    read_only_live: bool = False,
 ) -> dict:
     """Execute a single guard prune cycle.
 
@@ -937,6 +958,31 @@ def guard_prune_cycle(
             pruned_messages, results, team_state = prune_with_team_protect(
                 messages, rx_name=rx_name, config=config,
             )
+
+            # #106 — never rewrite a live session that Claude holds open.
+            # The no-reload tiers (SOFT 25%, agents-active HARD) reach here with
+            # read_only_live=True. os.replace-ing the file Claude is actively
+            # appending to races the harness (TOCTOU + inode-swap → lost/garbled
+            # transcript), and because Claude reads the JSONL only at
+            # startup/resume the on-disk rewrite cannot shrink the LIVE context
+            # anyway — all risk, no upside. Preserve team state via a read-only
+            # checkpoint and skip the destructive write. The HARD/reload tiers
+            # (which terminate Claude first) still do the real prune.
+            if read_only_live:
+                checkpoint_path = None
+                if not team_state.is_empty():
+                    checkpoint_path = write_team_checkpoint(team_state, session_path.parent)
+                return {
+                    "saved_mb": 0.0,
+                    "original_tokens": pre_te.total,
+                    "final_tokens": pre_te.total,
+                    "team_name": team_state.team_name or None,
+                    "team_messages": team_state.message_count,
+                    "checkpoint_path": str(checkpoint_path) if checkpoint_path else None,
+                    "backup_path": None,
+                    "reloading": False,
+                    "live_write_skipped": True,
+                }
 
             final_bytes = sum(b for _, _, b in pruned_messages)
             saved_bytes = original_bytes - final_bytes
