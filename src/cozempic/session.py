@@ -201,13 +201,17 @@ def find_sessions(project_filter: str | None = None) -> list[dict]:
 def cwd_to_project_slug(cwd: str | None = None) -> str:
     """Convert a working directory path to the Claude project slug format.
 
-    Claude stores projects under ~/.claude/projects/ using the path with
-    slashes replaced by dashes, e.g. /Users/foo/myproject -> -Users-foo-myproject
+    Claude stores projects under ~/.claude/projects/ replacing every
+    non-alphanumeric character with a single '-' (1:1, no run collapsing).
+
+    Examples:
+      /Users/foo/topstep_automation -> -Users-foo-topstep-automation
+      /Users/foo/.claude            -> -Users-foo--claude  (dot → dash, double-dash)
     """
-    import os
+    import os, re
     if cwd is None:
         cwd = os.getcwd()
-    return cwd.replace("/", "-")
+    return re.sub(r"[^a-zA-Z0-9]", "-", cwd)
 
 
 def project_slug_to_path(slug: str) -> str:
