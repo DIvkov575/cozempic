@@ -2584,9 +2584,12 @@ def _fmt_prune_result(result: dict) -> str:
     final_tok = result.get("final_tokens")
     if orig_tok and final_tok:
         saved_tok = orig_tok - final_tok
-        tok_str = f"{saved_tok / 1000:.1f}K" if saved_tok >= 1000 else str(saved_tok)
-        pct = f"{saved_tok / orig_tok * 100:.1f}%" if orig_tok > 0 else "0%"
-        return f"{tok_str} tokens freed ({pct}), {result['saved_mb']:.1f}MB saved"
+        # Negative => exact count re-anchored after metadata-strip (#105); the
+        # token delta is not meaningful, so report the reliable byte savings.
+        if saved_tok >= 0 and orig_tok > 0:
+            tok_str = f"{saved_tok / 1000:.1f}K" if saved_tok >= 1000 else str(saved_tok)
+            pct = f"{saved_tok / orig_tok * 100:.1f}%"
+            return f"{tok_str} tokens freed ({pct}), {result['saved_mb']:.1f}MB saved"
     return f"{result['saved_mb']:.1f}MB saved"
 
 

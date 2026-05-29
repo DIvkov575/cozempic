@@ -236,8 +236,11 @@ class OverflowRecovery:
         self.breaker.record_recovery(rx, before_mb, after_mb)
         orig_tok = result.get("original_tokens")
         final_tok = result.get("final_tokens")
-        if orig_tok and final_tok:
-            saved_tok = orig_tok - final_tok
+        saved_tok = (orig_tok - final_tok) if (orig_tok and final_tok) else -1
+        # saved_tok < 0 means the exact count re-anchored after metadata-strip
+        # (#105) — the token delta is not meaningful, so fall through to the
+        # MB-only line below rather than print "Pruned -648.7K tokens freed".
+        if orig_tok and final_tok and saved_tok >= 0:
             tok_str = f"{saved_tok / 1000:.1f}K" if saved_tok >= 1000 else str(saved_tok)
             print(
                 f"  [{now}] Pruned {tok_str} tokens freed "
