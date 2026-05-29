@@ -76,10 +76,10 @@ class TestTruncate(unittest.TestCase):
         result = _truncate("hello", 2)
         self.assertEqual(result, "he")
 
-    def test_truncate_max_len_three_at_most_three_chars(self) -> None:
-        # max_len=3: result must be at most 3 chars
+    def test_truncate_max_len_three_uses_ellipsis(self) -> None:
+        # max_len=3: exactly room for "..." — ellipsis must be used, not raw chars
         result = _truncate("hello", 3)
-        self.assertLessEqual(len(result), 3)
+        self.assertEqual(result, "...")
 
     def test_truncate_output_never_exceeds_max_len(self) -> None:
         # Invariant: for any valid max_len >= 0, len(result) <= max_len
@@ -165,6 +165,22 @@ class TestGenerateRecapMaxTurns(unittest.TestCase):
         msgs = _make_pairs(10)
         result = generate_recap(msgs, max_turns=40)
         self.assertIn("10 exchanges", result)
+
+    def test_max_turns_zero_produces_no_topics(self) -> None:
+        # max_turns=0 means "show 0 topics" — list[-0:] == list[0:] is the bug;
+        # the correct result is an empty topic window (no Recent: lines).
+        msgs = _make_pairs(5)
+        result = generate_recap(msgs, max_turns=0)
+        topic_lines = [l for l in result.split("\n") if l.strip().startswith("- ")]
+        self.assertEqual(
+            topic_lines, [], f"max_turns=0 must produce 0 topics, got: {topic_lines}"
+        )
+
+    def test_max_turns_zero_still_shows_exchange_count(self) -> None:
+        # exchange count reflects full session even when topic window is 0
+        msgs = _make_pairs(5)
+        result = generate_recap(msgs, max_turns=0)
+        self.assertIn("5 exchanges", result)
 
 
 # ---------------------------------------------------------------------------
