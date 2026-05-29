@@ -337,8 +337,8 @@ def start_guard(
 
     Three-phase protection:
       1. CHECKPOINT every interval — extract team state, write to disk
-      2. SOFT PRUNE at soft threshold — gentle prune, no reload, no disruption
-      3. HARD PRUNE at hard threshold — full prune with team-protect + optional reload
+      2. SOFT at soft threshold — read-only checkpoint (no live-file write, #106)
+      3. HARD PRUNE at hard threshold — terminate-first prune + resume (team-protect)
 
     Thresholds can be bytes-based, token-based, or both. When both are set,
     whichever is hit first triggers the action.
@@ -454,8 +454,8 @@ def start_guard(
 
     print(
         f"\n  4-tier guard protecting context ({ctx_str} window):\n"
-        f"    Soft  ({soft_pct}%): gentle prune, no reload (file maintenance)\n"
-        f"    Hard1 ({hard1_pct}%): {rx_name} prune + reload\n"
+        f"    Soft  ({soft_pct}%): read-only checkpoint, no live-file write (#106)\n"
+        f"    Hard1 ({hard1_pct}%): {rx_name} prune + reload (terminate-first)\n"
         f"    Hard2 ({hard2_pct}%): aggressive prune + reload (emergency)\n"
         f"    User  (90%): manual aggressive (cozempic treat -rx aggressive --execute)\n"
     )
@@ -1090,6 +1090,15 @@ def guard_prune_cycle(
             _write_holder["written"] = True
         except (PruneConflictError, PruneLockError) as exc:
             print(f"  [{_now()}] Deferred prune write skipped — {exc}", file=sys.stderr)
+        except OSError as exc:
+            # Disk-full / EIO / permission at the post-kill write instant. The
+            # write is atomic (save_messages leaves the original intact on any
+            # failure), so there's no corruption — but this runs AFTER Claude was
+            # terminated and BEFORE the resume watcher spawns, so an uncaught
+            # error would propagate out of _terminate_and_resume and crash the
+            # daemon, leaving Claude killed-but-not-resumed. Contain it: leave the
+            # full file for resume (written stays False) and let the reload proceed.
+            print(f"  [{_now()}] Deferred prune write failed ({exc}) — resuming from full file.", file=sys.stderr)
 
     result = {
         "saved_mb": saved_bytes / 1024 / 1024,
