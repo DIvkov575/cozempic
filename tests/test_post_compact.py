@@ -119,6 +119,49 @@ class TestCmdPostCompactCrossProjectIsolation(unittest.TestCase):
 
         self.assertEqual(output, "", "cmd_post_compact must be silent when no checkpoint exists.")
 
+    def test_global_checkpoint_not_read_when_local_absent(self):
+        """Global ~/.claude/team-checkpoint.md must NOT be returned by cmd_post_compact.
+
+        The global file is a cross-project read vector: it holds the most-recently
+        written checkpoint regardless of project. When the resolved project_dir has no
+        local checkpoint, cmd_post_compact must be silent (not inject the global file).
+
+        This tests the include_global=False guard added to the read_team_checkpoint call.
+        """
+        import tempfile
+        from cozempic.session import get_claude_dir
+
+        tmp_path = Path(tempfile.mkdtemp())
+        (tmp_path / "projects").mkdir(parents=True, exist_ok=True)
+
+        cwd = str(tmp_path / "my_project")
+        Path(cwd).mkdir(exist_ok=True)
+        # No local team-checkpoint.md in cwd
+
+        # Place a checkpoint in the global ~/.claude/ location (simulated)
+        global_cp = tmp_path / "claude_dir" / "team-checkpoint.md"
+        global_cp.parent.mkdir(parents=True, exist_ok=True)
+        global_cp.write_text("GLOBAL_CHECKPOINT", encoding="utf-8")
+
+        with (
+            patch("cozempic.session.get_projects_dir", return_value=tmp_path / "projects"),
+            patch("cozempic.session._session_id_from_process", return_value=None),
+            # get_claude_dir is imported inside read_team_checkpoint via `from .session import`
+            # so we patch it at the source module level.
+            patch("cozempic.session.get_claude_dir", return_value=tmp_path / "claude_dir"),
+        ):
+            output = self._run_post_compact(cwd=cwd)
+
+        self.assertNotIn(
+            "GLOBAL_CHECKPOINT", output,
+            "cmd_post_compact must not inject the global team-checkpoint.md. "
+            "include_global=False is not being passed to read_team_checkpoint."
+        )
+        self.assertEqual(
+            output, "",
+            "cmd_post_compact must be silent when only global checkpoint present."
+        )
+
 
 class TestReadTeamCheckpoint(unittest.TestCase):
 

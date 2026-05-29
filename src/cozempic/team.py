@@ -685,20 +685,33 @@ def write_team_checkpoint(state: TeamState, project_dir: Path | None = None) -> 
     return path
 
 
-def read_team_checkpoint(project_dir: Path | None = None) -> str | None:
+def read_team_checkpoint(
+    project_dir: Path | None = None,
+    include_global: bool = True,
+) -> str | None:
     """Read saved team checkpoint from disk.
 
     Returns the checkpoint content, or None if not found or empty.
     Used by PostCompact hook to re-inject team state after compaction.
     The checkpoint is written by PreCompact (before compaction), so reading
     from disk is safer than re-scanning the compacted JSONL.
+
+    Args:
+        project_dir: The resolved project directory (contains team-checkpoint.md).
+        include_global: When True (default), falls back to the shared
+            ~/.claude/team-checkpoint.md if the project-local file is absent.
+            Pass False from cmd_post_compact to prevent cross-project reads:
+            with a correctly resolved project_dir the global file is redundant,
+            and if resolution fails we prefer silence over injecting another
+            project's state.
     """
     from .session import get_claude_dir
 
     candidates = []
     if project_dir and project_dir.exists():
         candidates.append(project_dir / "team-checkpoint.md")
-    candidates.append(get_claude_dir() / "team-checkpoint.md")
+    if include_global:
+        candidates.append(get_claude_dir() / "team-checkpoint.md")
 
     for path in candidates:
         if path.exists():

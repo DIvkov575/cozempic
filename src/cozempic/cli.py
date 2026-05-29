@@ -746,14 +746,17 @@ def cmd_post_compact(args):
 
     cwd = args.cwd or os.getcwd()
 
-    # Try to find project dir from current session.
-    # strict=True: refuse to fall back to the global most-recent session (Strategy 4).
-    # If no session is found, use Path(cwd) — reads from the local project dir,
-    # which is always project-correct and never cross-contaminates.
+    # Resolve the project dir for this session.
+    # strict=True: refuse Strategy 4 (global most-recent fallback) — wrong-project
+    # sessions produce wrong-project checkpoints.
+    # On None: Path(cwd) points to the local project dir (project-correct; may have
+    # no checkpoint file → read_team_checkpoint returns None → silent, which is safe).
     sess = find_current_session(cwd, strict=True)
     project_dir = Path(sess["path"]).parent if sess else Path(cwd)
 
-    content = read_team_checkpoint(project_dir)
+    # include_global=False: the global ~/.claude/team-checkpoint.md is a cross-project
+    # read vector — it holds the last-written checkpoint regardless of project.
+    content = read_team_checkpoint(project_dir, include_global=False)
     if content:
         print(content)
 
