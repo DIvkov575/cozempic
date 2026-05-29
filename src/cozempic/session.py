@@ -333,9 +333,11 @@ def find_current_session(
         if matched:
             return matched
 
-    # Strategy 3: CWD slug match
+    # Strategy 3: CWD slug match — exact, not substring.
+    # Substring caused prefix collisions: '-Users-x-foo' IN '-Users-x-foobar'.
+    # Worktrees get their own project dir so exact-match is always correct.
     slug = cwd_to_project_slug(cwd)
-    matching = [s for s in sessions if slug in s["project"]]
+    matching = [s for s in sessions if s["project"] == slug]
     if matching:
         return max(matching, key=lambda s: s["mtime"])
 
