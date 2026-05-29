@@ -90,6 +90,50 @@ class TestReadOnlyLiveGuard(unittest.TestCase):
         self.assertFalse(result.get("live_write_skipped"))
         self.assertEqual(len(save_calls), 1, "deferred writer must perform the save")
 
+    def test_live_fd_held_guard_refuses_mutation(self):
+        """@Snailflyer's exact race (issue #106): hold a LIVE writer fd on the
+        JSONL, append a sentinel line through it, then run a no-reload guard
+        cycle — and assert the guard REFUSES to mutate the live file: same inode
+        (no os.replace / inode-swap out from under the harness), sentinel intact,
+        no backup. This is the measurable single-writer boundary he asked for."""
+        from cozempic.guard import guard_prune_cycle
+        from cozempic.team import TeamState
+
+        base = [json.dumps({"type": "user", "uuid": f"u{i}", "message": {"content": "x" * 150}})
+                for i in range(3)]
+        self.session_path.write_text("\n".join(base) + "\n")
+        inode_before = self.session_path.stat().st_ino
+
+        team = MagicMock(spec=TeamState)
+        team.is_empty.return_value = True
+        team.team_name = None
+        team.message_count = 0
+        pruned_subset = [(0, json.loads(base[0]), len(base[0]))]  # a prune WOULD shrink it
+
+        # Claude holds the file open and appends a sentinel mid-session.
+        with open(self.session_path, "a", encoding="utf-8") as live_fd:
+            live_fd.write(json.dumps({"type": "user", "uuid": "SENTINEL",
+                                      "message": {"content": "live append"}}) + "\n")
+            live_fd.flush()
+            with patch("cozempic.guard.prune_with_team_protect",
+                       return_value=(pruned_subset, {}, team)), \
+                 patch("cozempic.tokens.estimate_session_tokens", return_value=MagicMock(total=9999)), \
+                 patch("cozempic.tokens.calibrate_ratio", return_value=3.0):
+                result = guard_prune_cycle(
+                    session_path=self.session_path, rx_name="gentle",
+                    auto_reload=False, read_only_live=True,
+                )
+            self.assertTrue(result.get("live_write_skipped"), "guard must refuse the live mutation")
+
+        # Boundary assertions: the live-held inode was never swapped, the live
+        # append survived, and nothing pruned the file out from under the fd.
+        self.assertEqual(inode_before, self.session_path.stat().st_ino,
+                         "guard must NOT inode-swap a live-held transcript (#106)")
+        final = self.session_path.read_text()
+        self.assertIn("SENTINEL", final, "the live append must survive")
+        self.assertIn("u1", final)  # nothing was pruned (read-only)
+        self.assertEqual(list(self.tmpdir.glob("*.bak")), [], "no backup — no write occurred")
+
     def test_real_file_bytes_unchanged_in_read_only(self):
         """End-to-end on a real file (no mocks): the read-only cycle must not
         modify the bytes and must not leave a .bak — proving no os.replace."""
