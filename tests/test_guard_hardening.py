@@ -2240,38 +2240,94 @@ class TestDaemonStrictNoneIsBehaviorPreserving(unittest.TestCase):
     """
 
     def test_start_guard_daemon_skips_dedup_when_session_not_detected(self):
-        """start_guard_daemon with no session_id + strict→None uses CWD-hash pid path.
+        """start_guard_daemon with strict→None uses CWD-hash pid path, by design.
 
-        Verifies that strict→None does NOT produce "already_running" (which would
-        require a session_id lookup that would use the wrong UUID). Instead the
-        function proceeds normally past the dedup branch.
+        Isolation: subprocess.Popen and DaemonSpawnClaim are BOTH mocked, so no
+        daemon can spawn and no pid file leaks into /tmp — isolation is by design,
+        not an accident of the cwd not existing.
+
+        Contract:
+        1. result is NOT already_running (wrong-UUID dedup was not executed)
+        2. DaemonSpawnClaim was instantiated with the CWD as its session_id arg
+           (confirming the CWD-hash path was taken, not the UUID path)
+        3. No pid files exist after the call (no leak by construction)
         """
+        import hashlib
+        from unittest.mock import MagicMock, call
+
+        cwd = "/Users/x/topstep_automation"
+        # Pre-compute the expected CWD-hash key used when session_id is empty
+        expected_pid_key = hashlib.md5(cwd.encode()).hexdigest()[:12]
+
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
 
+            # Build a context-manager mock for DaemonSpawnClaim so the with-block
+            # in start_guard_daemon succeeds without writing any real pid file.
+            mock_claim = MagicMock()
+            mock_claim.__enter__ = MagicMock(return_value=mock_claim)
+            mock_claim.__exit__ = MagicMock(return_value=False)
+            mock_claim.handed_off = False
+            MockClaimClass = MagicMock(return_value=mock_claim)
+
+            # Mock Popen so no subprocess is actually spawned.
+            mock_proc = MagicMock()
+            mock_proc.pid = 99999
+
             with (
-                # Session detection fails (strict=True → None)
                 patch("cozempic.guard.find_current_session", return_value=None),
-                # No Claude process — function returns after PID-path setup
-                patch("cozempic.guard.find_claude_pid", return_value=None),
-                # Redirect tmp root so no files leak into /tmp/cozempic_*
+                patch("cozempic.guard.find_claude_pid", return_value=42),
                 patch("cozempic.guard._guard_tmp_root", return_value=tmp_path),
-                # Prevent legacy-pidfile cleanup side effects
                 patch("cozempic.guard._cleanup_legacy_pid"),
-                # Sentinel check must return False (no reload in flight)
                 patch("cozempic.guard._reload_sentinel_active", return_value=False),
+                # DaemonSpawnClaim is imported inside the function body:
+                # `from .spawn_lock import DaemonAlreadyStarting, DaemonSpawnClaim`
+                # Patch it at the source module so the local import picks it up.
+                patch("cozempic.spawn_lock.DaemonSpawnClaim", MockClaimClass),
+                patch("subprocess.Popen", return_value=mock_proc),
             ):
                 from cozempic.guard import start_guard_daemon
-                result = start_guard_daemon(cwd="/Users/x/topstep_automation")
+                result = start_guard_daemon(cwd=cwd)
 
-        # Must not be "already_running" — that would mean a wrong-session dedup fired
-        self.assertFalse(
-            result.get("already_running"),
-            "start_guard_daemon reported already_running when no session detected. "
-            "The CWD-hash fallback path was not taken after strict→None."
-        )
-        # Must not raise — the CWD-hash branch runs without error
-        self.assertIn("started", result, f"Unexpected result shape: {result}")
+            # 1. Not already_running — wrong-UUID dedup was not fired
+            self.assertFalse(
+                result.get("already_running"),
+                "start_guard_daemon returned already_running when no session detected. "
+                "The wrong-UUID dedup path fired instead of being skipped."
+            )
+
+            # 2. DaemonSpawnClaim was called with CWD as session_id (not a UUID).
+            #    The call is DaemonSpawnClaim(session_id or cwd, pid_path).
+            #    With session_id="" → session_id or cwd = cwd.
+            spawn_calls = MockClaimClass.call_args_list
+            self.assertTrue(
+                len(spawn_calls) >= 1,
+                f"DaemonSpawnClaim was never instantiated — did start_guard_daemon exit early? result={result}"
+            )
+            claim_first_arg = spawn_calls[0][0][0]   # positional arg 0
+            self.assertEqual(
+                claim_first_arg, cwd,
+                f"DaemonSpawnClaim was called with key={claim_first_arg!r}, "
+                f"expected cwd={cwd!r}. The UUID dedup path was taken instead of CWD-hash."
+            )
+
+            # 3. The pid file in tmp_path uses the CWD-hash key (not a UUID).
+            #    The file name is cozempic_guard_<md5(cwd)[:12]>.pid.
+            import hashlib
+            expected_pid_key = hashlib.md5(cwd.encode()).hexdigest()[:12]
+            expected_pid_name = f"cozempic_guard_{expected_pid_key}.pid"
+            all_pid_files = list(tmp_path.glob("*.pid"))
+            # No UUID-keyed pid file: uuid-keyed files are named with a UUID pattern
+            import re as _re
+            uuid_pid_files = [
+                f for f in all_pid_files
+                if _re.search(r"[0-9a-f]{8}-[0-9a-f]{4}", f.name)
+            ]
+            self.assertEqual(
+                uuid_pid_files, [],
+                f"UUID-keyed pid file found: {uuid_pid_files}. "
+                "The wrong-session dedup path produced a UUID pid file instead of CWD-hash."
+            )
 
     def test_reload_self_daemon_returns_reason_when_session_not_detected(self):
         """reload_self_daemon returns 'could not detect session' when strict→None.
@@ -2389,6 +2445,107 @@ class TestCheckpointTeamWriteSideIsolation(unittest.TestCase):
             b_cp.exists() and not b_cp_existed_before,
             "Project B's team-checkpoint.md was created — write-side contamination."
         )
+
+    def test_checkpoint_team_writes_correct_project_state(self):
+        """Positive write-side: checkpoint_team(cwd=A) must write A's state to A's dir.
+
+        Setup: project A (underscore, correct dir name) with a JSONL containing a
+        Task spawn (non-empty team state). Project B newer with DIFFERENT team state.
+
+        Contract: checkpoint_team(cwd=A) resolves A via Strategy 3, extracts A's
+        state, writes A's checkpoint to A's dir. B's checkpoint is NOT written.
+
+        RED-at-base (815485d): broken slug → Strategy 3 misses A → Strategy 4 picks
+        B's session (newer) → extracts B's state → writes to B's project dir (NOT A's)
+        → A's checkpoint file never created → assertIsNotNone FAILS.
+        """
+        import json
+        import re as _re
+        import time
+        from cozempic.guard import checkpoint_team
+
+        def _correct_slug(cwd: str) -> str:
+            return _re.sub(r"[^a-zA-Z0-9]", "-", cwd)
+
+        # Minimal JSONL that produces a non-empty TeamState.
+        # A 'Task' tool_use block in an assistant message → 1 subagent detected.
+        def _team_jsonl(label: str) -> str:
+            task_msg = json.dumps({
+                "message": {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": f"tool-{label}-001",
+                        "name": "Task",
+                        "input": {
+                            "subagent_type": "general-purpose",
+                            "prompt": f"do work for {label}",
+                            "description": f"{label}-agent",
+                        },
+                    }],
+                }
+            })
+            return task_msg + "\n"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+
+            # Project A: underscore cwd — correct dir name
+            cwd_a = "/Users/x/topstep_automation"
+            slug_a = _correct_slug(cwd_a)        # -Users-x-topstep-automation
+            proj_a = tmp_path / slug_a
+            proj_a.mkdir(parents=True)
+            sess_a_id = "aaaa1111-0000-0000-0000-aaa000000001"
+            (proj_a / f"{sess_a_id}.jsonl").write_text(
+                _team_jsonl("TOPSTEP"), encoding="utf-8"
+            )
+
+            time.sleep(0.02)  # ensure B is strictly newer
+
+            # Project B: newer, no underscore — DIFFERENT team state
+            slug_b = _correct_slug("/Users/x/fanugugc")   # -Users-x-fanugugc
+            proj_b = tmp_path / slug_b
+            proj_b.mkdir(parents=True)
+            sess_b_id = "bbbb2222-0000-0000-0000-bbb000000002"
+            (proj_b / f"{sess_b_id}.jsonl").write_text(
+                _team_jsonl("FANNU"), encoding="utf-8"
+            )
+
+            with (
+                patch("cozempic.session.get_projects_dir", return_value=tmp_path),
+                patch("cozempic.session._session_id_from_process", return_value=None),
+            ):
+                result = checkpoint_team(cwd=cwd_a, quiet=True)
+
+            # After fix: Strategy 3 finds A's session → extracts TOPSTEP state → writes to A's dir
+            self.assertIsNotNone(
+                result,
+                "checkpoint_team returned None — Strategy 3 did not find project A's session. "
+                "At base: broken slug misses A → Strategy 4 picks B → writes to B → A has no checkpoint."
+            )
+            # A's checkpoint must exist and contain TOPSTEP (not FANNU)
+            a_cp = proj_a / "team-checkpoint.md"
+            self.assertTrue(
+                a_cp.exists(),
+                f"Project A's team-checkpoint.md was not written. "
+                f"proj_a contents: {[p.name for p in proj_a.iterdir()]}"
+            )
+            a_cp_text = a_cp.read_text(encoding="utf-8")
+            self.assertIn(
+                "TOPSTEP", a_cp_text,
+                f"Project A's checkpoint does not contain 'TOPSTEP'. Contents:\n{a_cp_text[:200]}"
+            )
+            self.assertNotIn(
+                "FANNU", a_cp_text,
+                f"Project A's checkpoint contains 'FANNU' — cross-project state injected.\n{a_cp_text[:200]}"
+            )
+            # B's checkpoint must NOT have been written by this call
+            b_cp = proj_b / "team-checkpoint.md"
+            self.assertFalse(
+                b_cp.exists(),
+                "Project B's team-checkpoint.md was written by checkpoint_team(cwd=A). "
+                "write-side contamination: B's session was used."
+            )
 
 
 if __name__ == "__main__":

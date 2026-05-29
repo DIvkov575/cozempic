@@ -65,15 +65,15 @@ class TestStrictMode:
     def test_strict_succeeds_on_cwd_slug_match(self, tmp_path):
         """CWD slug match (Strategy 3) satisfies strict mode — underscore and dot variants.
 
-        Uses cwd_to_project_slug() (imported, not hand-copied) so the test tracks
-        the canonical formula. Covers underscore and dot-path cwds, not just plain paths.
+        Fixture dirs use HARDCODED literal names (what Claude Code actually writes to disk),
+        independent of cwd_to_project_slug. If the slug formula regresses, the computed
+        slug won't match the literal dir → strict=True returns None → test FAILS.
         """
-        from cozempic.session import cwd_to_project_slug
-
-        # Underscore cwd (was the original bug trigger)
+        # Underscore cwd (was the original bug trigger).
+        # Literal dir: '/Users/foo/topstep_automation' → '-Users-foo-topstep-automation'
         cwd_under = "/Users/foo/topstep_automation"
-        slug_under = cwd_to_project_slug(cwd_under)
-        proj_under = tmp_path / "projects" / slug_under
+        literal_dir_under = "-Users-foo-topstep-automation"
+        proj_under = tmp_path / "projects" / literal_dir_under
         sess_under = "cccc3333-0000-0000-0000-000000000000"
         _write_session(proj_under, sess_under)
 
@@ -85,17 +85,19 @@ class TestStrictMode:
 
         assert result is not None, (
             f"Strategy 3 did not find underscore-cwd project. "
-            f"slug={slug_under!r}, project dir={proj_under.name!r}"
+            f"Expected slug '-Users-foo-topstep-automation' to match literal dir."
         )
         assert result["session_id"] == sess_under
 
     def test_strict_succeeds_on_dot_cwd_slug_match(self, tmp_path):
-        """Dot-path cwd (double-dash slug) is found by Strategy 3 in strict mode."""
-        from cozempic.session import cwd_to_project_slug
+        """Dot-path cwd (double-dash slug) is found by Strategy 3 in strict mode.
 
+        Fixture dir uses HARDCODED literal name.
+        '/Users/foo/.claude' → '-Users-foo--claude' (dot→dash produces double-dash).
+        """
         cwd_dot = "/Users/foo/.claude"
-        slug_dot = cwd_to_project_slug(cwd_dot)   # "-Users-foo--claude"
-        proj_dot = tmp_path / "projects" / slug_dot
+        literal_dir_dot = "-Users-foo--claude"   # double-dash from dot replacement
+        proj_dot = tmp_path / "projects" / literal_dir_dot
         sess_dot = "eeee5555-0000-0000-0000-000000000000"
         _write_session(proj_dot, sess_dot)
 
@@ -107,7 +109,7 @@ class TestStrictMode:
 
         assert result is not None, (
             f"Strategy 3 did not find dot-path project. "
-            f"slug={slug_dot!r}, project dir={proj_dot.name!r}"
+            f"Expected slug '-Users-foo--claude' to match literal dir."
         )
         assert result["session_id"] == sess_dot
 
