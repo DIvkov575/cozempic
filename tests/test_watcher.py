@@ -736,6 +736,99 @@ class TestJsonlWatcherOSErrorRobustness(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    def test_kq_close_oserror_does_not_kill_thread_and_polls(self):
+        """kq.close() raising OSError in finally must NOT kill the thread.
+
+        Gap in the current nested try/finally (R3):
+            try:
+                if kq is not None: kq.close()   # raises OSError here
+            finally:
+                os.close(fd)                     # still runs (R3 ok)
+        ...but kq.close()'s OSError propagates out of the outer finally,
+        killing the thread and skipping the poll-fallback tail line.
+
+        Fix: swallow cleanup-close errors. Both closes are attempted and neither
+        propagates; the poll fallback at the end of _watch_kqueue is always reached.
+
+        This test combines with a kqueue()-EMFILE scenario so kqueue_error is True
+        when kq.close() raises — ensuring poll fallback IS entered (b), not just
+        that the thread survives a graceful stop.
+
+        Asserts:
+        (a) os.close(fd) is still called
+        (b) _watch_poll IS entered (poll fallback runs even when cleanup raises)
+        (c) thread stays alive / joins cleanly (does not die from cleanup exception)
+        """
+        import select as _sel
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jsonl",
+                                          mode="wb") as f:
+            path = f.name
+            f.write(b"x" * 100)
+        try:
+            fd_closed = threading.Event()
+            poll_entered = threading.Event()
+            real_os_close = os.close
+
+            def spy_close(fd: int) -> None:
+                fd_closed.set()
+                real_os_close(fd)
+
+            real_kqueue_cls = _sel.kqueue
+            kqueue_call_count = [0]
+
+            def spy_kqueue():
+                kqueue_call_count[0] += 1
+                real_kq = real_kqueue_cls()
+                mock_kq = MagicMock()
+                # First control() call raises OSError → kqueue_error=True → poll fallback
+                # This ensures fall_back_to_poll is True when we reach the finally block
+                call_n = [0]
+                def raising_control(events, max_events, timeout):
+                    call_n[0] += 1
+                    if call_n[0] == 1:
+                        raise OSError("kq.control() failed — EMFILE simulation")
+                    return real_kq.control(events, max_events, timeout)
+                mock_kq.control.side_effect = raising_control
+                # kq.close() also raises — the key condition being tested
+                def raising_close():
+                    real_kq.close()
+                    raise OSError("kq.close() misbehaved in cleanup")
+                mock_kq.close.side_effect = raising_close
+                return mock_kq
+
+            w = _make_watcher(path, lambda p, s: None, use_kqueue=True)
+
+            # Spy on _watch_poll to detect poll-fallback entry
+            real_watch_poll = w._watch_poll
+            def spy_poll():
+                poll_entered.set()
+                real_watch_poll()
+            w._watch_poll = spy_poll
+
+            with patch("select.kqueue", side_effect=spy_kqueue), \
+                 patch("os.close", side_effect=spy_close):
+                t = _start_thread(w)
+                # Wait for poll fallback to be entered (or timeout)
+                poll_entered.wait(timeout=2.0)
+                w.stop()
+                t.join(timeout=2)
+
+            # (a) fd was closed despite kq.close() raising
+            self.assertTrue(fd_closed.is_set(),
+                "os.close(fd) not called when kq.close() raised. "
+                "Cleanup swallow not implemented (addendum fix).")
+            # (b) poll fallback was entered despite the cleanup exception
+            self.assertTrue(poll_entered.is_set(),
+                "_watch_poll not entered after kq.close() OSError. "
+                "Addendum not fixed: OSError in cleanup kills thread before "
+                "poll-fallback tail line is reached.")
+            # (c) thread joined cleanly
+            self.assertFalse(t.is_alive(),
+                "Thread still alive after stop(). May be stuck in unexpected state.")
+        finally:
+            os.unlink(path)
+
 
 if __name__ == "__main__":
     unittest.main()
