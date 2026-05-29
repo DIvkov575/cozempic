@@ -2221,6 +2221,80 @@ class TestPolishV2_StartGuardDaemonValidatesSessionId(unittest.TestCase):
             f"{[str(o) for o in bash_orphans]}",
         )
 
+# ---------------------------------------------------------------------------
+# TestDaemonStrictNoneIsBehaviorPreserving — guard.py:1878/2464
+# ---------------------------------------------------------------------------
+class TestDaemonStrictNoneIsBehaviorPreserving(unittest.TestCase):
+    """strict→None in daemon paths must degrade gracefully (no new failure modes).
+
+    guard.py:1878 (start_guard_daemon): when find_current_session(cwd, strict=True)
+    returns None, session_id stays "". The function falls through to the CWD-hash
+    PID path — same behavior as calling with no session_id at all (old hook compat).
+
+    guard.py:2464 (reload_self_daemon): when find_current_session returns None,
+    session_id stays "" → returns {"reloaded": False, "reason": "could not detect session"}.
+    Same outcome as the pre-existing `if not session_id: return ...` guard.
+
+    Neither path spawns a subprocess in these tests — we patch find_current_session
+    and _guard_tmp_root to keep tests fast and isolated.
+    """
+
+    def test_start_guard_daemon_skips_dedup_when_session_not_detected(self):
+        """start_guard_daemon with no session_id + strict→None uses CWD-hash pid path.
+
+        Verifies that strict→None does NOT produce "already_running" (which would
+        require a session_id lookup that would use the wrong UUID). Instead the
+        function proceeds normally past the dedup branch.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+
+            with (
+                # Session detection fails (strict=True → None)
+                patch("cozempic.guard.find_current_session", return_value=None),
+                # No Claude process — function returns after PID-path setup
+                patch("cozempic.guard.find_claude_pid", return_value=None),
+                # Redirect tmp root so no files leak into /tmp/cozempic_*
+                patch("cozempic.guard._guard_tmp_root", return_value=tmp_path),
+                # Prevent legacy-pidfile cleanup side effects
+                patch("cozempic.guard._cleanup_legacy_pid"),
+                # Sentinel check must return False (no reload in flight)
+                patch("cozempic.guard._reload_sentinel_active", return_value=False),
+            ):
+                from cozempic.guard import start_guard_daemon
+                result = start_guard_daemon(cwd="/Users/x/topstep_automation")
+
+        # Must not be "already_running" — that would mean a wrong-session dedup fired
+        self.assertFalse(
+            result.get("already_running"),
+            "start_guard_daemon reported already_running when no session detected. "
+            "The CWD-hash fallback path was not taken after strict→None."
+        )
+        # Must not raise — the CWD-hash branch runs without error
+        self.assertIn("started", result, f"Unexpected result shape: {result}")
+
+    def test_reload_self_daemon_returns_reason_when_session_not_detected(self):
+        """reload_self_daemon returns 'could not detect session' when strict→None.
+
+        After fix: returns 'could not detect session' — clearer than pre-fix behavior
+        which could return 'no daemon running for session' with a wrong UUID.
+        The behavior-preserving claim: no reload attempt, no signal sent.
+        """
+        from cozempic.guard import reload_self_daemon
+
+        with patch("cozempic.guard.find_current_session", return_value=None):
+            result = reload_self_daemon(
+                cwd="/Users/x/topstep_automation",
+                session_id="",   # no session_id provided
+            )
+
+        self.assertFalse(result.get("reloaded"), f"Expected reloaded=False, got {result}")
+        self.assertEqual(
+            result.get("reason"), "could not detect session",
+            f"Expected reason='could not detect session', got {result.get('reason')!r}. "
+            "strict→None must produce this reason, not 'no daemon running for session'."
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestCheckpointTeamWriteSideIsolation — Bug P0-E regression
