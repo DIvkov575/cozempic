@@ -219,7 +219,11 @@ def checkpoint_team(
     Returns the extracted TeamState, or None if no session found.
     """
     if session_path is None:
-        sess = find_current_session(cwd)
+        # strict=True: refuse Strategy 4 (global most-recent fallback).
+        # Writing a checkpoint from the wrong project's session is worse than
+        # writing no checkpoint at all — the latter leaves PostCompact with
+        # nothing to inject, while the former injects another project's state.
+        sess = find_current_session(cwd, strict=True)
         if not sess:
             if not quiet:
                 print("  No active session found.", file=sys.stderr)
@@ -1866,8 +1870,12 @@ def start_guard_daemon(
                 "already_running": True,
             }
     else:
-        # No session_id — detect from CWD (backward compat with old hooks)
-        sess = find_current_session(cwd)
+        # No session_id — detect from CWD (backward compat with old hooks).
+        # strict=True: if ambiguous, skip dedup rather than dedup against the
+        # wrong session's PID file (which would pass spuriously and spawn a
+        # second daemon). Behavior with strict→None matches old hook invocations
+        # that provided no session_id (dedup was simply skipped then too).
+        sess = find_current_session(cwd, strict=True)
         if sess:
             session_id = sess.get("session_id", "")
 
@@ -2449,7 +2457,11 @@ def reload_self_daemon(
     cwd = cwd or os.getcwd()
 
     if not session_id:
-        sess = find_current_session(cwd)
+        # strict=True: if Strategy 3 fails, return "could not detect session" rather
+        # than looking for the reload target under a wrong (Strategy 4) session UUID,
+        # which would fail anyway (no daemon under that UUID) and give a misleading
+        # "no daemon running" error instead of the actual "ambiguous session" cause.
+        sess = find_current_session(cwd, strict=True)
         if sess:
             session_id = sess.get("session_id", "")
 

@@ -746,8 +746,11 @@ def cmd_post_compact(args):
 
     cwd = args.cwd or os.getcwd()
 
-    # Try to find project dir from current session
-    sess = find_current_session(cwd)
+    # Try to find project dir from current session.
+    # strict=True: refuse to fall back to the global most-recent session (Strategy 4).
+    # If no session is found, use Path(cwd) — reads from the local project dir,
+    # which is always project-correct and never cross-contaminates.
+    sess = find_current_session(cwd, strict=True)
     project_dir = Path(sess["path"]).parent if sess else Path(cwd)
 
     content = read_team_checkpoint(project_dir)
@@ -1105,7 +1108,9 @@ def _digest_session(args):
         # consistent with how the rest of cli.py resolves the current session.
         # Routing "current" through resolve_session() would use process-detection
         # (find_current_session(strict=False)) which is a different strategy.
-        sess = find_current_session(cwd)
+        # strict=True: digest flush/inject are write operations — injecting rules
+        # into an unrelated session's JSONL is a context-contamination risk.
+        sess = find_current_session(cwd, strict=True)
         if not sess:
             # Changed to stderr: consistent with resolve_session error output
             # and all other error paths in cli.py.
