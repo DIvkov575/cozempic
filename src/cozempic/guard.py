@@ -611,6 +611,10 @@ def start_guard(
                     cwd=cwd or os.getcwd(),
                     session_id=sess["session_id"],
                     claude_pid=claude_pid,
+                    # --no-reload: we won't terminate Claude, so we can't safely
+                    # write the live file (#106) — go read-only instead of falsely
+                    # reporting a prune that never persisted.
+                    read_only_live=not auto_reload,
                 )
 
                 if result.get("reloading"):
@@ -624,7 +628,7 @@ def start_guard(
                 if result.get("live_write_skipped"):
                     print(f"  Read-only — live session not rewritten (#106).")
                 elif result.get("futile_reload_skipped"):
-                    pass  # reported by the dedicated futile diagnostic below
+                    pass  # futile prune — nothing persisted (live file untouched)
                 else:
                     print(f"  Pruned: {_fmt_prune_result(result)}")
                 if result.get("team_name"):
@@ -667,6 +671,9 @@ def start_guard(
                         cwd=cwd or os.getcwd(),
                         session_id=sess["session_id"],
                         claude_pid=claude_pid,
+                        # --no-reload: read-only (can't safely write a live file
+                        # without terminating Claude — #106).
+                        read_only_live=not auto_reload,
                     )
 
                 if result.get("reloading"):
@@ -680,7 +687,7 @@ def start_guard(
                 if result.get("live_write_skipped"):
                     print(f"  Read-only — live session not rewritten (#106).")
                 elif result.get("futile_reload_skipped"):
-                    pass  # reported by the dedicated futile diagnostic below
+                    pass  # futile prune — nothing persisted (live file untouched)
                 else:
                     print(f"  Pruned: {_fmt_prune_result(result)}")
                 if result.get("team_name"):
@@ -1116,14 +1123,19 @@ def guard_prune_cycle(
                         session_path=session_path,
                         write_pruned=_write_pruned_after_exit,
                     )
-                    result["reloading"] = True
+                # The deferred writer fires only after a confirmed kill, so a
+                # successful write == Claude was terminated == a real reload is
+                # under way. If it did NOT write (anti-resurrection entry gate
+                # because Claude already exited, a failed kill, or an append
+                # conflict), nothing was persisted and no real reload happened —
+                # keep the daemon alive (reloading=False) and leave the full file
+                # for resume. This avoids a misleading "Reload triggered" + exit.
                 if _write_holder["written"]:
+                    result["reloading"] = True
                     result["backup_path"] = (
                         str(_write_holder["backup"]) if _write_holder["backup"] else None
                     )
                 else:
-                    # Claude could not be confirmed dead → prune not persisted;
-                    # it resumes from the untouched full file (safe, no loss).
                     result["saved_mb"] = 0.0
                     result["live_write_skipped"] = True
             except ReloadLockHeld as exc:

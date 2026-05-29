@@ -287,11 +287,23 @@ class OverflowRecovery:
                         session_path=self.session_path,
                         write_pruned=deferred_writer,
                     )
-                    print(
-                        f"  [{now}] Kill + resume triggered (PID {claude_pid}). "
-                        f"~10s downtime.",
-                        file=sys.stderr,
-                    )
+                    write_holder = result.get("_write_holder") or {}
+                    if write_holder.get("written") or deferred_writer is None:
+                        print(
+                            f"  [{now}] Kill + resume triggered (PID {claude_pid}). "
+                            f"~10s downtime.",
+                            file=sys.stderr,
+                        )
+                    else:
+                        # #106: the deferred write was skipped (Claude survived the
+                        # kill, or an append-conflict) — the live file was left
+                        # intact, so the resumed Claude reloads the FULL file. The
+                        # circuit breaker bounds repeated no-op recoveries.
+                        print(
+                            f"  [{now}] Kill triggered (PID {claude_pid}) but prune was "
+                            f"not persisted — resuming from the full file.",
+                            file=sys.stderr,
+                        )
             except ReloadLockHeld as exc:
                 print(
                     f"  [{now}] Reload deferred — another pipeline in flight "
