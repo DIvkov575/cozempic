@@ -219,7 +219,18 @@ class OverflowRecovery:
             session_id=self.session_id,
         )
 
-        after_mb = self.session_path.stat().st_size / 1024 / 1024
+        # #106: guard_prune_cycle no longer writes the live file inline — it
+        # returns a deferred writer that is invoked only AFTER Claude is
+        # terminated below (so the os.replace never swaps an inode under a live
+        # fd). Use the PROJECTED post-prune size for the pre-flight; the on-disk
+        # file is still the full pre-prune file until the deferred write fires.
+        deferred_writer = result.get("_deferred_writer")
+        final_bytes = result.get("_final_bytes")
+        if final_bytes is not None:
+            after_mb = final_bytes / 1024 / 1024
+        else:
+            # Futile / no-change prune (nothing to write) — file is unchanged.
+            after_mb = self.session_path.stat().st_size / 1024 / 1024
 
         # 4. Pre-flight: if still dangerously large, don't resume
         if after_mb * 1024 * 1024 > self.danger_threshold_bytes * 0.95:
@@ -269,10 +280,12 @@ class OverflowRecovery:
                     # mtime fallback works (happy-path symmetry with
                     # guard_prune_cycle). The bare-liveness gate in
                     # _terminate_and_resume still prevents resurrection.
+                    # #106: write_pruned persists the prune AFTER Claude is dead.
                     _terminate_and_resume(
                         claude_pid, self.cwd,
                         session_id=self.session_id,
                         session_path=self.session_path,
+                        write_pruned=deferred_writer,
                     )
                     print(
                         f"  [{now}] Kill + resume triggered (PID {claude_pid}). "

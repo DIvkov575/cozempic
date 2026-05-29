@@ -623,6 +623,8 @@ def start_guard(
 
                 if result.get("live_write_skipped"):
                     print(f"  Read-only — live session not rewritten (#106).")
+                elif result.get("futile_reload_skipped"):
+                    pass  # reported by the dedicated futile diagnostic below
                 else:
                     print(f"  Pruned: {_fmt_prune_result(result)}")
                 if result.get("team_name"):
@@ -677,6 +679,8 @@ def start_guard(
 
                 if result.get("live_write_skipped"):
                     print(f"  Read-only — live session not rewritten (#106).")
+                elif result.get("futile_reload_skipped"):
+                    pass  # reported by the dedicated futile diagnostic below
                 else:
                     print(f"  Pruned: {_fmt_prune_result(result)}")
                 if result.get("team_name"):
@@ -697,18 +701,18 @@ def start_guard(
                     # as futile (prune saved too few bytes to justify a reload
                     # that would immediately re-trigger HARD).
                     if result.get("futile_reload_skipped") and not _futile_skip_announced:
-                        saved_mb = result.get("saved_mb", 0)
+                        would_free_mb = result.get("would_free_mb", result.get("saved_mb", 0))
                         orig_bytes = result.get("original_bytes", 0)
-                        saved_pct = (saved_mb * 1024 * 1024 / orig_bytes * 100
+                        saved_pct = (would_free_mb * 1024 * 1024 / orig_bytes * 100
                                      if orig_bytes > 0 else 0)
                         checkpoint_ref = (
                             f" Checkpoint: {result['checkpoint_path']}"
                             if result.get("checkpoint_path") else ""
                         )
                         print(
-                            f"  [{_now()}] Hard prune freed {saved_mb:.3f}MB "
+                            f"  [{_now()}] Hard prune would free only {would_free_mb:.3f}MB "
                             f"(~{saved_pct:.0f}%) — below {int(_MIN_PRUNE_RATIO * 100)}% "
-                            f"threshold. Reload skipped: resumed Claude would re-trigger "
+                            f"threshold. Reload skipped (live file left intact): resumed Claude would re-trigger "
                             f"HARD immediately. Likely cause: subagent transcripts or large "
                             f"tool-results dominate context. Recommend: /clear (loses subagent "
                             f"state) or fresh session with restored team "
@@ -1007,26 +1011,25 @@ def guard_prune_cycle(
             # touch). Skip the reload; persist the prune output; let K-counter advance
             # so the circuit breaker eventually exits the daemon.
             if 0 < saved_bytes < original_bytes * _MIN_PRUNE_RATIO:
-                # Still write checkpoint (so user can recover team state via the
-                # checkpoint path surfaced in the diagnostic) and save messages
-                # (prune output is valid — it just won't save enough to avoid
-                # immediate re-trigger).
+                # Futile: the prune saved too little to justify a reload that
+                # would immediately re-trigger HARD. We are NOT terminating Claude
+                # this cycle, so per #106 we must NOT os.replace the live file the
+                # harness holds open — just checkpoint team state. The K-counter
+                # still advances so the circuit breaker eventually exits.
                 checkpoint_path = None
                 if not team_state.is_empty():
                     project_dir = session_path.parent
                     checkpoint_path = write_team_checkpoint(team_state, project_dir)
-                backup = save_messages(session_path, pruned_messages, create_backup=True, snapshot=snap)
-                if backup:
-                    cleanup_old_backups(session_path, keep=3)
                 return {
-                    "saved_mb": saved_bytes / 1024 / 1024,
+                    "saved_mb": 0.0,  # nothing persisted — live write skipped (#106)
+                    "would_free_mb": saved_bytes / 1024 / 1024,
                     "original_bytes": original_bytes,
                     "original_tokens": pre_te.total,
                     "final_tokens": pre_te.total,  # post_te not computed (early return)
-                    "team_name": team_state.team_name,
+                    "team_name": team_state.team_name or None,
                     "team_messages": team_state.message_count,
                     "checkpoint_path": str(checkpoint_path) if checkpoint_path else None,
-                    "backup_path": str(backup) if backup else None,
+                    "backup_path": None,
                     "reloading": False,
                     "futile_reload_skipped": True,
                 }
@@ -1040,12 +1043,10 @@ def guard_prune_cycle(
                 project_dir = session_path.parent
                 checkpoint_path = write_team_checkpoint(team_state, project_dir)
 
-            # Save pruned session — snapshot enables append-aware atomic write
-            backup = save_messages(session_path, pruned_messages, create_backup=True, snapshot=snap)
-
-            # Cap backup retention at 3 files to prevent disk fill (#19)
-            if backup:
-                cleanup_old_backups(session_path, keep=3)
+            # #106: the pruned session is NOT written here. The live file the
+            # harness holds open must only be os.replace'd AFTER Claude is
+            # terminated — see the deferred writer below (_write_pruned_after_exit).
+            # Team state is checkpointed above (read-only) regardless.
 
     except PruneLockError as exc:
         print(f"  [{_now()}] Prune deferred — lock held: {exc}", file=sys.stderr)
@@ -1063,24 +1064,40 @@ def guard_prune_cycle(
                        and isinstance(m.get("message", {}).get("content", ""), str))
         record_savings(tokens_saved, total_tokens=pre_te.total, turn_count=turn_count)
 
+    # #106 deferred writer — persists the pruned session ONLY after the process
+    # holding it is dead. Re-acquires the prune lock; the snapshot makes the
+    # write append-aware (any lines Claude wrote before dying are preserved); on
+    # conflict it aborts, leaving the original intact (Claude resumes from the
+    # full file — safe). Invoked by _terminate_and_resume after _wait_for_exit.
+    _write_holder = {"backup": None, "written": False}
+
+    def _write_pruned_after_exit():
+        try:
+            with _PruneLock(session_path):
+                bk = save_messages(
+                    session_path, pruned_messages, create_backup=True, snapshot=snap
+                )
+            if bk:
+                cleanup_old_backups(session_path, keep=3)
+            _write_holder["backup"] = bk
+            _write_holder["written"] = True
+        except (PruneConflictError, PruneLockError) as exc:
+            print(f"  [{_now()}] Deferred prune write skipped — {exc}", file=sys.stderr)
+
     result = {
         "saved_mb": saved_bytes / 1024 / 1024,
         "original_tokens": pre_te.total,
         "final_tokens": post_te.total,
-        "team_name": team_state.team_name,
+        "team_name": team_state.team_name or None,
         "team_messages": team_state.message_count,
         "checkpoint_path": str(checkpoint_path) if checkpoint_path else None,
-        "backup_path": str(backup) if backup else None,
+        "backup_path": None,
         "reloading": False,
     }
 
-    # Trigger reload if configured — terminate Claude then auto-resume.
-    # Wave 2: acquire the single-flight reload lock before spawning the
-    # watcher. If another process (manual `cozempic reload`, overflow
-    # recovery, or another guard daemon instance) is already in the middle
-    # of a reload pipeline, defer ours — the prune itself completed and
-    # the user already has the saved state. Next cycle (or next user-
-    # initiated event) will re-trigger if conditions still warrant.
+    # Trigger reload — terminate Claude FIRST, then the deferred writer persists
+    # the prune (post-death), then resume. This closes the #106 race: the live
+    # inode is never swapped while Claude holds the file open.
     if auto_reload:
         reload_pid = claude_pid if claude_pid is not None else find_claude_pid()
         if reload_pid:
@@ -1097,21 +1114,44 @@ def guard_prune_cycle(
                         reload_pid, cwd,
                         session_id=session_id,
                         session_path=session_path,
+                        write_pruned=_write_pruned_after_exit,
                     )
                     result["reloading"] = True
+                if _write_holder["written"]:
+                    result["backup_path"] = (
+                        str(_write_holder["backup"]) if _write_holder["backup"] else None
+                    )
+                else:
+                    # Claude could not be confirmed dead → prune not persisted;
+                    # it resumes from the untouched full file (safe, no loss).
+                    result["saved_mb"] = 0.0
+                    result["live_write_skipped"] = True
             except ReloadLockHeld as exc:
-                # Another reload pipeline is already in flight — defer.
-                # Prune output is already saved; the in-flight pipeline
-                # will do the kill+resume.
+                # Another reload pipeline is in flight — it terminates + writes
+                # its own prune. We did NOT write the live file (#106-safe).
                 print(
                     f"  Reload deferred — another pipeline in flight "
                     f"({exc.holder_initiator}, PID {exc.holder_pid})."
                 )
                 result["reloading"] = False
+                result["saved_mb"] = 0.0
+                result["live_write_skipped"] = True
         else:
+            # No live Claude PID found. We cannot prove the file is unheld, so
+            # per #106 we do NOT rewrite it; resume manually from the full file.
             resume_flag = f"--resume {session_id}" if session_id else "--resume"
-            print("  WARNING: Could not find Claude PID. Pruned but not reloading.")
+            print("  WARNING: Could not find Claude PID — not reloading, live file left intact.")
             print(f"  Restart manually: claude {resume_flag}")
+            result["saved_mb"] = 0.0
+            result["live_write_skipped"] = True
+    else:
+        # auto_reload=False reaching here = overflow recovery (a substantial prune;
+        # SOFT / agents-active returned read-only earlier). Hand the deferred
+        # writer + projected final size to the caller, which terminates Claude
+        # itself and then invokes the writer post-death.
+        result["_deferred_writer"] = _write_pruned_after_exit
+        result["_write_holder"] = _write_holder
+        result["_final_bytes"] = final_bytes
 
     return result
 
@@ -1291,6 +1331,7 @@ def _terminate_and_resume(
     project_dir: str,
     session_id: str | None = None,
     session_path: Path | None = None,
+    write_pruned=None,
     **_ignored_kwargs: object,
 ) -> None:
     """Gracefully exit Claude and resume in the same terminal where possible.
@@ -1388,6 +1429,13 @@ def _terminate_and_resume(
 
         time.sleep(1)
 
+        # #106: write the pruned session NOW — Claude has exited, so the
+        # os.replace can no longer swap an inode out from under a live fd. Gated
+        # on confirmed death; if Claude somehow survived, skip the write and let
+        # it resume from the untouched (full) file rather than risk corruption.
+        if write_pruned is not None and not _pid_is_alive(claude_pid):
+            write_pruned()
+
         # Resume in same pane
         subprocess.run(
             ["tmux", "send-keys", *(["-t", pane] if pane else []),
@@ -1430,6 +1478,10 @@ def _terminate_and_resume(
 
         time.sleep(1)
 
+        # #106: write the pruned session now that Claude has exited (see tmux note).
+        if write_pruned is not None and not _pid_is_alive(claude_pid):
+            write_pruned()
+
         subprocess.run(
             ["screen", "-S", screen_session, "-X", "stuff",
              f"cd {shell_quote(project_dir)} && {resume_cmd}\n"],
@@ -1467,6 +1519,16 @@ def _terminate_and_resume(
                     os.kill(claude_pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError, OSError):
             pass
+
+    # #106: Claude has been terminated above. Wait briefly for the fd to be
+    # released, then write the pruned session BEFORE spawning the resume
+    # watcher, so the os.replace never swaps an inode out from under a live
+    # Claude. Gated on confirmed death — if Claude somehow survived the kill,
+    # skip the write and let it resume from the untouched (full) file.
+    if write_pruned is not None:
+        _wait_for_exit(claude_pid, timeout=2.0)
+        if not _pid_is_alive(claude_pid):
+            write_pruned()
 
     # Plain-terminal path: write sentinel here, JUST BEFORE the watcher Popen.
     # SSH and PID-reuse-fail blocks above return without reaching this point,

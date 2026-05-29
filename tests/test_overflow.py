@@ -234,10 +234,13 @@ class TestOverflowDetection(unittest.TestCase):
             ):
                 recovery.recover()
 
+            # write_pruned is the #106 deferred writer (None here: the mocked
+            # guard_prune_cycle returns no _deferred_writer).
             mock_reload.assert_called_once_with(
                 7777, self.tmpdir,
                 session_id="test-explicit-pid",
                 session_path=self.session_path,
+                write_pruned=None,
             )
         finally:
             breaker.reset()
