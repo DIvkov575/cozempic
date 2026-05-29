@@ -91,6 +91,77 @@ class TestStrictMode:
             assert find_current_session(strict=False) is None
 
 
+# ---------------------------------------------------------------------------
+# TestStrategy3ExactMatch — Bug B: substring → exact-match in Strategy 3
+# ---------------------------------------------------------------------------
+
+class TestStrategy3ExactMatch:
+    """Strategy 3 must use exact-match on slug, not substring."""
+
+    def test_underscore_project_found_after_slug_fix(self, tmp_path):
+        """After P0-A+P0-B: an underscore-path project is found by Strategy 3."""
+        cwd = "/Users/x/topstep_automation"
+        from cozempic.session import cwd_to_project_slug
+        slug = cwd_to_project_slug(cwd)            # "-Users-x-topstep-automation"
+        proj = tmp_path / "projects" / slug
+        session_id = "dddd4444-0000-0000-0000-000000000000"
+        _write_session(proj, session_id)
+
+        with (
+            patch("cozempic.session.get_projects_dir", return_value=tmp_path / "projects"),
+            patch("cozempic.session._session_id_from_process", return_value=None),
+        ):
+            result = find_current_session(cwd=cwd, strict=True)
+
+        assert result is not None, (
+            "find_current_session must find the underscore-cwd project via Strategy 3. "
+            "If this fails, the slug is still wrong or Strategy 3 still uses substring."
+        )
+        assert result["session_id"] == session_id
+
+    def test_strategy3_no_prefix_collision(self, tmp_path):
+        """Slug '-Users-x-foo' must NOT match project '-Users-x-foobar'."""
+        from cozempic.session import cwd_to_project_slug
+        cwd_foo = "/Users/x/foo"
+        slug_foo = cwd_to_project_slug(cwd_foo)    # "-Users-x-foo"
+
+        # Create BOTH project dirs
+        proj_foo = tmp_path / "projects" / slug_foo
+        proj_foobar = tmp_path / "projects" / f"{slug_foo}bar"
+        sess_foo = "eeee5555-0000-0000-0000-000000000000"
+        sess_foobar = "ffff6666-0000-0000-0000-000000000000"
+        _write_session(proj_foo, sess_foo)
+        _write_session(proj_foobar, sess_foobar)
+
+        with (
+            patch("cozempic.session.get_projects_dir", return_value=tmp_path / "projects"),
+            patch("cozempic.session._session_id_from_process", return_value=None),
+        ):
+            result = find_current_session(cwd=cwd_foo, strict=True)
+
+        assert result is not None
+        assert result["session_id"] == sess_foo, (
+            f"Expected session for '-Users-x-foo', got {result['session_id']!r}. "
+            "Prefix collision: Strategy 3 is still using substring match."
+        )
+
+    def test_strategy4_strict_returns_none_on_no_match(self, tmp_path):
+        """strict=True blocks Strategy 4 fallback when no slug matches."""
+        proj = tmp_path / "projects" / "-some-other-path"
+        _write_session(proj, "aaaa1111-0000-0000-0000-000000000000")
+
+        with (
+            patch("cozempic.session.get_projects_dir", return_value=tmp_path / "projects"),
+            patch("cozempic.session._session_id_from_process", return_value=None),
+        ):
+            result = find_current_session(cwd="/unrelated/underscore_path", strict=True)
+
+        assert result is None, (
+            "strict=True must return None when no slug matches. "
+            "Strategy 4 fallback is leaking through."
+        )
+
+
 class TestSlugRoundTrip:
     def test_simple_path_round_trips(self):
         from cozempic.session import cwd_to_project_slug, project_slug_to_path

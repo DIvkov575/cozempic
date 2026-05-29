@@ -2,15 +2,122 @@
 
 from __future__ import annotations
 
+import argparse
 import io
+import json
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from cozempic.team import read_team_checkpoint
 from cozempic.init import COZEMPIC_HOOKS
+
+
+def _write_session_file(proj_dir: Path, session_id: str, content: str = "") -> Path:
+    """Helper: write a minimal JSONL session file into proj_dir."""
+    proj_dir.mkdir(parents=True, exist_ok=True)
+    p = proj_dir / f"{session_id}.jsonl"
+    p.write_text(
+        content or json.dumps({"role": "user", "content": "hi"}) + "\n",
+        encoding="utf-8",
+    )
+    return p
+
+
+# ---------------------------------------------------------------------------
+# TestCmdPostCompactCrossProjectIsolation — Bug C regression
+# ---------------------------------------------------------------------------
+
+class TestCmdPostCompactCrossProjectIsolation(unittest.TestCase):
+    """cmd_post_compact must NEVER inject another project's checkpoint."""
+
+    def _run_post_compact(self, cwd: str) -> str:
+        from cozempic.cli import cmd_post_compact
+        args = argparse.Namespace(cwd=cwd)
+        captured = io.StringIO()
+        old_stdout = sys.stdout
+        sys.stdout = captured
+        try:
+            cmd_post_compact(args)
+        finally:
+            sys.stdout = old_stdout
+        return captured.getvalue()
+
+    def test_does_not_return_other_projects_checkpoint_when_other_is_newer(self, tmp_path=None):
+        """Core bug: Strategy 4 picks a newer OTHER project's session → wrong checkpoint.
+
+        Fixture uses the CORRECT dir names (as Claude Code actually creates them, with dashes
+        for underscores). Old code computes broken slug with '_', so Strategy 3 misses project A
+        and Strategy 4 returns project B's (newer) session → contamination.
+        """
+        import tempfile
+        import re as _re
+        # Use explicit tmp_path if provided by pytest, otherwise create our own
+        if tmp_path is None:
+            tmp_path = Path(tempfile.mkdtemp())
+
+        # The CORRECT (fixed) slug formula — what Claude Code actually stores on disk
+        def _correct_slug(cwd: str) -> str:
+            return _re.sub(r"[^a-zA-Z0-9]", "-", cwd)
+
+        # Project A: topstep_automation — dir name uses dashes (Claude's real format)
+        cwd_a = "/Users/x/topstep_automation"
+        slug_a_correct = _correct_slug(cwd_a)   # "-Users-x-topstep-automation"
+        proj_a = tmp_path / "projects" / slug_a_correct
+        _write_session_file(proj_a, "aaaa1111-0000-0000-0000-000000000001")
+        # Write a checkpoint for project A
+        (proj_a / "team-checkpoint.md").write_text("TOPSTEP", encoding="utf-8")
+
+        # Small sleep ensures project B mtime is strictly newer
+        time.sleep(0.01)
+
+        # Project B: fanugugc (no underscore → still returned by Strategy 4 when A is missed)
+        cwd_b = "/Users/x/fanugugc"
+        slug_b_correct = _correct_slug(cwd_b)   # "-Users-x-fanugugc"
+        proj_b = tmp_path / "projects" / slug_b_correct
+        _write_session_file(proj_b, "bbbb2222-0000-0000-0000-000000000002")
+        # Give project B a team-checkpoint too (the one that must NOT appear)
+        (proj_b / "team-checkpoint.md").write_text("FANNU", encoding="utf-8")
+
+        with (
+            patch("cozempic.session.get_projects_dir", return_value=tmp_path / "projects"),
+            patch("cozempic.session._session_id_from_process", return_value=None),
+        ):
+            output = self._run_post_compact(cwd=cwd_a)
+
+        self.assertNotIn(
+            "FANNU", output,
+            "cmd_post_compact must NOT output fanugugc's checkpoint when cwd=topstep_automation. "
+            "Cross-project contamination detected."
+        )
+        # Output must be either the correct checkpoint or empty (strict→None→Path(cwd) fallback)
+        if output.strip():
+            self.assertIn(
+                "TOPSTEP", output,
+                "If cmd_post_compact outputs anything, it must be the current project's checkpoint."
+            )
+
+    def test_falls_back_safely_when_no_session_found(self):
+        """strict→None→Path(cwd) fallback must not crash and produce no output."""
+        import tempfile
+        tmp_path = Path(tempfile.mkdtemp())
+        # Empty projects dir — no sessions at all
+        (tmp_path / "projects").mkdir(parents=True, exist_ok=True)
+
+        cwd = str(tmp_path / "my_project")
+        Path(cwd).mkdir(exist_ok=True)
+        # No team-checkpoint.md in cwd
+
+        with (
+            patch("cozempic.session.get_projects_dir", return_value=tmp_path / "projects"),
+            patch("cozempic.session._session_id_from_process", return_value=None),
+        ):
+            output = self._run_post_compact(cwd=cwd)
+
+        self.assertEqual(output, "", "cmd_post_compact must be silent when no checkpoint exists.")
 
 
 class TestReadTeamCheckpoint(unittest.TestCase):

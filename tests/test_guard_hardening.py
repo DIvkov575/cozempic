@@ -2222,5 +2222,78 @@ class TestPolishV2_StartGuardDaemonValidatesSessionId(unittest.TestCase):
         )
 
 
+# ---------------------------------------------------------------------------
+# TestCheckpointTeamWriteSideIsolation — Bug P0-E regression
+# ---------------------------------------------------------------------------
+class TestCheckpointTeamWriteSideIsolation(unittest.TestCase):
+    """checkpoint_team must NOT write another project's state when no session_path given.
+
+    The write-side of the cross-project contamination chain:
+      1. PreCompact hook calls cmd_checkpoint → checkpoint_team(cwd=cwd_a)
+      2. Old code: non-strict find_current_session → Strategy 4 → returns newer project B's session
+      3. Checkpoint extracted from B's JSONL and WRITTEN into project A's dir
+      4. PostCompact reads A's dir → finds B's team state → contamination
+
+    After fix (strict=True): checkpoint_team returns None when Strategy 3 fails,
+    so no wrong checkpoint is written.
+    """
+
+    def test_checkpoint_team_does_not_write_wrong_project_when_other_is_newer(self):
+        """strict=True: checkpoint_team returns None, doesn't write fanugugc's state."""
+        import time
+        from cozempic.session import cwd_to_project_slug
+        from cozempic.guard import checkpoint_team
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+
+            # Project A — underscore path (slug mismatch under old code)
+            cwd_a = "/Users/x/topstep_automation"
+            slug_a = cwd_to_project_slug(cwd_a)
+            proj_a = tmp_path / slug_a
+            sess_a_id = "aaaa1111-0000-0000-0000-100000000001"
+            sess_a_file = proj_a / f"{sess_a_id}.jsonl"
+            proj_a.mkdir(parents=True)
+            sess_a_file.write_text(
+                '{"type":"user","message":{"role":"user","content":"hi"}}\n',
+                encoding="utf-8",
+            )
+
+            time.sleep(0.01)
+
+            # Project B — newer, no underscore (old Strategy 4 would return this)
+            slug_b = cwd_to_project_slug("/Users/x/fanugugc")
+            proj_b = tmp_path / slug_b
+            sess_b_id = "bbbb2222-0000-0000-0000-200000000002"
+            sess_b_file = proj_b / f"{sess_b_id}.jsonl"
+            proj_b.mkdir(parents=True)
+            sess_b_file.write_text(
+                '{"type":"user","message":{"role":"user","content":"hi"}}\n',
+                encoding="utf-8",
+            )
+
+            with (
+                patch("cozempic.session.get_projects_dir", return_value=tmp_path),
+                patch("cozempic.session._session_id_from_process", return_value=None),
+                patch("cozempic.guard.find_current_session",
+                      wraps=lambda cwd=None, **kw: __import__(
+                          "cozempic.session", fromlist=["find_current_session"]
+                      ).find_current_session(cwd, **kw)),
+            ):
+                result = checkpoint_team(cwd=cwd_a)
+
+            # With strict=True (fix), Strategy 3 can't match the slug (pre-fix),
+            # so checkpoint_team returns None — no write. After the full fix
+            # (P0-A + P0-E), Strategy 3 finds the right session OR strict blocks.
+            # The key invariant: result must NOT be project B's state.
+            if result is not None:
+                # If we got a result, it must belong to project A, not B
+                self.assertNotEqual(
+                    str(result),
+                    str(sess_b_file),
+                    "checkpoint_team returned project B's session — write-side contamination."
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

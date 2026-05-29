@@ -2841,3 +2841,83 @@ class TestDebugFlagTokens(unittest.TestCase):
             with patch.dict(os.environ, {}, clear=False):
                 os.environ.pop("COZEMPIC_DEBUG", None)
                 importlib.reload(_digest_module)
+
+
+# ---------------------------------------------------------------------------
+# TestGetMemdirUnderscoreProject — Bug C (P0-D) regression
+# ---------------------------------------------------------------------------
+
+def _correct_slug_for_test(cwd: str) -> str:
+    """The CORRECT slug formula (Claude's actual normalization). Used in test fixtures
+    to create dirs matching what Claude Code actually writes to disk, independent of
+    the (currently broken) cwd_to_project_slug implementation."""
+    import re as _re
+    return _re.sub(r"[^a-zA-Z0-9]", "-", cwd)
+
+
+class TestGetMemdirUnderscoreProject(unittest.TestCase):
+    """_get_memdir must route through cwd_to_project_slug and use exact-match.
+
+    Fixtures use the CORRECT slug (Claude's real normalization) to mirror what's
+    on disk. The old inline derivation in _get_memdir computes a broken slug with '_',
+    which won't match the correctly-named dir → returns None.
+    """
+
+    def test_get_memdir_resolves_underscore_project(self):
+        """_get_memdir must NOT return None for a project with '_' in path."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            cwd = "/Users/x/topstep_automation"
+            # Use CORRECT formula to create dir, as Claude Code actually does
+            slug = _correct_slug_for_test(cwd)    # "-Users-x-topstep-automation"
+            mem_dir = tmp_path / slug / "memory"
+            mem_dir.mkdir(parents=True)
+
+            with patch("cozempic.session.get_projects_dir", return_value=tmp_path):
+                result = _get_memdir(cwd)
+
+        self.assertIsNotNone(
+            result,
+            f"_get_memdir returned None for an underscore project (slug={slug!r}). "
+            "The inline slug derivation is still broken (keeps '_' → mismatch)."
+        )
+        self.assertEqual(result, mem_dir)
+
+    def test_get_memdir_no_prefix_collision(self):
+        """_get_memdir must resolve '-Users-x-foo', not '-Users-x-foobar'."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            cwd = "/Users/x/foo"
+            slug = _correct_slug_for_test(cwd)    # "-Users-x-foo"
+            mem_foo = tmp_path / slug / "memory"
+            mem_foobar = tmp_path / f"{slug}bar" / "memory"
+            mem_foo.mkdir(parents=True)
+            mem_foobar.mkdir(parents=True)
+
+            with patch("cozempic.session.get_projects_dir", return_value=tmp_path):
+                result = _get_memdir(cwd)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(
+            result, mem_foo,
+            f"Expected {mem_foo}, got {result}. Prefix collision: 'bar' suffix is leaking."
+        )
+
+    def test_get_memdir_dot_project(self):
+        """_get_memdir must handle paths containing '.' (produces double-dash slug)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            cwd = "/Users/x/.claude"
+            slug = _correct_slug_for_test(cwd)    # "-Users-x--claude"
+            mem_dir = tmp_path / slug / "memory"
+            mem_dir.mkdir(parents=True)
+
+            with patch("cozempic.session.get_projects_dir", return_value=tmp_path):
+                result = _get_memdir(cwd)
+
+        self.assertIsNotNone(
+            result,
+            f"_get_memdir returned None for a dot-path project (slug={slug!r}). "
+            "Slug with double-dash is not being matched."
+        )
+        self.assertEqual(result, mem_dir)
