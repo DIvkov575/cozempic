@@ -42,11 +42,16 @@ def _extract_text(msg: dict) -> str:
 
 def _clean_user_text(text: str) -> str:
     """Remove system tags, command noise, and whitespace from user text."""
-    # Strip NAMED system/command tags on the FULL text first so that an injection
-    # tag whose close-tag lies past the cap below is still removed (N-1).
+    # DoS guard: a pathological turn with thousands of literal <named-tag> opens
+    # makes the lazy `.*?` named-tag regexes below O(text_len x n_tags) — measured
+    # at >20s on the reload path for <system-reminder>x50000. Cap input to 32KB
+    # first. That is ~450x the ~72-char snippet the recap ever displays and 4x the
+    # 8000 generic-regex cap below, so a tag straddling the generic cap is still
+    # caught, no shown content is lost, and the worst case drops to ~0.15s.
+    text = text[:32768]
+    # Strip NAMED system/command tags on the (capped) full text first so that an
+    # injection tag whose close-tag lies past the 8000 cap below is still removed.
     # These regexes are anchored on literal tag names → linear on realistic input.
-    # LOW residual: a pathological <named-tag>×N flood would be O(n²) here too,
-    # but that is a perf-only concern (not an injection vector) and absurd in practice.
     text = re.sub(r"<system-reminder>.*?</system-reminder>", "", text, flags=re.DOTALL)
     text = re.sub(r"<local-command-caveat>.*?</local-command-caveat>", "", text, flags=re.DOTALL)
     text = re.sub(r"<command-name>.*?</command-name>", "", text, flags=re.DOTALL)
