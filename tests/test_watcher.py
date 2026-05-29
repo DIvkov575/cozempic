@@ -625,5 +625,117 @@ class TestJsonlWatcherImportIdiom(unittest.TestCase):
             os.unlink(path)
 
 
+# ---------------------------------------------------------------------------
+# Round-3 — OSError-robustness: any kqueue-path OSError must degrade to poll
+# ---------------------------------------------------------------------------
+
+@unittest.skipUnless(sys.platform == "darwin", "kqueue macOS only")
+class TestJsonlWatcherOSErrorRobustness(unittest.TestCase):
+    """kqueue path must fall back to poll on any OSError, not crash the daemon thread.
+
+    Three scenarios:
+    R1 — os.open raises PermissionError (subclass of OSError, not FileNotFoundError)
+    R2 — select.kqueue() raises OSError (EMFILE) → poll fallback, thread stays alive
+    R3 — kq.close() raises → os.close(fd) still runs (nested finally)
+    """
+
+    def test_permission_error_on_open_falls_back_to_poll(self):
+        """PermissionError on os.open must fall back to poll, not crash the thread.
+
+        Current code catches only FileNotFoundError; PermissionError propagates
+        uncaught → thread dies. Fix: catch OSError (parent of both).
+        """
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "watch.jsonl")
+            with open(path, "wb") as f:
+                f.write(b"x" * 100)
+
+            with patch("os.open", side_effect=PermissionError("EACCES simulated")):
+                w = _make_watcher(path, lambda p, s: None, use_kqueue=True)
+                t = _start_thread(w)
+                t.join(timeout=1.5)
+
+            # Thread must still be alive — fell back to poll loop
+            self.assertTrue(t.is_alive(),
+                "Watcher thread died on PermissionError from os.open. "
+                "R1 not fixed: only FileNotFoundError caught, not OSError.")
+            w.stop()
+            t.join(timeout=2)
+
+    def test_kqueue_oserror_falls_back_to_poll(self):
+        """OSError from select.kqueue() (e.g. EMFILE) must fall back to poll.
+
+        Current behaviour: OSError propagates out of the try/finally that closes fd,
+        then bubbles up through start() → thread dies. Fix: catch OSError around the
+        kqueue+control-loop block and fall back to poll.
+        """
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jsonl",
+                                          mode="wb") as f:
+            path = f.name
+            f.write(b"x" * 100)
+        try:
+            with patch("select.kqueue", side_effect=OSError("EMFILE simulated")):
+                w = _make_watcher(path, lambda p, s: None, use_kqueue=True)
+                t = _start_thread(w)
+                t.join(timeout=1.5)
+
+            # Thread must still be alive — fell back to poll loop
+            self.assertTrue(t.is_alive(),
+                "Watcher thread died on select.kqueue() OSError. "
+                "R2 not fixed: OSError not caught; no poll fallback after kqueue failure.")
+            w.stop()
+            t.join(timeout=2)
+        finally:
+            os.unlink(path)
+
+    def test_fd_closed_even_if_kq_close_raises(self):
+        """os.close(fd) must run even if kq.close() raises an exception.
+
+        Current finally block: kq.close() then os.close(fd) — if kq.close() raises,
+        os.close(fd) is skipped. Fix: nest them so os.close(fd) is unconditional.
+        """
+        import select as _sel
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jsonl",
+                                          mode="wb") as f:
+            path = f.name
+            f.write(b"x" * 100)
+        try:
+            fd_closed = threading.Event()
+            real_os_close = os.close
+
+            def spy_close(fd: int) -> None:
+                fd_closed.set()
+                real_os_close(fd)
+
+            real_kqueue_cls = _sel.kqueue
+
+            def spy_kqueue():
+                real_kq = real_kqueue_cls()
+                mock_kq = MagicMock()
+                mock_kq.control.side_effect = real_kq.control
+                # kq.close() raises — simulates a misbehaving kqueue object
+                def raising_close():
+                    real_kq.close()
+                    raise OSError("kq.close() failed")
+                mock_kq.close.side_effect = raising_close
+                return mock_kq
+
+            with patch("select.kqueue", side_effect=spy_kqueue), \
+                 patch("os.close", side_effect=spy_close):
+                w = _make_watcher(path, lambda p, s: None, use_kqueue=True)
+                t = _start_thread(w)
+                time.sleep(0.2)
+                w.stop()
+                t.join(timeout=2)
+
+            self.assertTrue(fd_closed.is_set(),
+                "os.close(fd) not called when kq.close() raised. "
+                "R3 not fixed: kq.close() must be in a nested try so os.close(fd) "
+                "always runs unconditionally.")
+        finally:
+            os.unlink(path)
+
+
 if __name__ == "__main__":
     unittest.main()
