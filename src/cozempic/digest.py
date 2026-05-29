@@ -894,17 +894,19 @@ def _get_memdir(cwd: str = "") -> Path | None:
     falling back to `~/.claude`. Prevents cross-profile leaks.
     """
     import os
-    from .session import get_projects_dir
+    from .session import cwd_to_project_slug, get_projects_dir
     if not cwd:
         cwd = os.getcwd()
     claude_dir = get_projects_dir()
     if not claude_dir.exists():
         return None
-    slug = cwd.lstrip("/").replace("/", "-")
-    project_dir = claude_dir / f"-{slug}"
+    # cwd_to_project_slug already includes the leading '-' (from the leading '/')
+    # so no f"-{slug}" prepend needed — avoids a double leading-dash regression.
+    slug = cwd_to_project_slug(cwd)
+    project_dir = claude_dir / slug
     if not project_dir.exists():
         for d in claude_dir.iterdir():
-            if d.is_dir() and slug in d.name:
+            if d.is_dir() and d.name == slug:
                 project_dir = d
                 break
         else:
