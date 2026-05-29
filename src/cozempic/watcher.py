@@ -57,19 +57,24 @@ class JsonlWatcher:
     def _watch_kqueue(self) -> None:
         """macOS kqueue watcher — 0.04ms wake latency, 0% CPU idle.
 
-        Falls back to poll if the watched inode is replaced (os.replace / atomic prune).
+        Falls back to poll on:
+        - OSError from os.open (file missing, permission denied, etc.)
+        - OSError from select.kqueue() or kq.control() (EMFILE, etc.)
+        - Inode replacement detected via KQ_NOTE_DELETE/RENAME (os.replace / atomic prune)
         """
         import select
 
         try:
             fd = os.open(self.filepath, os.O_RDONLY)
-        except FileNotFoundError:
-            # File not yet created — poll path handles OSError gracefully
+        except OSError:
+            # File not yet created, permission denied, or other OS error —
+            # poll path handles OSError in _get_size() gracefully
             self._watch_poll()
             return
-        # kq = None sentinel: if select.kqueue() raises (e.g. EMFILE), the finally
-        # block below must still close fd — deterministic, not GC-dependent.
+        # kq = None sentinel: ensures the finally block can guard kq.close()
+        # independently of whether kqueue() succeeded.
         kq = None
+        kqueue_error = False
         inode_replaced = False
         try:
             kq = select.kqueue()
@@ -101,11 +106,17 @@ class JsonlWatcher:
                             self._log_cb_error(exc)  # don't crash the watcher thread
                 if inode_replaced:
                     break
+        except OSError:
+            # kqueue setup or control() failed (e.g. EMFILE) — degrade to poll
+            kqueue_error = True
         finally:
-            if kq is not None:
-                kq.close()
-            os.close(fd)
-        if inode_replaced and self._running:
+            # Nested try ensures os.close(fd) always runs even if kq.close() raises
+            try:
+                if kq is not None:
+                    kq.close()
+            finally:
+                os.close(fd)
+        if (inode_replaced or kqueue_error) and self._running:
             self._watch_poll()
 
     def _watch_poll(self) -> None:
