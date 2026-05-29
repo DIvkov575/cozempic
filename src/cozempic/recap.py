@@ -74,7 +74,7 @@ def _truncate(text: str, max_len: int = 70) -> str:
     """Truncate text to max_len, adding ellipsis if needed."""
     if len(text) <= max_len:
         return text
-    if max_len <= 3:
+    if max_len < 3:
         return text[:max(max_len, 0)]
     return text[: max_len - 3] + "..."
 
@@ -149,11 +149,13 @@ def generate_recap(messages: list[Message], max_turns: int = 40) -> str:
 
     total_exchanges = len(all_user_turns)
 
-    # Limit topic analysis to the most-recent max_turns user turns
+    # Limit topic analysis to the most-recent max_turns user turns.
+    # Guard max_turns > 0: list[-0:] == list[0:] (full list), so zero must
+    # be treated as "show nothing" rather than "show everything".
     user_turns = (
         all_user_turns[-max_turns:]
-        if len(all_user_turns) > max_turns
-        else all_user_turns
+        if max_turns > 0 and len(all_user_turns) > max_turns
+        else (all_user_turns if max_turns > 0 else [])
     )
 
     # Deduplicate: keep unique user requests (by first 40 chars)
