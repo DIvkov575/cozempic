@@ -63,21 +63,53 @@ class TestStrictMode:
         assert result["session_id"] == session_id
 
     def test_strict_succeeds_on_cwd_slug_match(self, tmp_path):
-        """CWD slug match (Strategy 3) satisfies strict mode."""
-        cwd = "/Users/foo/myproject"
-        slug = cwd.replace("/", "-")
-        proj = tmp_path / "projects" / slug
-        session_id = "cccc3333-0000-0000-0000-000000000000"
-        _write_session(proj, session_id)
+        """CWD slug match (Strategy 3) satisfies strict mode — underscore and dot variants.
+
+        Uses cwd_to_project_slug() (imported, not hand-copied) so the test tracks
+        the canonical formula. Covers underscore and dot-path cwds, not just plain paths.
+        """
+        from cozempic.session import cwd_to_project_slug
+
+        # Underscore cwd (was the original bug trigger)
+        cwd_under = "/Users/foo/topstep_automation"
+        slug_under = cwd_to_project_slug(cwd_under)
+        proj_under = tmp_path / "projects" / slug_under
+        sess_under = "cccc3333-0000-0000-0000-000000000000"
+        _write_session(proj_under, sess_under)
 
         with (
             patch("cozempic.session.get_projects_dir", return_value=tmp_path / "projects"),
             patch("cozempic.session._session_id_from_process", return_value=None),
         ):
-            result = find_current_session(cwd=cwd, strict=True)
+            result = find_current_session(cwd=cwd_under, strict=True)
 
-        assert result is not None
-        assert result["session_id"] == session_id
+        assert result is not None, (
+            f"Strategy 3 did not find underscore-cwd project. "
+            f"slug={slug_under!r}, project dir={proj_under.name!r}"
+        )
+        assert result["session_id"] == sess_under
+
+    def test_strict_succeeds_on_dot_cwd_slug_match(self, tmp_path):
+        """Dot-path cwd (double-dash slug) is found by Strategy 3 in strict mode."""
+        from cozempic.session import cwd_to_project_slug
+
+        cwd_dot = "/Users/foo/.claude"
+        slug_dot = cwd_to_project_slug(cwd_dot)   # "-Users-foo--claude"
+        proj_dot = tmp_path / "projects" / slug_dot
+        sess_dot = "eeee5555-0000-0000-0000-000000000000"
+        _write_session(proj_dot, sess_dot)
+
+        with (
+            patch("cozempic.session.get_projects_dir", return_value=tmp_path / "projects"),
+            patch("cozempic.session._session_id_from_process", return_value=None),
+        ):
+            result = find_current_session(cwd=cwd_dot, strict=True)
+
+        assert result is not None, (
+            f"Strategy 3 did not find dot-path project. "
+            f"slug={slug_dot!r}, project dir={proj_dot.name!r}"
+        )
+        assert result["session_id"] == sess_dot
 
     def test_no_sessions_returns_none_regardless_of_strict(self, tmp_path):
         projects = tmp_path / "projects"
@@ -99,11 +131,21 @@ class TestStrategy3ExactMatch:
     """Strategy 3 must use exact-match on slug, not substring."""
 
     def test_underscore_project_found_after_slug_fix(self, tmp_path):
-        """After P0-A+P0-B: an underscore-path project is found by Strategy 3."""
+        """Strategy 3 must find an underscore-path project via its exact slug.
+
+        Fixture uses the LITERAL dir name '-Users-x-topstep-automation' (not derived
+        from cwd_to_project_slug) so the test is independent of the function under test.
+        strict=True disables Strategy 4 — if Strategy 3 misses, returns None (RED).
+
+        RED-at-base (815485d): broken slug '-Users-x-topstep_automation' (keeps '_')
+        ≠ literal dir '-Users-x-topstep-automation' → Strategy 3 finds 0 matches →
+        strict=True → None → assertIsNotNone FAILS.
+        """
         cwd = "/Users/x/topstep_automation"
-        from cozempic.session import cwd_to_project_slug
-        slug = cwd_to_project_slug(cwd)            # "-Users-x-topstep-automation"
-        proj = tmp_path / "projects" / slug
+        # Hardcoded literal — the dir name Claude Code actually creates on disk.
+        # NOT derived from cwd_to_project_slug() so this test is not tautological.
+        literal_dir = "-Users-x-topstep-automation"
+        proj = tmp_path / "projects" / literal_dir
         session_id = "dddd4444-0000-0000-0000-000000000000"
         _write_session(proj, session_id)
 
@@ -114,8 +156,9 @@ class TestStrategy3ExactMatch:
             result = find_current_session(cwd=cwd, strict=True)
 
         assert result is not None, (
-            "find_current_session must find the underscore-cwd project via Strategy 3. "
-            "If this fails, the slug is still wrong or Strategy 3 still uses substring."
+            "find_current_session(strict=True) returned None for underscore cwd. "
+            "The slug normalization is not replacing '_' with '-'. "
+            "Expected: computed slug '-Users-x-topstep-automation' matches literal dir."
         )
         assert result["session_id"] == session_id
 
