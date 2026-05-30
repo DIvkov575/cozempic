@@ -1109,8 +1109,8 @@ def _digest_session(args):
     if not session_arg or session_arg == "current":
         # Both absent and explicit "current" use cwd-based auto-detection,
         # consistent with how the rest of cli.py resolves the current session.
-        # Routing "current" through resolve_session() would use process-detection
-        # (find_current_session(strict=False)) which is a different strategy.
+        # Routing "current" through resolve_session() would invoke process-detection
+        # (a different strategy from slug-match) — not what we want here.
         # strict=True: digest flush/inject are write operations — injecting rules
         # into an unrelated session's JSONL is a context-contamination risk.
         sess = find_current_session(cwd, strict=True)

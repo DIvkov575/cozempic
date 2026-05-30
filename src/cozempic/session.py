@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -208,7 +209,6 @@ def cwd_to_project_slug(cwd: str | None = None) -> str:
       /Users/foo/topstep_automation -> -Users-foo-topstep-automation
       /Users/foo/.claude            -> -Users-foo--claude  (dot → dash, double-dash)
     """
-    import os, re
     if cwd is None:
         cwd = os.getcwd()
     return re.sub(r"[^a-zA-Z0-9]", "-", cwd)

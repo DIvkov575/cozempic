@@ -893,7 +893,6 @@ def _get_memdir(cwd: str = "") -> Path | None:
     `CLAUDE_CONFIG_DIR` (used by the `claudes` profile launcher) before
     falling back to `~/.claude`. Prevents cross-profile leaks.
     """
-    import os
     from .session import cwd_to_project_slug, get_projects_dir
     if not cwd:
         cwd = os.getcwd()
