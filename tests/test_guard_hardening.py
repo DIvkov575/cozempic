@@ -2252,12 +2252,9 @@ class TestDaemonStrictNoneIsBehaviorPreserving(unittest.TestCase):
            (confirming the CWD-hash path was taken, not the UUID path)
         3. No pid files exist after the call (no leak by construction)
         """
-        import hashlib
-        from unittest.mock import MagicMock, call
+        from unittest.mock import MagicMock
 
         cwd = "/Users/x/topstep_automation"
-        # Pre-compute the expected CWD-hash key used when session_id is empty
-        expected_pid_key = hashlib.md5(cwd.encode()).hexdigest()[:12]
 
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -2284,7 +2281,7 @@ class TestDaemonStrictNoneIsBehaviorPreserving(unittest.TestCase):
                 # `from .spawn_lock import DaemonAlreadyStarting, DaemonSpawnClaim`
                 # Patch it at the source module so the local import picks it up.
                 patch("cozempic.spawn_lock.DaemonSpawnClaim", MockClaimClass),
-                patch("subprocess.Popen", return_value=mock_proc),
+                patch("cozempic.guard.subprocess.Popen", return_value=mock_proc),
             ):
                 from cozempic.guard import start_guard_daemon
                 result = start_guard_daemon(cwd=cwd)
@@ -2311,17 +2308,13 @@ class TestDaemonStrictNoneIsBehaviorPreserving(unittest.TestCase):
                 f"expected cwd={cwd!r}. The UUID dedup path was taken instead of CWD-hash."
             )
 
-            # 3. The pid file in tmp_path uses the CWD-hash key (not a UUID).
-            #    The file name is cozempic_guard_<md5(cwd)[:12]>.pid.
-            import hashlib
-            expected_pid_key = hashlib.md5(cwd.encode()).hexdigest()[:12]
-            expected_pid_name = f"cozempic_guard_{expected_pid_key}.pid"
+            # 3. No UUID-keyed pid file in tmp — uuid-keyed files are named with a UUID
+            #    pattern (cozempic_guard_<uuid>.pid); their presence would indicate the
+            #    wrong-session dedup path ran instead of the CWD-hash path.
             all_pid_files = list(tmp_path.glob("*.pid"))
-            # No UUID-keyed pid file: uuid-keyed files are named with a UUID pattern
-            import re as _re
             uuid_pid_files = [
                 f for f in all_pid_files
-                if _re.search(r"[0-9a-f]{8}-[0-9a-f]{4}", f.name)
+                if re.search(r"[0-9a-f]{8}-[0-9a-f]{4}", f.name)
             ]
             self.assertEqual(
                 uuid_pid_files, [],
