@@ -124,6 +124,31 @@ class TestStrictMode:
             assert find_current_session(strict=True) is None
             assert find_current_session(strict=False) is None
 
+    def test_trailing_slash_cwd_resolves_project(self, tmp_path):
+        """cwd with trailing slash must find the project after normpath strips it.
+
+        Without normpath: slug('-Users-x-proj-') ≠ dir('-Users-x-proj') → None.
+        With normpath: '/Users/x/proj/' → '/Users/x/proj' → slug='-Users-x-proj' → found.
+
+        RED-at-base (815485d): no normpath → trailing dash mismatch → strict=True → None.
+        """
+        literal_dir = "-Users-x-proj"
+        proj = tmp_path / "projects" / literal_dir
+        session_id = "ffff6666-0000-0000-0000-000000000000"
+        _write_session(proj, session_id)
+
+        with (
+            patch("cozempic.session.get_projects_dir", return_value=tmp_path / "projects"),
+            patch("cozempic.session._session_id_from_process", return_value=None),
+        ):
+            result = find_current_session(cwd="/Users/x/proj/", strict=True)
+
+        assert result is not None, (
+            "find_current_session(cwd='/Users/x/proj/', strict=True) returned None. "
+            "normpath is not stripping the trailing slash before slug computation."
+        )
+        assert result["session_id"] == session_id
+
 
 # ---------------------------------------------------------------------------
 # TestStrategy3ExactMatch — Bug B: substring → exact-match in Strategy 3

@@ -211,6 +211,7 @@ def cwd_to_project_slug(cwd: str | None = None) -> str:
     """
     if cwd is None:
         cwd = os.getcwd()
+    cwd = os.path.normpath(cwd)
     return re.sub(r"[^a-zA-Z0-9]", "-", cwd)
 
 

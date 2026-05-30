@@ -71,12 +71,25 @@ class TestCwdToProjectSlug:
         result = cwd_to_project_slug("/Users/x/my-project")
         assert result == "-Users-x-my-project"
 
-    def test_trailing_slash_produces_trailing_dash(self):
-        """With NO rstrip, a trailing '/' becomes a trailing '-'."""
+    def test_trailing_slash_normalized(self):
+        """normpath strips trailing slash before regex — no trailing dash in output."""
         result = cwd_to_project_slug("/Users/x/myproject/")
-        # Lead decision: NO rstrip — trailing slash → trailing dash
-        assert result == "-Users-x-myproject-", (
-            f"Got {result!r}. Expected trailing '-' from trailing '/'."
+        assert result == "-Users-x-myproject", (
+            f"Got {result!r}. normpath should have stripped the trailing slash."
+        )
+
+    def test_dot_segment_normalized(self):
+        """`./` and embedded `.` segments are collapsed by normpath."""
+        result = cwd_to_project_slug("/Users/x/./p")
+        assert result == "-Users-x-p", (
+            f"Got {result!r}. normpath should collapse the dot segment."
+        )
+
+    def test_double_slash_normalized(self):
+        """Double slashes are collapsed by normpath."""
+        result = cwd_to_project_slug("/Users/x//p")
+        assert result == "-Users-x-p", (
+            f"Got {result!r}. normpath should collapse double slash."
         )
 
     def test_none_cwd_uses_os_getcwd(self):
