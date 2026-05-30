@@ -2425,19 +2425,21 @@ class TestCheckpointTeamWriteSideIsolation(unittest.TestCase):
             ):
                 result = checkpoint_team(cwd=cwd_a, quiet=True)
 
-        # Core invariant: only B's session is present; checkpoint_team called with
-        # cwd=A must return None (never use B's session).
-        self.assertIsNone(
-            result,
-            f"checkpoint_team(cwd=topstep_automation) returned {result!r} instead of None. "
-            "The cross-project session fallback is not being blocked. "
-            "At base: Strategy 4 returns B's session → empty TeamState returned (not None)."
-        )
-        # Belt-and-suspenders: B's checkpoint must be untouched
-        self.assertFalse(
-            b_cp.exists() and not b_cp_existed_before,
-            "Project B's team-checkpoint.md was created — write-side contamination."
-        )
+            # Core invariant: only B's session is present; checkpoint_team called with
+            # cwd=A must return None (never use B's session).
+            self.assertIsNone(
+                result,
+                f"checkpoint_team(cwd=topstep_automation) returned {result!r} instead of None. "
+                "The cross-project session fallback is not being blocked. "
+                "At base: Strategy 4 returns B's session → empty TeamState returned (not None)."
+            )
+            # Belt-and-suspenders: B's checkpoint must be untouched.
+            # Both assertions are inside the `with tempfile.TemporaryDirectory()` block
+            # so b_cp.exists() queries the live tmpdir (not a deleted one).
+            self.assertFalse(
+                b_cp.exists() and not b_cp_existed_before,
+                "Project B's team-checkpoint.md was created — write-side contamination."
+            )
 
     def test_checkpoint_team_writes_correct_project_state(self):
         """Positive write-side: checkpoint_team(cwd=A) must write A's state to A's dir.
