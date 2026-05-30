@@ -4,7 +4,7 @@ PortSystem          1.0
 PortGroup           python 1.0
 
 name                py-cozempic
-version             1.8.17
+version             1.8.18
 revision            0
 
 license             MIT
@@ -20,9 +20,9 @@ long_description    Cozempic prunes bloated Claude Code session JSONL files, \
 
 homepage            https://github.com/Ruya-AI/cozempic
 
-checksums           rmd160  a9e3a9db6bb194104ba5c2a9af2b337e86c9e3fa \
-                    sha256  9dd09b7f416e1ece7b92c04a7f61d255ec4b901ee15f54bed1b2d8dec307b2a4 \
-                    size    326618
+checksums           rmd160  6ec7b51d1365a4981dbedad3ec3460031ab8164b \
+                    sha256  da2c37cb85c1652b16af27f3593fc4890b1e8d878c2df0788da27dd195da1cb1 \
+                    size    359898
 
 python.versions     310 311 312 313
 python.default_version 312
