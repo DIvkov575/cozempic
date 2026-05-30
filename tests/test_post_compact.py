@@ -202,9 +202,14 @@ class TestReadTeamCheckpoint(unittest.TestCase):
             self.assertEqual(result, "# Project Team")
 
     def test_falls_back_to_none_when_dir_missing(self):
-        result = read_team_checkpoint(Path("/nonexistent/dir"))
-        # Should not raise, just return None (falls through to global check)
-        # Global checkpoint may or may not exist, but shouldn't crash
+        # include_global=False: prevents this test from accidentally passing by
+        # reading the developer's real ~/.claude/team-checkpoint.md when present.
+        result = read_team_checkpoint(Path("/nonexistent/dir"), include_global=False)
+        self.assertIsNone(
+            result,
+            "read_team_checkpoint must return None when project_dir doesn't exist "
+            "and include_global=False."
+        )
 
 
 class TestCmdPostCompact(unittest.TestCase):

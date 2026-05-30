@@ -415,3 +415,25 @@ class TestDigestSessionResolution:
         mock_rs.assert_not_called()
         assert path == Path("/y/curr.jsonl")
         assert session_id == "curr"
+
+    def test_no_session_arg_calls_find_current_with_strict_true(self):
+        """_digest_session calls find_current_session(cwd, strict=True) — not the
+        non-strict default.
+
+        digest flush/inject are write operations. Without strict=True, a user running
+        `cozempic digest flush` in a project whose Strategy-3 lookup fails would
+        silently inject rules into another project's session (Strategy-4 fallback).
+
+        Spy asserts keyword `strict=True` is passed; no behavior gap if omitted.
+        """
+        fake_sess = {"path": Path("/z/strict.jsonl"), "session_id": "strict-sess"}
+        with patch("cozempic.session.find_current_session", return_value=fake_sess) as mock_fc:
+            _digest_session(self._make_args(session=None))
+
+        mock_fc.assert_called_once()
+        _, kwargs = mock_fc.call_args
+        assert kwargs.get("strict") is True, (
+            f"find_current_session was called with strict={kwargs.get('strict')!r}, "
+            "expected strict=True. Without this, digest writes can cross-contaminate "
+            "when Strategy-3 fails and Strategy-4 picks a newer unrelated session."
+        )
