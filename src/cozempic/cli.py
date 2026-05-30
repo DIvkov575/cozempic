@@ -151,14 +151,25 @@ def print_prescription_result(pr: PrescriptionResult):
 
     if pr.original_tokens is not None and pr.final_tokens is not None:
         tok_saved = pr.original_tokens - pr.final_tokens
-        tok_pct = f"{tok_saved / pr.original_tokens * 100:.1f}%" if pr.original_tokens > 0 else "0%"
         from .tokens import DEFAULT_CONTEXT_WINDOW
         context_window = pr.context_window or DEFAULT_CONTEXT_WINDOW
         after_pct = round(pr.final_tokens / context_window * 100, 1)
         window_str = fmt_tokens(context_window)
         print(f"  Before   {fmt_tokens(pr.original_tokens):>8} tokens  {fmt_bytes(pr.original_total_bytes):>8}  {pr.original_message_count:,} messages")
         print(f"  After    {fmt_tokens(pr.final_tokens):>8} tokens  {fmt_bytes(pr.final_total_bytes):>8}  {pr.final_message_count:,} messages")
-        print(f"  Saved    {fmt_tokens(tok_saved):>8} tokens ({tok_pct})  {fmt_bytes(saved)} freed")
+        if tok_saved >= 0 and pr.original_tokens > 0:
+            tok_pct = f"{tok_saved / pr.original_tokens * 100:.1f}%"
+            print(f"  Saved    {fmt_tokens(tok_saved):>8} tokens ({tok_pct})  {fmt_bytes(saved)} freed")
+        else:
+            # Tokens appear to have GROWN despite a byte reduction. This is not a
+            # real increase: metadata-strip removes the `usage` frames the exact
+            # count anchors on, so the post-prune exact count re-anchors on an
+            # earlier turn with a different cache_read — making the token delta
+            # non-comparable (#105: "-401.6% freed"). Report the reliable byte
+            # savings and flag the token delta as unavailable rather than print a
+            # nonsensical negative/over-100% value.
+            byte_pct = fmt_pct(saved, pr.original_total_bytes)
+            print(f"  Saved    {fmt_bytes(saved):>8} ({byte_pct})  — exact token delta n/a (usage metadata pruned; count re-anchored)")
         print(f"  Context  {fmt_context_bar(after_pct)} of {window_str}")
     else:
         byte_pct = fmt_pct(saved, pr.original_total_bytes)
@@ -1186,7 +1197,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="cozempic",
         description="Context weight-loss tool for Claude Code — prune bloated JSONL conversation files",
     )
-    parser.add_argument("--version", action="version", version="%(prog)s 1.8.17")
+    parser.add_argument("--version", action="version", version="%(prog)s 1.8.18")
     parser.add_argument("--context-window", type=int, default=None, help="Override context window size in tokens (e.g. 1000000 for 1M beta)")
     parser.add_argument("--system-overhead-tokens", type=int, default=None, help="Override system overhead estimate (default: 21000). Increase for heavy rules/MCP configs.")
     sub = parser.add_subparsers(dest="command")

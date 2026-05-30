@@ -234,11 +234,50 @@ class TestOverflowDetection(unittest.TestCase):
             ):
                 recovery.recover()
 
+            # write_pruned is the #106 deferred writer (None here: the mocked
+            # guard_prune_cycle returns no _deferred_writer).
             mock_reload.assert_called_once_with(
                 7777, self.tmpdir,
                 session_id="test-explicit-pid",
                 session_path=self.session_path,
+                write_pruned=None,
             )
+        finally:
+            breaker.reset()
+
+    def test_recovery_negative_token_delta_reports_mb_only(self):
+        """#105: when the post-prune exact count re-anchors after metadata-strip
+        (final > original), the overflow path must NOT print
+        'Pruned -648.7K tokens freed' — it falls back to the MB-only line."""
+        import io
+        from contextlib import redirect_stderr
+
+        breaker = CircuitBreaker(session_id="test-neg-delta", max_recoveries=3)
+        breaker.reset()
+        try:
+            self._write_lines([json.dumps({"type": "user", "message": "hello"})])
+            recovery = OverflowRecovery(
+                self.session_path, "test-neg-delta", self.tmpdir, breaker,
+                danger_threshold_mb=100.0, claude_pid=7777,
+            )
+            buf = io.StringIO()
+            with (
+                patch.object(recovery, "detect_overflow", return_value=True),
+                patch("cozempic.guard.guard_prune_cycle", return_value={
+                    "saved_mb": 5.95,
+                    "original_tokens": 161500,
+                    "final_tokens": 810200,   # re-anchored: final > original (#105)
+                }),
+                patch("cozempic.guard._terminate_and_resume"),
+                patch("cozempic.session.find_claude_pid", return_value=None),
+                redirect_stderr(buf),
+            ):
+                recovery.recover()
+            out = buf.getvalue()
+            self.assertNotIn("tokens freed", out)            # no token clause
+            self.assertNotRegex(out, r"-[\d.]+K? tokens")    # no negative token figure
+            self.assertIn("saved", out)                       # MB-only fallback present
+            self.assertIn("MB", out)
         finally:
             breaker.reset()
 

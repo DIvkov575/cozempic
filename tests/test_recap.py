@@ -362,6 +362,39 @@ class TestCleanUserTextInputCap(unittest.TestCase):
             elapsed, 0.5, f"_clean_user_text took {elapsed:.3f}s (limit 500ms)"
         )
 
+    def test_named_tag_flood_complete_under_500ms(self) -> None:
+        """A flood of literal <system-reminder> opens must not block reload.
+
+        The named-tag regexes run before the 8000 generic cap (to catch a tag
+        whose close straddles that cap); without the 32KB input cap, a lazy
+        `.*?` over tens of thousands of unmatched opens is O(text_len x n_tags)
+        and took >20s. The cap must bound this to well under the reload budget.
+        """
+        import time
+        from cozempic.recap import _clean_user_text
+
+        t0 = time.perf_counter()
+        result = _clean_user_text("<system-reminder>" * 50000)
+        elapsed = time.perf_counter() - t0
+        self.assertLess(
+            elapsed, 0.5, f"_clean_user_text took {elapsed:.3f}s (limit 500ms)"
+        )
+        # Correctness preserved: no <system-reminder> survives into the recap.
+        self.assertNotIn("system-reminder", result)
+
+    def test_named_tag_straddling_generic_cap_still_stripped(self) -> None:
+        """A <system-reminder> whose close lies past the 8000 generic cap (but
+        within the 32KB input cap) is still fully removed — the reason the named
+        regexes run pre-generic-cap. Guards against the input cap being lowered
+        below the generic cap."""
+        from cozempic.recap import _clean_user_text
+
+        payload = "<system-reminder>" + ("x" * 9000) + "</system-reminder>safe"
+        result = _clean_user_text(payload)
+        self.assertNotIn("system-reminder", result)
+        self.assertNotIn("x" * 50, result)
+        self.assertIn("safe", result)
+
 
 # ---------------------------------------------------------------------------
 # M-1 extension — _truncate with negative max_len

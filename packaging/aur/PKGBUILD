@@ -1,6 +1,6 @@
 # Maintainer: Ruya <j@junaidq.com>
 pkgname=cozempic
-pkgver=1.8.17
+pkgver=1.8.18
 pkgrel=1
 pkgdesc="Context cleaning CLI for Claude Code — prune bloat, protect agent teams from compaction"
 arch=('any')
@@ -9,7 +9,7 @@ license=('MIT')
 depends=('python>=3.10')
 makedepends=('python-build' 'python-installer' 'python-setuptools' 'python-wheel')
 source=("https://files.pythonhosted.org/packages/source/c/cozempic/cozempic-${pkgver}.tar.gz")
-sha256sums=('9dd09b7f416e1ece7b92c04a7f61d255ec4b901ee15f54bed1b2d8dec307b2a4')
+sha256sums=('da2c37cb85c1652b16af27f3593fc4890b1e8d878c2df0788da27dd195da1cb1')
 
 build() {
   cd "${srcdir}/${pkgname}-${pkgver}"

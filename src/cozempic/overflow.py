@@ -219,7 +219,18 @@ class OverflowRecovery:
             session_id=self.session_id,
         )
 
-        after_mb = self.session_path.stat().st_size / 1024 / 1024
+        # #106: guard_prune_cycle no longer writes the live file inline — it
+        # returns a deferred writer that is invoked only AFTER Claude is
+        # terminated below (so the os.replace never swaps an inode under a live
+        # fd). Use the PROJECTED post-prune size for the pre-flight; the on-disk
+        # file is still the full pre-prune file until the deferred write fires.
+        deferred_writer = result.get("_deferred_writer")
+        final_bytes = result.get("_final_bytes")
+        if final_bytes is not None:
+            after_mb = final_bytes / 1024 / 1024
+        else:
+            # Futile / no-change prune (nothing to write) — file is unchanged.
+            after_mb = self.session_path.stat().st_size / 1024 / 1024
 
         # 4. Pre-flight: if still dangerously large, don't resume
         if after_mb * 1024 * 1024 > self.danger_threshold_bytes * 0.95:
@@ -236,8 +247,11 @@ class OverflowRecovery:
         self.breaker.record_recovery(rx, before_mb, after_mb)
         orig_tok = result.get("original_tokens")
         final_tok = result.get("final_tokens")
-        if orig_tok and final_tok:
-            saved_tok = orig_tok - final_tok
+        saved_tok = (orig_tok - final_tok) if (orig_tok and final_tok) else -1
+        # saved_tok < 0 means the exact count re-anchored after metadata-strip
+        # (#105) — the token delta is not meaningful, so fall through to the
+        # MB-only line below rather than print "Pruned -648.7K tokens freed".
+        if orig_tok and final_tok and saved_tok >= 0:
             tok_str = f"{saved_tok / 1000:.1f}K" if saved_tok >= 1000 else str(saved_tok)
             print(
                 f"  [{now}] Pruned {tok_str} tokens freed "
@@ -266,16 +280,30 @@ class OverflowRecovery:
                     # mtime fallback works (happy-path symmetry with
                     # guard_prune_cycle). The bare-liveness gate in
                     # _terminate_and_resume still prevents resurrection.
+                    # #106: write_pruned persists the prune AFTER Claude is dead.
                     _terminate_and_resume(
                         claude_pid, self.cwd,
                         session_id=self.session_id,
                         session_path=self.session_path,
+                        write_pruned=deferred_writer,
                     )
-                    print(
-                        f"  [{now}] Kill + resume triggered (PID {claude_pid}). "
-                        f"~10s downtime.",
-                        file=sys.stderr,
-                    )
+                    write_holder = result.get("_write_holder") or {}
+                    if write_holder.get("written") or deferred_writer is None:
+                        print(
+                            f"  [{now}] Kill + resume triggered (PID {claude_pid}). "
+                            f"~10s downtime.",
+                            file=sys.stderr,
+                        )
+                    else:
+                        # #106: the deferred write was skipped (Claude survived the
+                        # kill, or an append-conflict) — the live file was left
+                        # intact, so the resumed Claude reloads the FULL file. The
+                        # circuit breaker bounds repeated no-op recoveries.
+                        print(
+                            f"  [{now}] Kill triggered (PID {claude_pid}) but prune was "
+                            f"not persisted — resuming from the full file.",
+                            file=sys.stderr,
+                        )
             except ReloadLockHeld as exc:
                 print(
                     f"  [{now}] Reload deferred — another pipeline in flight "
