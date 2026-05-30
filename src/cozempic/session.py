@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -201,13 +202,17 @@ def find_sessions(project_filter: str | None = None) -> list[dict]:
 def cwd_to_project_slug(cwd: str | None = None) -> str:
     """Convert a working directory path to the Claude project slug format.
 
-    Claude stores projects under ~/.claude/projects/ using the path with
-    slashes replaced by dashes, e.g. /Users/foo/myproject -> -Users-foo-myproject
+    Claude stores projects under ~/.claude/projects/ replacing every
+    non-alphanumeric character with a single '-' (1:1, no run collapsing).
+
+    Examples:
+      /Users/foo/topstep_automation -> -Users-foo-topstep-automation
+      /Users/foo/.claude            -> -Users-foo--claude  (dot → dash, double-dash)
     """
-    import os
     if cwd is None:
         cwd = os.getcwd()
-    return cwd.replace("/", "-")
+    cwd = os.path.normpath(cwd)
+    return re.sub(r"[^a-zA-Z0-9]", "-", cwd)
 
 
 def project_slug_to_path(slug: str) -> str:
@@ -329,9 +334,11 @@ def find_current_session(
         if matched:
             return matched
 
-    # Strategy 3: CWD slug match
+    # Strategy 3: CWD slug match — exact, not substring.
+    # Substring caused prefix collisions: '-Users-x-foo' IN '-Users-x-foobar'.
+    # Worktrees get their own project dir so exact-match is always correct.
     slug = cwd_to_project_slug(cwd)
-    matching = [s for s in sessions if slug in s["project"]]
+    matching = [s for s in sessions if s["project"] == slug]
     if matching:
         return max(matching, key=lambda s: s["mtime"])
 

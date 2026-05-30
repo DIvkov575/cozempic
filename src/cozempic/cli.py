@@ -757,11 +757,17 @@ def cmd_post_compact(args):
 
     cwd = args.cwd or os.getcwd()
 
-    # Try to find project dir from current session
-    sess = find_current_session(cwd)
+    # Resolve the project dir for this session.
+    # strict=True: refuse Strategy 4 (global most-recent fallback) — wrong-project
+    # sessions produce wrong-project checkpoints.
+    # On None: Path(cwd) points to the local project dir (project-correct; may have
+    # no checkpoint file → read_team_checkpoint returns None → silent, which is safe).
+    sess = find_current_session(cwd, strict=True)
     project_dir = Path(sess["path"]).parent if sess else Path(cwd)
 
-    content = read_team_checkpoint(project_dir)
+    # include_global=False: the global ~/.claude/team-checkpoint.md is a cross-project
+    # read vector — it holds the last-written checkpoint regardless of project.
+    content = read_team_checkpoint(project_dir, include_global=False)
     if content:
         print(content)
 
@@ -1114,9 +1120,11 @@ def _digest_session(args):
     if not session_arg or session_arg == "current":
         # Both absent and explicit "current" use cwd-based auto-detection,
         # consistent with how the rest of cli.py resolves the current session.
-        # Routing "current" through resolve_session() would use process-detection
-        # (find_current_session(strict=False)) which is a different strategy.
-        sess = find_current_session(cwd)
+        # Routing "current" through resolve_session() would invoke process-detection
+        # (a different strategy from slug-match) — not what we want here.
+        # strict=True: digest flush/inject are write operations — injecting rules
+        # into an unrelated session's JSONL is a context-contamination risk.
+        sess = find_current_session(cwd, strict=True)
         if not sess:
             # Changed to stderr: consistent with resolve_session error output
             # and all other error paths in cli.py.
