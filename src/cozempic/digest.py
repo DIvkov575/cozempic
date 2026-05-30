@@ -155,6 +155,13 @@ _SYSTEM_NOISE_MARKERS = (
     "Please analyze this codebase",  # /init prompt
     "[Cozempic Guard:",  # cozempic self-restoration meta banner
     "This session is being continued from a previous conversation",  # CC compaction-resume banner
+    # Skill-injection bodies (#109): when a skill loads, the harness injects its
+    # SKILL.md into the transcript prefixed with this header. It is NOT a user
+    # utterance — without this, skill bodies were captured as EXPLICIT_CORRECTION
+    # rules (e.g. "Do not base directory for this skill: ~/.claude/skills/...").
+    "Base directory for this skill:",
+    "The following skills are available for use",  # SessionStart skills listing
+    "The following deferred tools are now available",  # deferred-tool reminder
 )
 
 

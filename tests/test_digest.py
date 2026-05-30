@@ -536,6 +536,38 @@ class TestSystemNoiseFilter(unittest.TestCase):
         is_noise = _import_system_noise()
         self.assertTrue(is_noise("<bash-stderr>No such file</bash-stderr>"))
 
+    # ---- #109: skill-injection / system boilerplate must not become rules ----
+
+    def test_skill_injection_body_is_noise(self):
+        """#109: a loaded skill's SKILL.md body (prefixed by the harness with
+        'Base directory for this skill:') is not a user correction."""
+        is_noise = _import_system_noise()
+        self.assertTrue(is_noise(
+            "Base directory for this skill: ~/.claude/skills/create-handoff\n\n"
+            "# Create Handoff\nCreate a concise handoff document that compacts "
+            "session context into a resumable summary..."
+        ))
+        self.assertTrue(is_noise(
+            "Base directory for this skill: ~/.claude/skills/resume-handoff\n"
+            "# Resume work from a handoff document"
+        ))
+
+    def test_skills_listing_is_noise(self):
+        """#109: the SessionStart 'available skills' listing is framework text."""
+        is_noise = _import_system_noise()
+        self.assertTrue(is_noise(
+            "The following skills are available for use with the Skill tool:\n"
+            "- cozempic: Diagnose and prune bloated Claude Code context."
+        ))
+
+    def test_genuine_corrections_are_not_noise(self):
+        """#109 guard against over-filtering: real user corrections must still
+        be eligible for extraction."""
+        is_noise = _import_system_noise()
+        self.assertFalse(is_noise("no, do not use bullet points — I always want prose"))
+        self.assertFalse(is_noise("use Edit not Write for existing files"))
+        self.assertFalse(is_noise("actually, run the tests before committing"))
+
     def test_leading_tag_is_noise(self):
         is_noise = _import_system_noise()
         # A user turn whose content STARTS with an angle-bracket tag is
