@@ -559,8 +559,8 @@ class TestPolishPR93_HookSchemaV9(unittest.TestCase):
     def test_hook_schema_version_v9(self):
         from cozempic.init import HOOK_SCHEMA_VERSION
         self.assertIn(
-            HOOK_SCHEMA_VERSION, ("v9", "v10"),
-            "HOOK_SCHEMA_VERSION must be v9 or higher (PR #93 head -1 change, PR #94 Phase B bump)",
+            HOOK_SCHEMA_VERSION, ("v9", "v10", "v11"),
+            "HOOK_SCHEMA_VERSION must be v9 or higher (PR #93 head -1 change, PR #94 Phase B bump, #109 NO_AUTO_INIT)",
         )
 
     def test_hooks_json_uses_head_minus_1(self):
@@ -599,13 +599,13 @@ class TestPolishPR93_HookSchemaV9(unittest.TestCase):
             with self.subTest(path=hooks_rel):
                 body = hooks_path.read_text()
                 self.assertTrue(
-                    "cozempic-hook-schema=v9" in body or "cozempic-hook-schema=v10" in body,
-                    f"{hooks_rel}: schema marker must be v9 or v10",
+                    "cozempic-hook-schema=v9" in body or "cozempic-hook-schema=v10" in body or "cozempic-hook-schema=v11" in body,
+                    f"{hooks_rel}: schema marker must be v9 or higher",
                 )
                 self.assertNotIn(
                     "cozempic-hook-schema=v8",
                     body,
-                    f"{hooks_rel}: v8 marker must be migrated to v9/v10",
+                    f"{hooks_rel}: v8 marker must be migrated to v9+",
                 )
 
 
