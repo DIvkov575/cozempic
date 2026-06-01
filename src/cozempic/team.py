@@ -214,6 +214,85 @@ class TeamState:
         return "\n".join(parts)
 
 
+def _count_by_status(items: list[object]) -> dict[str, int]:
+    """Return stable status counts for receipt/debug output."""
+    counts: dict[str, int] = {}
+    for item in items:
+        status = (getattr(item, "status", "unknown") or "unknown").strip().lower()
+        counts[status] = counts.get(status, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def build_team_recovery_receipt(state: TeamState) -> dict:
+    """Build a privacy-safe receipt for post-compact team recovery.
+
+    The receipt is intentionally count/flag based: it proves what recovery
+    state was available without copying team names, task subjects, prompts,
+    cwd values, result summaries, or raw session text into a shareable artifact.
+    """
+    active_tasks, completed_tasks, blank_tasks = state._task_groups()
+    running_subagents = [s for s in state.subagents if (s.status or "").lower() == "running"]
+    active_teammates = [t for t in state.teammates if (t.status or "").lower() not in {"done", "completed"}]
+
+    gaps: list[str] = []
+    if state.is_empty():
+        gaps.append("no_team_state")
+    if not state.config_source:
+        gaps.append("missing_config_source")
+    if state.last_coordination_index < 0:
+        gaps.append("missing_last_coordination_cursor")
+    if not state.tasks:
+        gaps.append("no_task_assignment_table")
+
+    # Cozempic can currently identify the last coordination line, but it does
+    # not yet expose a per-teammate event/message cursor. Marking active teams
+    # as partial until that exists prevents a phantom-team recovery from being
+    # presented as complete.
+    event_cursors_recorded = False
+    has_active_work = bool(active_tasks or running_subagents or active_teammates)
+    if has_active_work and not event_cursors_recorded:
+        gaps.append("per_teammate_event_cursors_not_recorded")
+
+    if state.is_empty():
+        verdict = "unsafe-to-resume"
+    elif has_active_work and not event_cursors_recorded:
+        verdict = "partial"
+    elif gaps:
+        verdict = "partial"
+    else:
+        verdict = "complete"
+
+    return {
+        "event": "team.recovery.receipt.v1",
+        "recovery_verdict": verdict,
+        "source": {
+            "config_source": state.config_source or "unknown",
+            "team_identity_present": bool(state.team_name or state.lead_agent_id or state.lead_session_id),
+            "last_coordination_cursor_present": state.last_coordination_index >= 0,
+            "per_teammate_event_cursors_recorded": event_cursors_recorded,
+        },
+        "counts": {
+            "team_messages": state.message_count,
+            "teammates_total": len(state.teammates),
+            "teammates_by_status": _count_by_status(state.teammates),
+            "subagents_total": len(state.subagents),
+            "subagents_by_status": _count_by_status(state.subagents),
+            "tasks_active": len(active_tasks),
+            "tasks_completed": completed_tasks,
+            "tasks_blank": blank_tasks,
+            "tasks_by_status": _count_by_status(state.tasks),
+        },
+        "privacy": {
+            "raw_team_name_recorded": False,
+            "raw_agent_ids_recorded": False,
+            "raw_task_subjects_recorded": False,
+            "raw_prompts_or_results_recorded": False,
+            "raw_paths_recorded": False,
+        },
+        "audit_gaps": gaps,
+    }
+
+
 # ─── Patterns for team message detection ─────────────────────────────────────
 
 # Tool names that indicate team/agent coordination
