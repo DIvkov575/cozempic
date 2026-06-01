@@ -35,5 +35,33 @@ class TestHooksSync(unittest.TestCase):
         )
 
 
+    def test_all_hooks_export_no_auto_init(self):
+        """Every hook command must set COZEMPIC_NO_AUTO_INIT=1."""
+        canonical = json.loads(DATA_HOOKS.read_text(encoding="utf-8"))
+        for event, entries in canonical.get("hooks", {}).items():
+            for entry in entries:
+                for h in entry.get("hooks", []):
+                    cmd = h.get("command", "")
+                    self.assertIn(
+                        "COZEMPIC_NO_AUTO_INIT=1",
+                        cmd,
+                        msg=f"Hook {event}[{entry.get('matcher', '')}] missing COZEMPIC_NO_AUTO_INIT=1",
+                    )
+
+    def test_schema_marker_is_current(self):
+        """Every hook command must have the current schema marker."""
+        from cozempic.init import HOOK_SCHEMA_MARKER
+        canonical = json.loads(DATA_HOOKS.read_text(encoding="utf-8"))
+        for event, entries in canonical.get("hooks", {}).items():
+            for entry in entries:
+                for h in entry.get("hooks", []):
+                    cmd = h.get("command", "")
+                    self.assertIn(
+                        HOOK_SCHEMA_MARKER,
+                        cmd,
+                        msg=f"Hook {event}[{entry.get('matcher', '')}] has stale schema marker",
+                    )
+
+
 if __name__ == "__main__":
     unittest.main()
