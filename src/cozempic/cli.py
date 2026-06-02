@@ -1677,8 +1677,9 @@ def _maybe_auto_init(argv: list[str]) -> None:
         # Warn if redundant local hooks are also present.
         if _project_is_cozempic_current(claude_dir):
             print(
-                "  Cozempic: local hooks redundant (global hooks active). "
-                "Remove with `cozempic init --uninstall` in this project.",
+                "  Cozempic: local hooks redundant (global hooks active) — "
+                "they are harmless but can be removed from this project's "
+                ".claude/settings.json.",
                 file=sys.stderr,
             )
         return
