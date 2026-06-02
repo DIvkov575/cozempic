@@ -157,6 +157,12 @@ class TestTeamRecoveryReceipt(unittest.TestCase):
         self.assertIn("no_team_state", receipt["audit_gaps"])
         self.assertFalse(receipt["privacy"]["raw_task_subjects_recorded"])
 
+    def test_none_state_is_unsafe_to_resume(self):
+        # bug reports / guard logs may pass a missing state — must not crash (#110 nit)
+        receipt = build_team_recovery_receipt(None)
+        self.assertEqual(receipt["recovery_verdict"], "unsafe-to-resume")
+        self.assertIn("no_team_state", receipt["audit_gaps"])
+
     def test_active_team_without_event_cursors_is_partial(self):
         state = TeamState(
             team_name="Private GTM Team",

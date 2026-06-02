@@ -230,6 +230,12 @@ def build_team_recovery_receipt(state: TeamState) -> dict:
     state was available without copying team names, task subjects, prompts,
     cwd values, result summaries, or raw session text into a shareable artifact.
     """
+    # The intended consumers (bug reports, guard logs) are exactly the contexts
+    # where team state may be missing, so a None state must yield an
+    # unsafe-to-resume receipt rather than crash. An empty TeamState routes
+    # through the is_empty() path below to that verdict.
+    if state is None:
+        state = TeamState()
     active_tasks, completed_tasks, blank_tasks = state._task_groups()
     running_subagents = [s for s in state.subagents if (s.status or "").lower() == "running"]
     active_teammates = [t for t in state.teammates if (t.status or "").lower() not in {"done", "completed"}]
