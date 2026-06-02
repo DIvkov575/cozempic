@@ -6,10 +6,13 @@ import json
 import unittest
 
 from cozempic.team import (
+    SubagentInfo,
     TaskInfo,
+    TeammateInfo,
     TeamState,
     _is_team_message,
     _is_task_tool_result,
+    build_team_recovery_receipt,
     extract_team_state,
     inject_team_recovery,
     merge_config_into_state,
@@ -142,6 +145,58 @@ class TestMergeConfigStrongJoin(unittest.TestCase):
         state = self._state(team_name="Existing")
         result = merge_config_into_state(state, [])
         self.assertEqual(result.team_name, "Existing")
+
+
+class TestTeamRecoveryReceipt(unittest.TestCase):
+
+    def test_empty_state_is_unsafe_to_resume(self):
+        receipt = build_team_recovery_receipt(TeamState())
+
+        self.assertEqual(receipt["event"], "team.recovery.receipt.v1")
+        self.assertEqual(receipt["recovery_verdict"], "unsafe-to-resume")
+        self.assertIn("no_team_state", receipt["audit_gaps"])
+        self.assertFalse(receipt["privacy"]["raw_task_subjects_recorded"])
+
+    def test_active_team_without_event_cursors_is_partial(self):
+        state = TeamState(
+            team_name="Private GTM Team",
+            config_source="both",
+            message_count=7,
+            last_coordination_index=42,
+            teammates=[TeammateInfo("agent-secret-1", "private-name", status="running")],
+            subagents=[SubagentInfo("subagent-secret-2", "private desc", status="running")],
+            tasks=[TaskInfo("task-secret-3", "private task subject", "in_progress", owner="private-owner")],
+        )
+
+        receipt = build_team_recovery_receipt(state)
+
+        self.assertEqual(receipt["recovery_verdict"], "partial")
+        self.assertEqual(receipt["counts"]["teammates_total"], 1)
+        self.assertEqual(receipt["counts"]["subagents_by_status"], {"running": 1})
+        self.assertEqual(receipt["counts"]["tasks_active"], 1)
+        self.assertIn("per_teammate_event_cursors_not_recorded", receipt["audit_gaps"])
+
+        rendered = json.dumps(receipt)
+        self.assertNotIn("Private GTM Team", rendered)
+        self.assertNotIn("agent-secret-1", rendered)
+        self.assertNotIn("private task subject", rendered)
+        self.assertNotIn("private-owner", rendered)
+
+    def test_completed_team_state_can_be_complete(self):
+        state = TeamState(
+            team_name="Done Team",
+            config_source="both",
+            message_count=4,
+            last_coordination_index=10,
+            teammates=[TeammateInfo("agent-1", "builder", status="done")],
+            tasks=[TaskInfo("task-1", "finished", "completed")],
+        )
+
+        receipt = build_team_recovery_receipt(state)
+
+        self.assertEqual(receipt["recovery_verdict"], "complete")
+        self.assertEqual(receipt["counts"]["tasks_completed"], 1)
+        self.assertEqual(receipt["audit_gaps"], [])
 
 
 class TestTeamRecoveryRendering(unittest.TestCase):
