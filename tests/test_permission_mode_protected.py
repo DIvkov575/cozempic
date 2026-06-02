@@ -40,12 +40,20 @@ class TestPermissionModeInMetaTypes:
         # This test checks module-level behaviour — if _META_TYPES is made module-
         # level (acceptable refactor), the assertion below also verifies it.
         src = gentle.strategy_compact_summary_collapse.__code__.co_consts
-        # All string constants baked into the function's code object
-        all_strings = {c for c in src if isinstance(c, str)}
-        assert "permission-mode" in all_strings, (
-            "'permission-mode' is not referenced inside strategy_compact_summary_collapse. "
-            "The strategy is unaware of permission-mode and will drop it during "
-            "compact-summary-collapse."
+        # The local _META_TYPES set is stored as a frozenset in co_consts by CPython.
+        # Individual strings in the set are NOT listed separately; they live inside
+        # the frozenset literal. Check the frozenset directly.
+        meta_types_sets = [c for c in src if isinstance(c, frozenset)]
+        assert meta_types_sets, (
+            "No frozenset found in strategy_compact_summary_collapse code constants. "
+            "The _META_TYPES set definition may have changed form."
+        )
+        # At least one frozenset in the function should contain 'permission-mode'
+        found = any("permission-mode" in fs for fs in meta_types_sets)
+        assert found, (
+            f"'permission-mode' is not in the _META_TYPES frozenset inside "
+            f"strategy_compact_summary_collapse (found frozensets: {meta_types_sets}). "
+            "Add 'permission-mode' to _META_TYPES — losing it silently breaks resume."
         )
 
 
