@@ -532,44 +532,14 @@ class TestTagLeakInvariant:
 
 
 # ── Class 9: PruneValidationError in guard_prune_cycle abort path ─────────────
-
-class TestPruneValidationErrorAbortPath:
-    def test_guard_aborts_on_validation_failure_no_write(self, tmp_path):
-        """guard_prune_cycle must return _no_change if PruneValidationError fires."""
-        import json
-        from unittest.mock import patch, MagicMock
-        from cozempic.safety import PruneValidationError
-
-        # Build a minimal session file
-        session_path = tmp_path / "test_session.jsonl"
-        msgs = [
-            {"type": "user", "uuid": "u-001", "parentUuid": None,
-             "message": {"content": "hi", "role": "user"}},
-            {"type": "assistant", "uuid": "a-001", "parentUuid": "u-001",
-             "message": {"content": "hello", "role": "assistant"}},
-        ]
-        session_path.write_text("\n".join(json.dumps(m) for m in msgs) + "\n")
-
-        from cozempic.guard import guard_prune_cycle
-
-        # Patch run_prescription to raise PruneValidationError
-        def _raising_run_prescription(*args, **kwargs):
-            raise PruneValidationError(
-                "test validation failure",
-                {"failed_check": "C3", "surviving_user_count": 0, "surviving_assistant_count": 0}
-            )
-
-        with patch("cozempic.executor.run_prescription", side_effect=_raising_run_prescription):
-            result = guard_prune_cycle(
-                session_path=session_path,
-                rx_name="standard",
-                config={},
-            )
-
-        # Must return a _no_change-like dict (saved_mb=0, reloading=False)
-        assert result.get("saved_mb", 0) == 0.0
-        assert result.get("reloading", False) is False
-        # The file must be unchanged
-        content_after = session_path.read_text()
-        expected = "\n".join(json.dumps(m) for m in msgs) + "\n"
-        assert content_after == expected, "File was modified despite PruneValidationError abort"
+# Rewritten (H-1): see test_prune_safety_r2.py::TestGuardAbortContractRewritten
+# for the correct abort-contract tests that patch cozempic.guard.prune_with_team_protect
+# (the symbol guard.py actually calls) and assert all 3 invariants:
+#   (a) result has validation_error + evidence keys
+#   (b) file is byte-identical before and after
+#   (c) _terminate_and_resume was NOT called
+#
+# The old test here patched cozempic.executor.run_prescription, which guard.py
+# had already imported via `from .executor import run_prescription` (line 138).
+# The patch never fired; the test was GREEN via the saved_bytes<=0 early-return
+# path, NOT the abort branch — it proved nothing about the abort contract.
