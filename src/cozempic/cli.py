@@ -1652,7 +1652,8 @@ def _maybe_auto_init(argv: list[str]) -> None:
       1. COZEMPIC_NO_AUTO_INIT=1 in env (also set by --no-auto-init via _prescan_argv)
       2. cwd has no .claude/ directory (not a Claude project)
       3. Subcommand is in _AUTO_INIT_SKIP_CMDS or no subcommand was given
-      4. Cozempic hooks are already wired in this project's settings
+      4. Global hooks are current in ~/.claude/settings.json (local would be redundant)
+      5. Cozempic hooks are already wired in this project's settings
 
     Otherwise: runs init silently and prints a single one-line notice to stderr.
     Failures are non-fatal — the user's original command still runs.
@@ -1666,6 +1667,20 @@ def _maybe_auto_init(argv: list[str]) -> None:
 
     cmd = next((tok for tok in argv if tok in _SUBCOMMANDS), None)
     if cmd is None or cmd in _AUTO_INIT_SKIP_CMDS:
+        return
+
+    # Skip local init when global hooks are already current (avoids double-firing).
+    # Guard: if cwd IS the home dir, home_claude == claude_dir -- fall through
+    # to the normal local check instead.
+    home_claude = Path.home() / ".claude"
+    if home_claude != claude_dir and _project_is_cozempic_current(home_claude):
+        # Warn if redundant local hooks are also present.
+        if _project_is_cozempic_current(claude_dir):
+            print(
+                "  Cozempic: local hooks redundant (global hooks active). "
+                "Remove with `cozempic init --uninstall` in this project.",
+                file=sys.stderr,
+            )
         return
 
     if _project_is_cozempic_current(claude_dir):

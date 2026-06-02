@@ -227,11 +227,12 @@ class TestSessionStartHookSkipsSpawnDuringSentinel(unittest.TestCase):
     def test_session_start_hook_skips_spawn_during_reload(self):
         """Hook must skip guard --daemon when sentinel is present (v10 behavior)."""
         cmd = self._load_session_start_command()
-        # Sentinel check requires v10 hook schema — if not present, this RED is expected
+        # Sentinel check requires v10+ hook schema — if not present, this RED is expected
+        from cozempic.init import HOOK_SCHEMA_MARKER
         self.assertIn(
-            "v10",
+            HOOK_SCHEMA_MARKER,
             cmd,
-            "Hook schema is not v10 — sentinel check not yet in hooks.json. "
+            "Hook schema marker not current — sentinel check not yet in hooks.json. "
             "This test RED until Phase B adds sentinel skip to hooks.json.",
         )
         hook_data = json.dumps({"session_id": self.sid, "transcript_path": ""})

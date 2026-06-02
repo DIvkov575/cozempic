@@ -328,11 +328,12 @@ class TestSessionStartHookSurfacesPriorStatus(unittest.TestCase):
         """Hook prints failure reason and removes status file."""
         import json as _json
         cmd = self._load_session_start_command()
-        # Status file surface requires v10 hook schema
+        # Status file surface requires v10+ hook schema
+        from cozempic.init import HOOK_SCHEMA_MARKER
         self.assertIn(
-            "v10",
+            HOOK_SCHEMA_MARKER,
             cmd,
-            "Hook schema is not v10 — status file surfacing not yet in hooks.json. "
+            "Hook schema marker not current — status file surfacing not yet in hooks.json. "
             "Expected RED until Phase B adds status surface to hooks.json.",
         )
         hook_data = _json.dumps({"session_id": self.sid, "transcript_path": ""})
