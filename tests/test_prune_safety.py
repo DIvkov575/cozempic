@@ -445,6 +445,80 @@ class TestFloorConfig:
         result = _clamp_float("nan", 0.0, 1.0, 0.50)
         assert result == pytest.approx(0.50)
 
+    # ── R3-1: preserve_first_message JSON-config path must use _parse_bool ─────
+    # The pre-fix code used `bool(floor_data["preserve_first_message"])` on the
+    # file path. `bool("false")` and `bool("0")` return True — opposite of the
+    # env path which uses `_parse_bool`. String values from JSON config were
+    # silently ignored (always True).
+
+    def test_file_config_string_false_is_false(self, monkeypatch):
+        """RED (assertion-RED pre-fix): file config preserve_first_message='false' → False.
+
+        Pre-fix: bool('false') → True (WRONG). Post-fix: _parse_bool('false') → False.
+        This test FAILS pre-fix (asserts False, gets True) and PASSES post-fix.
+        Env var cleared so the file path is exercised.
+        """
+        from cozempic import config as cfg_mod
+
+        monkeypatch.delenv("COZEMPIC_FLOOR_PRESERVE_FIRST", raising=False)
+        result = cfg_mod._resolve_floor_with({"floor": {"preserve_first_message": "false"}})
+        assert result.preserve_first_message is False, (
+            "string 'false' in JSON config must parse to False; "
+            "pre-fix bool('false') returns True"
+        )
+
+    def test_file_config_string_zero_is_false(self, monkeypatch):
+        """File config preserve_first_message='0' → False (same bug, different token)."""
+        from cozempic import config as cfg_mod
+
+        monkeypatch.delenv("COZEMPIC_FLOOR_PRESERVE_FIRST", raising=False)
+        result = cfg_mod._resolve_floor_with({"floor": {"preserve_first_message": "0"}})
+        assert result.preserve_first_message is False
+
+    def test_file_config_string_no_is_false(self, monkeypatch):
+        """File config preserve_first_message='no' → False."""
+        from cozempic import config as cfg_mod
+
+        monkeypatch.delenv("COZEMPIC_FLOOR_PRESERVE_FIRST", raising=False)
+        result = cfg_mod._resolve_floor_with({"floor": {"preserve_first_message": "no"}})
+        assert result.preserve_first_message is False
+
+    def test_file_config_native_bool_false_is_false(self, monkeypatch):
+        """Native JSON bool false (parsed by json.load as Python False) → False.
+
+        This already worked pre-fix (bool(False) → False), but must keep working
+        post-fix as a regression guard.
+        """
+        from cozempic import config as cfg_mod
+
+        monkeypatch.delenv("COZEMPIC_FLOOR_PRESERVE_FIRST", raising=False)
+        result = cfg_mod._resolve_floor_with({"floor": {"preserve_first_message": False}})
+        assert result.preserve_first_message is False
+
+    def test_file_config_string_true_is_true(self, monkeypatch):
+        """File config preserve_first_message='true' → True."""
+        from cozempic import config as cfg_mod
+
+        monkeypatch.delenv("COZEMPIC_FLOOR_PRESERVE_FIRST", raising=False)
+        result = cfg_mod._resolve_floor_with({"floor": {"preserve_first_message": "true"}})
+        assert result.preserve_first_message is True
+
+    def test_file_config_string_one_is_true(self, monkeypatch):
+        """File config preserve_first_message='1' → True."""
+        from cozempic import config as cfg_mod
+
+        monkeypatch.delenv("COZEMPIC_FLOOR_PRESERVE_FIRST", raising=False)
+        result = cfg_mod._resolve_floor_with({"floor": {"preserve_first_message": "1"}})
+        assert result.preserve_first_message is True
+
+    def test_file_config_native_bool_true_is_true(self, monkeypatch):
+        """Native JSON bool true → True (regression guard)."""
+        from cozempic import config as cfg_mod
+
+        monkeypatch.delenv("COZEMPIC_FLOOR_PRESERVE_FIRST", raising=False)
+        result = cfg_mod._resolve_floor_with({"floor": {"preserve_first_message": True}})
+        assert result.preserve_first_message is True
+
 
 # ── Class 8: R-2 — team-tag and singleton-tag strip invariant ────────────────
 
