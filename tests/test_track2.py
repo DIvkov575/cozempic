@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import unittest
 
+from cozempic.config import FloorConfig
 from cozempic.helpers import msg_bytes
 from cozempic.registry import STRATEGIES, PRESCRIPTIONS
 from cozempic.executor import run_prescription
@@ -306,7 +307,12 @@ class TestRegistryPrescriptions(unittest.TestCase):
 class TestPrescriptionIntegration(unittest.TestCase):
 
     def test_gentle_with_boundary(self):
-        """Full gentle prescription on a session with compact boundary."""
+        """Full gentle prescription on a session with compact boundary.
+
+        Uses FloorConfig.disabled() to isolate compact-summary-collapse behavior
+        from the floor preservation layer (introduced by P0-C). The floor is tested
+        separately in test_prune_safety.py::TestEnforceFloor.
+        """
         messages = [
             make_user(0, "old"),
             make_assistant(1, "old resp"),
@@ -316,7 +322,10 @@ class TestPrescriptionIntegration(unittest.TestCase):
             make_user(5, "new"),
             make_assistant(6, "new resp"),
         ]
-        result_msgs, results = run_prescription(messages, PRESCRIPTIONS["gentle"], {})
+        result_msgs, results = run_prescription(
+            messages, PRESCRIPTIONS["gentle"], {},
+            floor_config=FloorConfig.disabled(),
+        )
         # Pre-boundary messages (0, 1) + attribution (2) should be removed
         result_indices = {idx for idx, _, _ in result_msgs}
         self.assertNotIn(0, result_indices)
@@ -333,7 +342,10 @@ class TestPrescriptionIntegration(unittest.TestCase):
             make_attribution_snapshot(1),
             make_assistant(2),
         ]
-        result_msgs, results = run_prescription(messages, PRESCRIPTIONS["gentle"], {})
+        result_msgs, results = run_prescription(
+            messages, PRESCRIPTIONS["gentle"], {},
+            floor_config=FloorConfig.disabled(),
+        )
         result_indices = {idx for idx, _, _ in result_msgs}
         # Attribution snapshot should be removed
         self.assertNotIn(1, result_indices)

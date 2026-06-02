@@ -13,6 +13,7 @@ from .diagnosis import diagnose_session
 from .doctor import run_doctor
 from .executor import execute_actions, run_prescription
 from .guard import checkpoint_team, start_guard, start_guard_daemon
+from .safety import PruneValidationError
 from .init import run_init
 from .recap import save_recap
 from .registry import PRESCRIPTIONS, STRATEGIES
@@ -252,7 +253,15 @@ def cmd_current(args):
 
         print("  Estimated Savings by Prescription:")
         for rx_name, strategy_names in PRESCRIPTIONS.items():
-            new_msgs, _ = run_prescription(messages, strategy_names, {})
+            try:
+                new_msgs, _ = run_prescription(messages, strategy_names, {})
+            except PruneValidationError as ve:
+                # Dry-run estimation: a structural validation failure means the
+                # session is already malformed or the strategy would make it
+                # unreplayable. Report the check that failed — do not crash.
+                check = ve.evidence.get("failed_check", "?")
+                print(f"    {rx_name:<15} would be invalid ({check}): {ve.reason}")
+                continue
             final_bytes = sum(b for _, _, b in new_msgs)
             total_saved = diag["total_bytes"] - final_bytes
             pct = fmt_pct(total_saved, diag["total_bytes"])
@@ -268,7 +277,13 @@ def cmd_diagnose(args):
 
     print("  Estimated Savings by Prescription:")
     for rx_name, strategy_names in PRESCRIPTIONS.items():
-        new_msgs, _ = run_prescription(messages, strategy_names, {})
+        try:
+            new_msgs, _ = run_prescription(messages, strategy_names, {})
+        except PruneValidationError as ve:
+            # Dry-run estimation: report structural failure instead of crashing.
+            check = ve.evidence.get("failed_check", "?")
+            print(f"    {rx_name:<15} would be invalid ({check}): {ve.reason}")
+            continue
         final_bytes = sum(b for _, _, b in new_msgs)
         total_saved = diag["total_bytes"] - final_bytes
         pct = fmt_pct(total_saved, diag["total_bytes"])
@@ -301,7 +316,20 @@ def cmd_treat(args):
     pre_te = estimate_session_tokens(messages)
     pre_ratio = calibrate_ratio(messages)
 
-    new_messages, strategy_results = run_prescription(messages, strategy_names, config)
+    try:
+        new_messages, strategy_results = run_prescription(messages, strategy_names, config)
+    except PruneValidationError as ve:
+        check = ve.evidence.get("failed_check", "?")
+        print(
+            f"  Prune validation failed ({check}): {ve.reason}",
+            file=sys.stderr,
+        )
+        print(
+            "  Session file was not modified. Fix the structural issue or choose a different prescription.",
+            file=sys.stderr,
+        )
+        sys.exit(5)
+
     final_bytes = sum(b for _, _, b in new_messages)
     final_count = len(new_messages)
 
@@ -580,7 +608,20 @@ def cmd_reload(args):
         pre_te = estimate_session_tokens(messages)
         pre_ratio = calibrate_ratio(messages)
 
-        new_messages, strategy_results = run_prescription(messages, strategy_names, config)
+        try:
+            new_messages, strategy_results = run_prescription(messages, strategy_names, config)
+        except PruneValidationError as ve:
+            check = ve.evidence.get("failed_check", "?")
+            print(
+                f"  Prune validation failed ({check}): {ve.reason}",
+                file=sys.stderr,
+            )
+            print(
+                "  Session file was not modified. Fix the structural issue or choose a different prescription.",
+                file=sys.stderr,
+            )
+            sys.exit(5)
+
         final_bytes = sum(b for _, _, b in new_messages)
         final_count = len(new_messages)
 
