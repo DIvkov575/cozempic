@@ -28,6 +28,12 @@ import threading
 import time
 from pathlib import Path
 
+# P0-B: imported at module level so guard_prune_cycle can catch the exception
+# without an inner try/except that masks import errors during testing.
+# safety.py is a new module (this PR); the import is always available once
+# the package is installed from this version onwards.
+from .safety import PruneValidationError
+
 # ── HARD-threshold back-off + exit constants ────────────────────────────────
 # When ``guard_prune_cycle`` keeps returning saved_bytes == 0 at the HARD
 # threshold (because the live conversation is dominated by immutable tool-
@@ -969,10 +975,28 @@ def guard_prune_cycle(
             pre_te = estimate_session_tokens(messages)
             pre_ratio = calibrate_ratio(messages)
 
-            # Prune with team protection
-            pruned_messages, results, team_state = prune_with_team_protect(
-                messages, rx_name=rx_name, config=config,
-            )
+            # Prune with team protection.
+            # P0-B: catch PruneValidationError from run_prescription inside
+            # prune_with_team_protect. On validation failure: log the failure,
+            # return _no_change immediately. The deferred writer (_write_pruned_after_exit)
+            # is NOT set (it is defined later in this function), so the file stays
+            # untouched and Claude is NOT terminated.
+            try:
+                pruned_messages, results, team_state = prune_with_team_protect(
+                    messages, rx_name=rx_name, config=config,
+                )
+            except PruneValidationError as ve:
+                check = ve.evidence.get("failed_check", "?")
+                print(
+                    f"  [{_now()}] Prune validation failed ({check}): {ve.reason} "
+                    f"— aborting prune, session file unchanged.",
+                    file=sys.stderr,
+                )
+                return {
+                    **_no_change,
+                    "validation_error": ve.reason,
+                    "evidence": ve.evidence,
+                }
 
             # #106 — never rewrite a live session that Claude holds open.
             # The no-reload tiers (SOFT 25%, agents-active HARD) reach here with
