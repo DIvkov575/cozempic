@@ -207,6 +207,61 @@ class TestSnapshotAndAppend:
         with pytest.raises(PruneConflictError):
             save_messages(jsonl, messages, create_backup=False, snapshot=snap)
 
+    def test_held_open_replace_defers_as_conflict(self, tmp_path, monkeypatch):
+        """#112: on Windows os.replace onto a held-open transcript raises
+        PermissionError [WinError 5]. save_messages must treat this as a
+        deferred prune (PruneConflictError), not a hard crash, and leave the
+        original file intact with no orphaned .tmp."""
+        jsonl = tmp_path / "sess.jsonl"
+        original_text = "\n".join(
+            json.dumps({"message": {"role": "user", "content": f"original {i}"}}) for i in range(3)
+        ) + "\n"
+        jsonl.write_text(original_text, encoding="utf-8")
+        messages = load_messages(jsonl)
+
+        import os as _os
+        real_replace = _os.replace
+
+        def denied(src, dst, *a, **k):
+            # only the final transcript replace is denied; tmp scaffolding is allowed
+            if str(dst) == str(jsonl):
+                raise PermissionError("[WinError 5] Access is denied")
+            return real_replace(src, dst, *a, **k)
+
+        monkeypatch.setattr(_os, "replace", denied)
+
+        with pytest.raises(PruneConflictError):
+            save_messages(jsonl, messages, create_backup=False)
+
+        # original intact, no orphan tmp
+        assert jsonl.read_text(encoding="utf-8") == original_text
+        assert not jsonl.with_suffix(".tmp").exists()
+
+    def test_held_open_replace_cleans_backup(self, tmp_path, monkeypatch):
+        """#112: when the deferred-prune path fires with create_backup=True,
+        the just-created .bak must be cleaned up so deferred cycles don't
+        accumulate orphan backups."""
+        jsonl = tmp_path / "sess.jsonl"
+        jsonl.write_text(
+            json.dumps({"message": {"role": "user", "content": "x"}}) + "\n", encoding="utf-8"
+        )
+        messages = load_messages(jsonl)
+
+        import os as _os
+        real_replace = _os.replace
+
+        def denied(src, dst, *a, **k):
+            if str(dst) == str(jsonl):
+                raise PermissionError("[WinError 5] Access is denied")
+            return real_replace(src, dst, *a, **k)
+
+        monkeypatch.setattr(_os, "replace", denied)
+
+        with pytest.raises(PruneConflictError):
+            save_messages(jsonl, messages, create_backup=True)
+
+        assert list(jsonl.parent.glob("*.bak")) == [], "deferred prune must not leave an orphan backup"
+
 
 class TestPruneLock:
     def test_lock_acquired_and_released(self, tmp_path):

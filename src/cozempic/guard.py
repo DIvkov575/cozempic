@@ -2208,7 +2208,12 @@ def start_guard_daemon(
                         pass
                 finally:
                     os.close(_tmp_fd)
-                os.rename(str(tmp_path), str(pid_path))
+                # os.replace (not os.rename): on Windows os.rename raises
+                # FileExistsError [WinError 183] when pid_path already exists
+                # (a stale .pid from an abruptly-terminated guard is the
+                # documented leftover state — see doctor.py). os.replace
+                # overwrites atomically on both POSIX and Windows. (#113)
+                os.replace(str(tmp_path), str(pid_path))
                 # Fsync the parent directory so the rename itself is
                 # durable across abrupt power loss (DA round 1 M1).
                 # Without this, the rename is in the kernel's metadata

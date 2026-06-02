@@ -736,7 +736,21 @@ def save_messages(
             backup_path = path.with_suffix(f".{ts}.jsonl.bak")
             shutil.copy2(path, backup_path)
 
-        os.replace(tmp_path, path)
+        try:
+            os.replace(tmp_path, path)
+        except PermissionError as exc:
+            # Windows (#112): Claude Code holds the live transcript open
+            # without FILE_SHARE_DELETE, so os.replace onto it raises
+            # PermissionError [WinError 5]. This is not a hard failure —
+            # defer the prune to the next cycle, exactly like an
+            # incomplete-append conflict. Clean up the tmp file and the
+            # just-created backup so a deferred cycle leaves no orphans.
+            tmp_path.unlink(missing_ok=True)
+            if backup_path is not None:
+                backup_path.unlink(missing_ok=True)
+            raise PruneConflictError(
+                f"Session file is held open by another process — deferring prune: {path}"
+            ) from exc
     except Exception:
         tmp_path.unlink(missing_ok=True)
         raise
