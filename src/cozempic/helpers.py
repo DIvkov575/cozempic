@@ -280,6 +280,13 @@ _PROTECTED_TYPES = frozenset({
     "task-summary",
 })
 
+# P0-D — last-of-type metadata singleton tag.
+# Defined here (not in executor) so is_protected() can check it without
+# importing from executor.py, which would create a circular dependency.
+# executor.py imports this constant to apply the tag; strategies call
+# is_protected() which reads it. The string value is the sole source of truth.
+_METADATA_SINGLETON_KEY: str = "__cozempic_metadata_singleton__"
+
 
 def is_protected(msg: dict) -> bool:
     """Return True if this entry must NEVER be removed or structurally modified."""
@@ -295,6 +302,10 @@ def is_protected(msg: dict) -> bool:
     if msg.get("__cozempic_behavioral_digest__"):
         return True
     if msg.get("__cozempic_team_protected__"):
+        return True
+    # P0-D: last-of-type metadata singleton — executor tags the last occurrence
+    # of each protected type before strategies run; strip happens after.
+    if msg.get(_METADATA_SINGLETON_KEY):
         return True
     return False
 
