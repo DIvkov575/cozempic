@@ -521,6 +521,178 @@ def start_guard(
     # defer-window (mirrors deferred_exit_announced pattern).
     _futile_skip_announced = False
 
+    def _account_hard_prune(result, agents_active, state):
+        # Post-prune circuit-breaker accounting shared by the HARD1 (55%) and
+        # HARD2 (80%) tiers. Increments the empty-prune counter, emits the
+        # GAP-D futile diagnostic, decides the K-exit-vs-defer, and applies the
+        # exponential back-off sleep. Extracted verbatim from the HARD1 block so
+        # HARD2 gets the same breaker (previously it had none → infinite
+        # kill→no-write→resume loop on a sustained deferred-conflict).
+        nonlocal consecutive_empty_hard_prunes, deferred_exit_announced, _futile_skip_announced
+
+        if result.get("live_write_skipped") and not result.get("prune_deferred_conflict"):
+            # #106 read-only deferral (agents active at 55%): we
+            # intentionally did not prune the live file. This is neither a
+            # successful prune nor a futile one — leave the futile-loop
+            # circuit breaker untouched so a long agent run doesn't trip
+            # the K-exit or emit the misleading "guard is powerless"
+            # diagnostic. HARD2 (80%) still force-reloads if needed.
+            pass
+        elif (result.get("saved_mb", 0) <= 0
+              or result.get("futile_reload_skipped")
+              or result.get("prune_deferred_conflict")):
+            consecutive_empty_hard_prunes += 1
+
+            # GAP-D: emit one-shot diagnostic when reload was skipped
+            # as futile (prune saved too few bytes to justify a reload
+            # that would immediately re-trigger HARD).
+            if result.get("futile_reload_skipped") and not _futile_skip_announced:
+                would_free_mb = result.get("would_free_mb", result.get("saved_mb", 0))
+                orig_bytes = result.get("original_bytes", 0)
+                saved_pct = (would_free_mb * 1024 * 1024 / orig_bytes * 100
+                             if orig_bytes > 0 else 0)
+                checkpoint_ref = (
+                    f" Checkpoint: {result['checkpoint_path']}"
+                    if result.get("checkpoint_path") else ""
+                )
+                print(
+                    f"  [{_now()}] Hard prune would free only {would_free_mb:.3f}MB "
+                    f"(~{saved_pct:.0f}%) — below {int(_MIN_PRUNE_RATIO * 100)}% "
+                    f"threshold. Reload skipped (live file left intact): resumed Claude would re-trigger "
+                    f"HARD immediately. Likely cause: subagent transcripts or large "
+                    f"tool-results dominate context. Recommend: /clear (loses subagent "
+                    f"state) or fresh session with restored team "
+                    f"checkpoint.{checkpoint_ref}",
+                    flush=True,
+                )
+                _futile_skip_announced = True
+
+            # Exit path: the daemon is powerless against this context
+            # (live tool-result blocks dominate; HARD prune cannot free
+            # bytes; reload+0-byte = the cascade that crashed sessions
+            # in production). Exit gracefully and let the SessionStart
+            # hook respawn on next activity. Do NOT change reload-trigger
+            # gating in guard_prune_cycle — that's not the right escape.
+            #
+            # PR #93 item #4: defer the exit when `agents_active=True`.
+            # Killing the daemon mid-task destroys subagent protection
+            # AND the diagnostic recommends `/clear` (which also
+            # destroys subagent state). Hard cap at
+            # HARD_LOOP_HARD_EXIT_THRESHOLD (default 50, override via
+            # COZEMPIC_GUARD_HARD_EXIT_K) ensures eventual exit so a
+            # stuck `extract_team_state` (BUG-G15 family) can't wedge
+            # the daemon forever.
+            if consecutive_empty_hard_prunes >= HARD_LOOP_EXIT_THRESHOLD:
+                if (
+                    agents_active
+                    and consecutive_empty_hard_prunes < HARD_LOOP_HARD_EXIT_THRESHOLD
+                ):
+                    # Defer: stay alive, keep cycling at backoff cap.
+                    if not deferred_exit_announced:
+                        running_count = sum(
+                            1 for s in state.subagents
+                            if s.status in ("running", "unknown")
+                        )
+                        worst_case_min = (
+                            HARD_LOOP_HARD_EXIT_THRESHOLD
+                            * HARD_LOOP_BACKOFF_CAP_SECONDS
+                            // 60
+                        )
+                        print(
+                            f"  [{_now()}] K={consecutive_empty_hard_prunes} "
+                            f"reached normal exit threshold "
+                            f"({HARD_LOOP_EXIT_THRESHOLD}) but "
+                            f"{running_count} subagent(s) still active. "
+                            f"Deferring daemon exit until agents quiesce "
+                            f"or K reaches hard cap "
+                            f"({HARD_LOOP_HARD_EXIT_THRESHOLD}, "
+                            f"~{worst_case_min} min worst case).",
+                            flush=True,
+                        )
+                        deferred_exit_announced = True
+                    # Fall through to the back-off sleep below.
+                    # We do NOT sys.exit while agents are working.
+                else:
+                    # Either no agents (original K=10 exit) OR hard
+                    # cap reached even with agents (circuit breaker).
+                    try:
+                        checkpoint_team(session_path=session_path, quiet=True)
+                    except Exception:
+                        # Checkpoint failure must not prevent exit —
+                        # final checkpoint is best-effort here; the
+                        # SOFT loop above has been writing checkpoints
+                        # every cycle for the entire run, so on-disk
+                        # state is already current.
+                        pass
+                    if (
+                        agents_active
+                        and consecutive_empty_hard_prunes >= HARD_LOOP_HARD_EXIT_THRESHOLD
+                    ):
+                        # Hard cap fired with agents still active —
+                        # different diagnostic. Do NOT tell the
+                        # operator to `/clear` (that destroys
+                        # subagent state too).
+                        print(
+                            f"  [{_now()}] Guard hard-cap exit "
+                            f"(K={consecutive_empty_hard_prunes} >= "
+                            f"{HARD_LOOP_HARD_EXIT_THRESHOLD}). "
+                            f"Subagents are still active; their state "
+                            f"may be lost on the next compaction. "
+                            f"Consider letting current subagents "
+                            f"finish then starting a fresh session.",
+                            flush=True,
+                        )
+                    else:
+                        # Original K=10 exit (no agents — operator
+                        # can safely `/clear`).
+                        print(
+                            f"  [{_now()}] Guard powerless against live-context "
+                            f"dominance ({HARD_LOOP_EXIT_THRESHOLD} consecutive "
+                            f"0-byte HARD prunes). Exiting — NO further guard "
+                            f"protection in this session. SessionStart fires only "
+                            f"on startup/resume/clear, NOT on tool calls or "
+                            f"message turns, so the daemon will NOT auto-respawn "
+                            f"while the session continues. To re-enable cozempic: "
+                            f"type /clear or restart the session. Recommended: "
+                            f"split work across fresh sessions to avoid >55% "
+                            f"context dominance by immutable tool-result blocks.",
+                            flush=True,
+                        )
+                    # _safe_unlink_session_pidfile is called via the
+                    # finally block (PR #93 commit 2) — covers this
+                    # sys.exit path automatically.
+                    sys.exit(0)
+
+            # Back-off path: replace the original fixed-cadence sleep at
+            # the bottom of the loop with an exponentially growing one.
+            # The loop's primary ``time.sleep(interval)`` at the top of
+            # the next iteration is the normal cadence — we ADD an extra
+            # back-off sleep here so the next prune is genuinely delayed.
+            backoff = _hard_loop_backoff_sleep(
+                consecutive_empty_hard_prunes, interval
+            )
+            # Only emit a back-off sleep beyond the normal interval to
+            # avoid double-sleeping at K=1 / K=2 where backoff == interval.
+            if backoff > interval:
+                if consecutive_empty_hard_prunes == HARD_LOOP_BACKOFF_START:
+                    print(
+                        f"  [{_now()}] Hard prune freed 0 bytes "
+                        f"{HARD_LOOP_BACKOFF_START}x — entering exponential "
+                        f"back-off (next sleep: {backoff}s, cap "
+                        f"{HARD_LOOP_BACKOFF_CAP_SECONDS}s, exit after "
+                        f"{HARD_LOOP_EXIT_THRESHOLD} cycles)."
+                    )
+                time.sleep(backoff)
+        else:
+            consecutive_empty_hard_prunes = 0
+            # Reset the defer announcement so a fresh K-cycle that
+            # reaches K=10-with-agents will emit the notice again
+            # (PR #93 item #4 — operator-friendly).
+            deferred_exit_announced = False
+            # Reset futile-skip announcement so a fresh K-cycle
+            # emits the diagnostic again (GAP-D — mirrors above).
+            _futile_skip_announced = False
+
     try:
         while True:
             time.sleep(interval)
@@ -637,6 +809,12 @@ def start_guard(
                     print(f"  Pruned: {_fmt_prune_result(result)}")
                 if result.get("team_name"):
                     print(f"  Team '{result['team_name']}' state preserved ({result['team_messages']} messages)")
+                # Reaching here means HARD2 did NOT reload (the reloading branch
+                # above breaks/exits first). Apply the same circuit-breaker
+                # accounting as HARD1 so a sustained deferred-conflict / futile
+                # prune at 80% backs off and eventually exits instead of
+                # spinning kill→no-write→resume forever.
+                _account_hard_prune(result, agents_active, state)
                 print()
 
             # ── Phase 3: HARD1 (55%) — standard + reload (SKIP reload if agents active) ──
@@ -697,166 +875,7 @@ def start_guard(
                 if result.get("team_name"):
                     print(f"  Team '{result['team_name']}' state preserved ({result['team_messages']} messages)")
 
-                if result.get("live_write_skipped"):
-                    # #106 read-only deferral (agents active at 55%): we
-                    # intentionally did not prune the live file. This is neither a
-                    # successful prune nor a futile one — leave the futile-loop
-                    # circuit breaker untouched so a long agent run doesn't trip
-                    # the K-exit or emit the misleading "guard is powerless"
-                    # diagnostic. HARD2 (80%) still force-reloads if needed.
-                    pass
-                elif result.get("saved_mb", 0) <= 0 or result.get("futile_reload_skipped"):
-                    consecutive_empty_hard_prunes += 1
-
-                    # GAP-D: emit one-shot diagnostic when reload was skipped
-                    # as futile (prune saved too few bytes to justify a reload
-                    # that would immediately re-trigger HARD).
-                    if result.get("futile_reload_skipped") and not _futile_skip_announced:
-                        would_free_mb = result.get("would_free_mb", result.get("saved_mb", 0))
-                        orig_bytes = result.get("original_bytes", 0)
-                        saved_pct = (would_free_mb * 1024 * 1024 / orig_bytes * 100
-                                     if orig_bytes > 0 else 0)
-                        checkpoint_ref = (
-                            f" Checkpoint: {result['checkpoint_path']}"
-                            if result.get("checkpoint_path") else ""
-                        )
-                        print(
-                            f"  [{_now()}] Hard prune would free only {would_free_mb:.3f}MB "
-                            f"(~{saved_pct:.0f}%) — below {int(_MIN_PRUNE_RATIO * 100)}% "
-                            f"threshold. Reload skipped (live file left intact): resumed Claude would re-trigger "
-                            f"HARD immediately. Likely cause: subagent transcripts or large "
-                            f"tool-results dominate context. Recommend: /clear (loses subagent "
-                            f"state) or fresh session with restored team "
-                            f"checkpoint.{checkpoint_ref}",
-                            flush=True,
-                        )
-                        _futile_skip_announced = True
-
-                    # Exit path: the daemon is powerless against this context
-                    # (live tool-result blocks dominate; HARD prune cannot free
-                    # bytes; reload+0-byte = the cascade that crashed sessions
-                    # in production). Exit gracefully and let the SessionStart
-                    # hook respawn on next activity. Do NOT change reload-trigger
-                    # gating in guard_prune_cycle — that's not the right escape.
-                    #
-                    # PR #93 item #4: defer the exit when `agents_active=True`.
-                    # Killing the daemon mid-task destroys subagent protection
-                    # AND the diagnostic recommends `/clear` (which also
-                    # destroys subagent state). Hard cap at
-                    # HARD_LOOP_HARD_EXIT_THRESHOLD (default 50, override via
-                    # COZEMPIC_GUARD_HARD_EXIT_K) ensures eventual exit so a
-                    # stuck `extract_team_state` (BUG-G15 family) can't wedge
-                    # the daemon forever.
-                    if consecutive_empty_hard_prunes >= HARD_LOOP_EXIT_THRESHOLD:
-                        if (
-                            agents_active
-                            and consecutive_empty_hard_prunes < HARD_LOOP_HARD_EXIT_THRESHOLD
-                        ):
-                            # Defer: stay alive, keep cycling at backoff cap.
-                            if not deferred_exit_announced:
-                                running_count = sum(
-                                    1 for s in state.subagents
-                                    if s.status in ("running", "unknown")
-                                )
-                                worst_case_min = (
-                                    HARD_LOOP_HARD_EXIT_THRESHOLD
-                                    * HARD_LOOP_BACKOFF_CAP_SECONDS
-                                    // 60
-                                )
-                                print(
-                                    f"  [{_now()}] K={consecutive_empty_hard_prunes} "
-                                    f"reached normal exit threshold "
-                                    f"({HARD_LOOP_EXIT_THRESHOLD}) but "
-                                    f"{running_count} subagent(s) still active. "
-                                    f"Deferring daemon exit until agents quiesce "
-                                    f"or K reaches hard cap "
-                                    f"({HARD_LOOP_HARD_EXIT_THRESHOLD}, "
-                                    f"~{worst_case_min} min worst case).",
-                                    flush=True,
-                                )
-                                deferred_exit_announced = True
-                            # Fall through to the back-off sleep below.
-                            # We do NOT sys.exit while agents are working.
-                        else:
-                            # Either no agents (original K=10 exit) OR hard
-                            # cap reached even with agents (circuit breaker).
-                            try:
-                                checkpoint_team(session_path=session_path, quiet=True)
-                            except Exception:
-                                # Checkpoint failure must not prevent exit —
-                                # final checkpoint is best-effort here; the
-                                # SOFT loop above has been writing checkpoints
-                                # every cycle for the entire run, so on-disk
-                                # state is already current.
-                                pass
-                            if (
-                                agents_active
-                                and consecutive_empty_hard_prunes >= HARD_LOOP_HARD_EXIT_THRESHOLD
-                            ):
-                                # Hard cap fired with agents still active —
-                                # different diagnostic. Do NOT tell the
-                                # operator to `/clear` (that destroys
-                                # subagent state too).
-                                print(
-                                    f"  [{_now()}] Guard hard-cap exit "
-                                    f"(K={consecutive_empty_hard_prunes} >= "
-                                    f"{HARD_LOOP_HARD_EXIT_THRESHOLD}). "
-                                    f"Subagents are still active; their state "
-                                    f"may be lost on the next compaction. "
-                                    f"Consider letting current subagents "
-                                    f"finish then starting a fresh session.",
-                                    flush=True,
-                                )
-                            else:
-                                # Original K=10 exit (no agents — operator
-                                # can safely `/clear`).
-                                print(
-                                    f"  [{_now()}] Guard powerless against live-context "
-                                    f"dominance ({HARD_LOOP_EXIT_THRESHOLD} consecutive "
-                                    f"0-byte HARD prunes). Exiting — NO further guard "
-                                    f"protection in this session. SessionStart fires only "
-                                    f"on startup/resume/clear, NOT on tool calls or "
-                                    f"message turns, so the daemon will NOT auto-respawn "
-                                    f"while the session continues. To re-enable cozempic: "
-                                    f"type /clear or restart the session. Recommended: "
-                                    f"split work across fresh sessions to avoid >55% "
-                                    f"context dominance by immutable tool-result blocks.",
-                                    flush=True,
-                                )
-                            # _safe_unlink_session_pidfile is called via the
-                            # finally block (PR #93 commit 2) — covers this
-                            # sys.exit path automatically.
-                            sys.exit(0)
-
-                    # Back-off path: replace the original fixed-cadence sleep at
-                    # the bottom of the loop with an exponentially growing one.
-                    # The loop's primary ``time.sleep(interval)`` at the top of
-                    # the next iteration is the normal cadence — we ADD an extra
-                    # back-off sleep here so the next prune is genuinely delayed.
-                    backoff = _hard_loop_backoff_sleep(
-                        consecutive_empty_hard_prunes, interval
-                    )
-                    # Only emit a back-off sleep beyond the normal interval to
-                    # avoid double-sleeping at K=1 / K=2 where backoff == interval.
-                    if backoff > interval:
-                        if consecutive_empty_hard_prunes == HARD_LOOP_BACKOFF_START:
-                            print(
-                                f"  [{_now()}] Hard prune freed 0 bytes "
-                                f"{HARD_LOOP_BACKOFF_START}x — entering exponential "
-                                f"back-off (next sleep: {backoff}s, cap "
-                                f"{HARD_LOOP_BACKOFF_CAP_SECONDS}s, exit after "
-                                f"{HARD_LOOP_EXIT_THRESHOLD} cycles)."
-                            )
-                        time.sleep(backoff)
-                else:
-                    consecutive_empty_hard_prunes = 0
-                    # Reset the defer announcement so a fresh K-cycle that
-                    # reaches K=10-with-agents will emit the notice again
-                    # (PR #93 item #4 — operator-friendly).
-                    deferred_exit_announced = False
-                    # Reset futile-skip announcement so a fresh K-cycle
-                    # emits the diagnostic again (GAP-D — mirrors above).
-                    _futile_skip_announced = False
+                _account_hard_prune(result, agents_active, state)
                 print()
 
             # ── Phase 2: SOFT (25%) — gentle, no reload (file maintenance only) ──
@@ -1080,7 +1099,7 @@ def guard_prune_cycle(
     # write append-aware (any lines Claude wrote before dying are preserved); on
     # conflict it aborts, leaving the original intact (Claude resumes from the
     # full file — safe). Invoked by _terminate_and_resume after _wait_for_exit.
-    _write_holder = {"backup": None, "written": False}
+    _write_holder = {"backup": None, "written": False, "error": None}
 
     def _write_pruned_after_exit():
         try:
@@ -1093,8 +1112,10 @@ def guard_prune_cycle(
             _write_holder["backup"] = bk
             _write_holder["written"] = True
         except (PruneConflictError, PruneLockError) as exc:
+            _write_holder["error"] = "conflict"
             print(f"  [{_now()}] Deferred prune write skipped — {exc}", file=sys.stderr)
         except OSError as exc:
+            _write_holder["error"] = "oserror"
             # Disk-full / EIO / permission at the post-kill write instant. The
             # write is atomic (save_messages leaves the original intact on any
             # failure), so there's no corruption — but this runs AFTER Claude was
@@ -1151,6 +1172,8 @@ def guard_prune_cycle(
                 else:
                     result["saved_mb"] = 0.0
                     result["live_write_skipped"] = True
+                    if _write_holder.get("error"):
+                        result["prune_deferred_conflict"] = True
             except ReloadLockHeld as exc:
                 # Another reload pipeline is in flight — it terminates + writes
                 # its own prune. We did NOT write the live file (#106-safe).
