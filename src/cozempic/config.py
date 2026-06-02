@@ -31,7 +31,7 @@ from typing import Any
 _FLOOR_MAX_DROP_PCT_DEFAULT: float = 0.50
 _FLOOR_MAX_DROP_PCT_RANGE: tuple[float, float] = (0.0, 1.0)
 
-_FLOOR_PRESERVE_LAST_K_DEFAULT: int = 50
+_FLOOR_PRESERVE_LAST_K_DEFAULT: int = 10
 _FLOOR_PRESERVE_LAST_K_RANGE: tuple[int, int] = (1, 1000)
 
 _CONFIG_FILE_PATH = Path.home() / ".cozempic" / "config.json"

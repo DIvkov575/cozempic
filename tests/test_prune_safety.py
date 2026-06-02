@@ -406,12 +406,19 @@ class TestEnforceFloor:
 
 class TestFloorConfig:
     def test_default_values(self):
-        """FloorConfig() has the expected default values."""
+        """FloorConfig() has the expected default values.
+
+        last_k=10 (H-2): lowered from 50 → 10 to avoid neutralizing gentle/standard
+        on sessions ≤50 turns. K=50 re-added every removed turn on small sessions → 0%
+        savings. K=10 preserves a meaningful recent-context floor without swallowing
+        typical sessions. Operators needing the stricter floor use
+        COZEMPIC_FLOOR_PRESERVE_LAST_K=50.
+        """
         from cozempic.config import FloorConfig
 
         cfg = FloorConfig()
         assert cfg.max_user_assistant_drop_pct == 0.50
-        assert cfg.preserve_last_k_turns == 50
+        assert cfg.preserve_last_k_turns == 10
         assert cfg.preserve_first_message is True
 
     def test_env_var_max_drop_pct(self, monkeypatch):
