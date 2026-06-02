@@ -307,18 +307,16 @@ def prune_with_team_protect(
                 if tool_use_id:
                     pending_task_ids.add(tool_use_id)
 
-    # 3. Tag team messages as protected (strategies skip via is_protected())
-    tagged_indices: list[int] = []
-    for _, msg_dict, _ in messages:
-        if _is_team_message(msg_dict, pending_task_ids):
-            msg_dict["__cozempic_team_protected__"] = True
-            tagged_indices.append(id(msg_dict))
-
-    # 4. Prune full list. Wrapped in try/finally (L-4: sister-parity with
-    # executor.py's singleton-tag finally) so the team-tag strip ALWAYS runs
-    # even when run_prescription raises PruneValidationError — prevents
-    # __cozempic_team_protected__ residue on the in-memory list on the abort path.
+    # 3+4. Tag team messages as protected, then prune. The apply loop is INSIDE
+    # the try so the finally strip covers it unconditionally — including a signal
+    # delivered between the apply and run_prescription (hardening, no disk leak
+    # either way since the list is discarded on exit). Tags are still applied
+    # before run_prescription so strategies see them via is_protected().
     try:
+        for _, msg_dict, _ in messages:
+            if _is_team_message(msg_dict, pending_task_ids):
+                msg_dict["__cozempic_team_protected__"] = True
+
         pruned_messages, results = run_prescription(messages, strategy_names, config)
     finally:
         # 5. Remove tags from the source list (messages) — covers the abort path

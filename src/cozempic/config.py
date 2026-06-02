@@ -196,11 +196,16 @@ def _resolve_floor_with(file_data: dict[str, Any]) -> FloorConfig:
 
     # preserve_first_message — REVIEW-round3 F.N7: must read from file_data
     # and env var. Prior hardcoded True silently ignored operator config.
+    # R3-1 fix: the file path previously used bare bool(), so bool("false") and
+    # bool("0") both returned True — opposite of intent and inconsistent with the
+    # env path which uses _parse_bool. Now: pass native JSON bools through as-is;
+    # coerce non-bool values via _parse_bool (handles "false"/"0"/"no" correctly).
     raw_env = os.environ.get("COZEMPIC_FLOOR_PRESERVE_FIRST")
     if raw_env is not None and raw_env != "":
         preserve_first = _parse_bool(raw_env, default=True)
     elif "preserve_first_message" in floor_data:
-        preserve_first = bool(floor_data["preserve_first_message"])
+        val = floor_data["preserve_first_message"]
+        preserve_first = val if isinstance(val, bool) else _parse_bool(str(val), default=True)
     else:
         preserve_first = True
 
