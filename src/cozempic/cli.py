@@ -9,15 +9,16 @@ import subprocess
 import sys
 from pathlib import Path
 
+from .config import load_config
 from .diagnosis import diagnose_session
 from .doctor import run_doctor
 from .executor import execute_actions, run_prescription
 from .guard import checkpoint_team, start_guard, start_guard_daemon
-from .safety import PruneValidationError
+from .helpers import is_ssh_session, shell_quote
 from .init import run_init
 from .recap import save_recap
 from .registry import PRESCRIPTIONS, STRATEGIES
-from .helpers import is_ssh_session, shell_quote
+from .safety import PruneValidationError
 from .session import _PruneLock, PruneConflictError, PruneLockError, find_claude_pid, find_current_session, find_sessions, get_session_cwd, load_messages, project_slug_to_path, resolve_session, save_messages, snapshot_session
 from .tokens import estimate_session_tokens, quick_token_estimate, calibrate_ratio
 from .types import PrescriptionResult, StrategyResult
@@ -252,9 +253,12 @@ def cmd_current(args):
         print_diagnosis(diag, sess["path"])
 
         print("  Estimated Savings by Prescription:")
+        # Resolve floor_config once (L-3: avoid per-prescription disk reads in the loop)
+        _floor_cfg = load_config().floor
         for rx_name, strategy_names in PRESCRIPTIONS.items():
             try:
-                new_msgs, _ = run_prescription(messages, strategy_names, {})
+                new_msgs, _ = run_prescription(messages, strategy_names, {},
+                                               floor_config=_floor_cfg)
             except PruneValidationError as ve:
                 # Dry-run estimation: a structural validation failure means the
                 # session is already malformed or the strategy would make it
@@ -276,9 +280,12 @@ def cmd_diagnose(args):
     print_diagnosis(diag, path)
 
     print("  Estimated Savings by Prescription:")
+    # Resolve floor_config once (L-3: avoid per-prescription disk reads in the loop)
+    _floor_cfg = load_config().floor
     for rx_name, strategy_names in PRESCRIPTIONS.items():
         try:
-            new_msgs, _ = run_prescription(messages, strategy_names, {})
+            new_msgs, _ = run_prescription(messages, strategy_names, {},
+                                           floor_config=_floor_cfg)
         except PruneValidationError as ve:
             # Dry-run estimation: report structural failure instead of crashing.
             check = ve.evidence.get("failed_check", "?")

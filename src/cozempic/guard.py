@@ -314,10 +314,19 @@ def prune_with_team_protect(
             msg_dict["__cozempic_team_protected__"] = True
             tagged_indices.append(id(msg_dict))
 
-    # 4. Prune full list — team messages are protected, no list splitting needed
-    pruned_messages, results = run_prescription(messages, strategy_names, config)
+    # 4. Prune full list. Wrapped in try/finally (L-4: sister-parity with
+    # executor.py's singleton-tag finally) so the team-tag strip ALWAYS runs
+    # even when run_prescription raises PruneValidationError — prevents
+    # __cozempic_team_protected__ residue on the in-memory list on the abort path.
+    try:
+        pruned_messages, results = run_prescription(messages, strategy_names, config)
+    finally:
+        # 5. Remove tags from the source list (messages) — covers the abort path
+        # where pruned_messages may be partially built or identical to messages.
+        for _, msg_dict, _ in messages:
+            msg_dict.pop("__cozempic_team_protected__", None)
 
-    # 5. Remove tags from surviving messages
+    # 5b. Also strip from pruned_messages (they may be a different list).
     for _, msg_dict, _ in pruned_messages:
         msg_dict.pop("__cozempic_team_protected__", None)
 
