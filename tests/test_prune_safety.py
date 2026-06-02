@@ -230,35 +230,12 @@ class TestValidatePostPruneC4C5C6C7:
         assert exc_info.value.evidence["failed_check"] == "C7"
 
 
-# ── Class 5: simulate_replay_readiness ───────────────────────────────────────
-
-class TestSimulateReplayReadiness:
-    def test_cross_session_parent_treated_as_anchor(self):
-        """First msg with external parentUuid is a valid cross-session anchor → (True, '')."""
-        from cozempic.safety import simulate_replay_readiness
-
-        # parentUuid points to a uuid NOT in this file (external session anchor)
-        msgs = [
-            _user(0, "u-root", "external-parent-uuid-not-in-file"),
-            _asst(1, "a-001", "u-root"),
-        ]
-        ok, reason = simulate_replay_readiness(msgs)
-        assert ok is True
-        assert reason == ""
-
-    def test_no_anchor_fails(self):
-        """All messages form a closed cycle with no null or external entry → (False, ...)."""
-        from cozempic.safety import simulate_replay_readiness
-
-        # Cycle: a→b→c→a (all parentUuids resolve within the file → no anchor)
-        msgs = [
-            _user(0, "msg-a", "msg-c"),  # parent = msg-c (within file)
-            _asst(1, "msg-b", "msg-a"),
-            _user(2, "msg-c", "msg-b"),
-        ]
-        ok, reason = simulate_replay_readiness(msgs)
-        assert ok is False
-        assert reason != ""
+# ── Class 5: simulate_replay_readiness (REMOVED — M-1) ───────────────────────
+# simulate_replay_readiness was a dead export: implemented, exported in __all__,
+# and unit-tested, but never called by any production path. Removed per M-1.
+# validate_post_prune (two-list, in the prune path) already provides the
+# structural/anchor guarantee. A standalone single-list diagnostic is deferred
+# to a separate PR if wanted later.
 
 
 # ── Class 6: enforce_floor ───────────────────────────────────────────────────

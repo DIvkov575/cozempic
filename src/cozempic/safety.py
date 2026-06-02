@@ -328,47 +328,6 @@ def validate_post_prune(
             )
 
 
-def simulate_replay_readiness(
-    messages: list[tuple[int, dict, int]],
-) -> tuple[bool, str]:
-    """Structural probe: walk the parentUuid graph as Claude Code's resume would.
-
-    Returns ``(ok, reason)``. ``ok=False`` means the session would not
-    bootstrap cleanly. ``ok=True`` returns reason="".
-
-    PR #102 fix: cross-session pointers (parentUuid not defined as any uuid
-    in this file) are treated as external anchors, NOT chain breaks. A valid
-    session anchor is any message whose parentUuid is either None OR an
-    external UUID not defined in this file (both are valid chain heads).
-    """
-    if not messages:
-        return False, "empty message list"
-
-    surviving_uuids: set[str] = {
-        m.get("uuid", "") for _, m, _ in messages if m.get("uuid")
-    }
-
-    # At least one message must be a chain anchor: parentUuid is absent from
-    # surviving_uuids (either None = true root, or external UUID = cross-session
-    # anchor). A session where every parentUuid resolves within the file in a
-    # cycle has no bootstrappable entry point.
-    has_anchor = any(
-        m.get("parentUuid") is None or m.get("parentUuid") not in surviving_uuids
-        for _, m, _ in messages
-        if m.get("uuid")  # ignore metadata entries with no uuid
-    )
-    if not has_anchor:
-        return False, "no chain anchor (no parentUuid=null or external entry; possible cycle)"
-
-    # Conversation must include at least one user AND one assistant.
-    has_user = any(m.get("type") == "user" for _, m, _ in messages)
-    has_asst = any(m.get("type") == "assistant" for _, m, _ in messages)
-    if not (has_user and has_asst):
-        return False, "no conversation (zero users or zero assistants)"
-
-    return True, ""
-
-
 # ── P0-C — Floor preservation ─────────────────────────────────────────────────
 
 
