@@ -5,8 +5,7 @@ onto the v1.8.18 terminate-first flow:
 
 P0-B — Post-prune structural validation:
   - ``PruneValidationError`` exception with reason + evidence dict
-  - ``validate_post_prune(msgs_before, msgs_after, strict)`` — raises on C1-C7
-  - ``simulate_replay_readiness(messages)`` — structural replay probe
+  - ``validate_post_prune(msgs_before, msgs_after)`` — raises on C1-C7
 
 P0-C — Floor preservation:
   - ``enforce_floor(msgs_before, msgs_after, cfg)`` — re-adds must-preserve msgs
@@ -15,6 +14,9 @@ P0-D helpers (executor.py owns the tagging; this module owns enforcement):
   - ``FloorConfig`` re-exported from config.py for ergonomic imports
 
 P0-A (idle guard) is intentionally out of scope for this PR.
+``simulate_replay_readiness`` (single-list replay probe) deferred —
+``validate_post_prune`` (two-list, in the prune path) covers the
+prune-path guarantee; a standalone diagnostic is a separate PR if wanted.
 """
 
 from __future__ import annotations
@@ -28,7 +30,6 @@ __all__ = [
     "FloorConfig",
     "validate_post_prune",
     "enforce_floor",
-    "simulate_replay_readiness",
 ]
 
 
@@ -73,24 +74,77 @@ def _last_compact_boundary(
     return last
 
 
+def _build_orphan_shells(
+    msgs_before: list[tuple[int, dict, int]],
+) -> set[str]:
+    """Compute the set of uuids of orphan-shell messages in msgs_before.
+
+    An orphan-shell is a message that meets ALL of:
+      1. Has ≥ 1 content block.
+      2. ALL its content blocks are ``tool_result`` blocks.
+      3. Every such ``tool_result``'s ``tool_use_id`` is NOT present in any
+         ``tool_use`` block anywhere in msgs_before (cross-session orphan).
+
+    ``fix_orphaned_tool_results`` legitimately drops orphan-shells because the
+    Anthropic API requires every ``tool_result`` to have a matching ``tool_use``
+    in the message history. Dropping a cross-session orphan-shell is correct
+    API-hygiene, NOT a prune-induced structural failure.
+
+    C1 and C2 must exclude orphan-shell uuids from their "prune-induced break"
+    checks so that legit orphan-shell drops do not cause false-positive aborts
+    (the C-1 CRITICAL correctness regression on resumed sessions).
+    """
+    # Pass 1: collect all tool_use ids present in msgs_before.
+    before_tool_use_ids: set[str] = set()
+    for _, msg, _ in msgs_before:
+        content = msg.get("message", {}).get("content", [])
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                tid = block.get("id", "")
+                if tid:
+                    before_tool_use_ids.add(tid)
+
+    # Pass 2: identify orphan-shell uuids.
+    orphan_shells: set[str] = set()
+    for _, msg, _ in msgs_before:
+        uuid = msg.get("uuid", "")
+        if not uuid:
+            continue
+        content = msg.get("message", {}).get("content", [])
+        if not isinstance(content, list) or not content:
+            continue
+        # All blocks must be tool_result blocks whose tool_use_id ∉ before_tool_use_ids.
+        if all(
+            isinstance(blk, dict)
+            and blk.get("type") == "tool_result"
+            and blk.get("tool_use_id", "") not in before_tool_use_ids
+            for blk in content
+        ):
+            orphan_shells.add(uuid)
+
+    return orphan_shells
+
+
 def validate_post_prune(
     msgs_before: list[tuple[int, dict, int]],
     msgs_after: list[tuple[int, dict, int]],
-    *,
-    strict: bool = True,
 ) -> None:
     """Validate the pruned message list. Raise PruneValidationError on failure.
 
     Checks run fail-fast in order C3 → C2 → C4 → C5 → C6 → C7 → C1 (semantic
     checks before structural so the failure attribution is actionable):
 
-      C1. parentUuid resolution — baseline-relative: only flag a parent that
-          WAS in msgs_before (existed pre-prune) but is absent from msgs_after
-          (prune introduced a chain break). Cross-session pointers (parent not
-          in before_uuids) are valid external anchors; skip them.
-      C2. Root preserved — at least one of the original ``parentUuid=null``
-          uuids from msgs_before must survive. Multi-root sessions supported
-          via set-intersection (REVIEW-max B.11).
+      C1. parentUuid resolution — baseline-relative + orphan-shell-aware: only
+          flag a parent that (a) WAS in msgs_before, (b) is absent from msgs_after,
+          AND (c) is NOT a legit_removed_orphan_shell. Cross-session pointers
+          (parent ∉ before_uuids) and legitimately-dropped orphan-shell parents
+          are both valid and skipped.
+      C2. Root preserved — at least one ELIGIBLE original ``parentUuid=null`` uuid
+          from msgs_before must survive. Eligible = NOT a legit_removed_orphan_shell.
+          An orphan-shell root's removal is legitimate; it is excluded from the
+          required-root set (REVIEW-max B.11 + C-1 correctness fix).
       C3. Conversation survival — ≥1 user AND ≥1 assistant survives.
       C4. compact_boundary — if msgs_before had a system/compact_boundary
           entry, the LAST such entry MUST survive.
@@ -107,6 +161,9 @@ def validate_post_prune(
     surviving_uuids: set[str] = {
         msg.get("uuid", "") for _, msg, _ in msgs_after if msg.get("uuid")
     }
+
+    # Compute orphan-shell set once for use by both C2 and C1.
+    legit_removed_orphan_shells = _build_orphan_shells(msgs_before)
 
     # ── C3: conversation survival ─────────────────────────────────────────────
     # Check before C2/C1 because a wholesale wipe is more actionable to report
@@ -131,22 +188,26 @@ def validate_post_prune(
     # ── C2: original root uuid preserved ─────────────────────────────────────
     # Review finding H-1: a structural ``any(parentUuid is None)`` check is
     # bypassed by _relink_parent_chain re-pointing dead-end chains to None
-    # when the original root is dropped. Require that AT LEAST ONE of the
-    # original parentUuid=null uuids from msgs_before survives (REVIEW-max B.11).
+    # when the original root is dropped. Require that AT LEAST ONE ELIGIBLE
+    # original parentUuid=null uuid from msgs_before survives.
+    # ELIGIBLE = not a legit_removed_orphan_shell (C-1 fix): an orphan-shell
+    # root is legitimately dropped by fix_orphaned_tool_results; its absence
+    # must not trigger C2. (REVIEW-max B.11 + C-1 correctness fix.)
     original_root_uuids: set[str] = set()
     for _, msg, _ in msgs_before:
         if msg.get("parentUuid") is None and msg.get("uuid"):
             original_root_uuids.add(msg["uuid"])
-    if original_root_uuids and not (original_root_uuids & surviving_uuids):
+    eligible_roots = original_root_uuids - legit_removed_orphan_shells
+    if eligible_roots and not (eligible_roots & surviving_uuids):
         raise PruneValidationError(
             reason=(
                 f"every original session root uuid was dropped "
-                f"(expected one of {sorted(original_root_uuids)} to survive)"
+                f"(expected one of {sorted(eligible_roots)} to survive)"
             ),
             evidence={
                 "failed_check": "C2",
-                "expected_root_uuid": sorted(original_root_uuids)[0],
-                "expected_root_uuids": sorted(original_root_uuids),
+                "expected_root_uuid": sorted(eligible_roots)[0],
+                "expected_root_uuids": sorted(eligible_roots),
                 "before_count": len(msgs_before),
                 "after_count": len(msgs_after),
             },
@@ -219,7 +280,7 @@ def validate_post_prune(
                 },
             )
 
-    # ── C1: parent chain resolves (baseline-relative) ────────────────────────
+    # ── C1: parent chain resolves (baseline-relative + orphan-shell-aware) ────
     # Defense-in-depth fallback. The executor's _relink_parent_chain step
     # SHOULD ensure every surviving parentUuid resolves; this re-verifies.
     # REVIEW-max B.10: treat falsy parentUuid (None, "", 0, ...) as equivalent
@@ -227,10 +288,13 @@ def validate_post_prune(
     #
     # PR #102 fix — unconditionally baseline-relative:
     # Skip any parent absent from before_uuids (never existed in this session
-    # before the prune) — it is a cross-session pointer and is NOT a regression
-    # introduced by this prune. Only raise when the parent WAS in before_uuids
-    # (existed pre-prune) but is absent from surviving_uuids (prune removed it,
-    # breaking the chain).
+    # before the prune) — it is a cross-session pointer.
+    # C-1 fix — orphan-shell-aware:
+    # Also skip parents in legit_removed_orphan_shells. When a parent was
+    # legitimately dropped by fix_orphaned_tool_results (cross-session orphan),
+    # the child's dangling parentUuid is NOT a prune-induced break.
+    # Only raise when the parent was a REAL (non-orphan-shell) message in
+    # msgs_before that the prune removed without relinking.
     before_uuids: set[str] = {
         msg.get("uuid", "") for _, msg, _ in msgs_before if msg.get("uuid")
     }
@@ -242,8 +306,13 @@ def validate_post_prune(
             if parent not in before_uuids:
                 # Parent was never in this file — cross-session pointer; skip.
                 continue
-            # Parent was in before_uuids (existed pre-prune) but absent after
-            # — the prune introduced this chain break. Raise C1.
+            if parent in legit_removed_orphan_shells:
+                # Parent was an orphan-shell legitimately dropped by orphan-fix;
+                # not a prune-induced break — skip.
+                continue
+            # Parent was a real message in before_uuids (existed pre-prune) but
+            # absent after, and it was NOT an orphan-shell — prune introduced
+            # this chain break. Raise C1.
             raise PruneValidationError(
                 reason=(
                     f"parentUuid {parent!r} on uuid {msg.get('uuid')!r} "
