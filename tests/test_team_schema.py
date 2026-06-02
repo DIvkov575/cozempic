@@ -163,6 +163,44 @@ class TestTeamRecoveryReceipt(unittest.TestCase):
         self.assertEqual(receipt["recovery_verdict"], "unsafe-to-resume")
         self.assertIn("no_team_state", receipt["audit_gaps"])
 
+    def test_raw_status_text_does_not_leak_via_status_keys(self):
+        # status fields are agent-controlled raw text (TaskUpdate input,
+        # <status> capture). They must NOT reach the receipt as dict keys.
+        secret = "token-sk-live-abc123-customer-pii"
+        state = TeamState(
+            team_name="t", config_source="both", message_count=1, last_coordination_index=1,
+            teammates=[TeammateInfo("a1", "n1", status=secret)],
+            subagents=[SubagentInfo("s1", "d1", status="secret_project_apollo")],
+            tasks=[TaskInfo("t1", "subj", secret, owner="o1")],
+        )
+        receipt = build_team_recovery_receipt(state)
+        rendered = json.dumps(receipt)
+        self.assertNotIn(secret, rendered)
+        self.assertNotIn("secret_project_apollo", rendered)
+        # off-vocabulary statuses bucket to "other", counts preserved
+        self.assertEqual(receipt["counts"]["teammates_by_status"], {"other": 1})
+        self.assertEqual(receipt["counts"]["subagents_by_status"], {"other": 1})
+        self.assertEqual(receipt["counts"]["teammates_total"], 1)
+
+    def test_known_statuses_pass_through(self):
+        state = TeamState(
+            team_name="t", config_source="both", message_count=1, last_coordination_index=1,
+            teammates=[TeammateInfo("a1", "n1", status="running"),
+                       TeammateInfo("a2", "n2", status="done")],
+        )
+        receipt = build_team_recovery_receipt(state)
+        self.assertEqual(receipt["counts"]["teammates_by_status"], {"done": 1, "running": 1})
+
+    def test_non_list_teammates_subagents_do_not_crash(self):
+        # half-built state (None lists) must summarize, not crash
+        state = TeamState(team_name="t", config_source="both", message_count=1,
+                          last_coordination_index=1)
+        state.teammates = None
+        state.subagents = None
+        receipt = build_team_recovery_receipt(state)
+        self.assertEqual(receipt["counts"]["teammates_total"], 0)
+        self.assertEqual(receipt["counts"]["subagents_total"], 0)
+
     def test_active_team_without_event_cursors_is_partial(self):
         state = TeamState(
             team_name="Private GTM Team",

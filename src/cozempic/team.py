@@ -214,11 +214,28 @@ class TeamState:
         return "\n".join(parts)
 
 
+# Status values reach the receipt as dict KEYS, and they originate from raw,
+# agent-controlled text (TaskUpdate tool input, <status>…</status> capture), so
+# they must be coerced to a fixed vocabulary before they can be serialized —
+# otherwise free-text (e.g. a secret accidentally written as a status) would
+# leak into a "privacy-safe" artifact via the key. Anything off-vocabulary
+# buckets to "other" so counts stay correct without copying raw text.
+_KNOWN_STATUSES = frozenset({
+    "running", "active", "in_progress", "pending", "queued", "blocked",
+    "idle", "done", "completed", "failed", "cancelled", "stopped", "unknown",
+})
+
+
 def _count_by_status(items: list[object]) -> dict[str, int]:
-    """Return stable status counts for receipt/debug output."""
+    """Return stable status counts for receipt/debug output.
+
+    Status strings are normalized to a fixed vocabulary (_KNOWN_STATUSES) so
+    no raw, agent-controlled text reaches the receipt as a dict key.
+    """
     counts: dict[str, int] = {}
-    for item in items:
-        status = (getattr(item, "status", "unknown") or "unknown").strip().lower()
+    for item in items or []:
+        raw = (getattr(item, "status", "unknown") or "unknown").strip().lower()
+        status = raw if raw in _KNOWN_STATUSES else "other"
         counts[status] = counts.get(status, 0) + 1
     return dict(sorted(counts.items()))
 
@@ -237,8 +254,13 @@ def build_team_recovery_receipt(state: TeamState) -> dict:
     if state is None:
         state = TeamState()
     active_tasks, completed_tasks, blank_tasks = state._task_groups()
-    running_subagents = [s for s in state.subagents if (s.status or "").lower() == "running"]
-    active_teammates = [t for t in state.teammates if (t.status or "").lower() not in {"done", "completed"}]
+    # `subagents`/`teammates` can be None on a half-built state (the bug-report /
+    # guard-log contexts this receipt targets) — coerce to [] so we summarize
+    # instead of crashing.
+    subagents = state.subagents or []
+    teammates = state.teammates or []
+    running_subagents = [s for s in subagents if (s.status or "").lower() == "running"]
+    active_teammates = [t for t in teammates if (t.status or "").lower() not in {"done", "completed"}]
 
     gaps: list[str] = []
     if state.is_empty():
@@ -279,10 +301,10 @@ def build_team_recovery_receipt(state: TeamState) -> dict:
         },
         "counts": {
             "team_messages": state.message_count,
-            "teammates_total": len(state.teammates),
-            "teammates_by_status": _count_by_status(state.teammates),
-            "subagents_total": len(state.subagents),
-            "subagents_by_status": _count_by_status(state.subagents),
+            "teammates_total": len(teammates),
+            "teammates_by_status": _count_by_status(teammates),
+            "subagents_total": len(subagents),
+            "subagents_by_status": _count_by_status(subagents),
             "tasks_active": len(active_tasks),
             "tasks_completed": completed_tasks,
             "tasks_blank": blank_tasks,
