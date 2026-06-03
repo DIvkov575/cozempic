@@ -5,7 +5,7 @@ onto the v1.8.18 terminate-first flow:
 
 P0-B — Post-prune structural validation:
   - ``PruneValidationError`` exception with reason + evidence dict
-  - ``validate_post_prune(msgs_before, msgs_after)`` — raises on C1-C7
+  - ``validate_post_prune(msgs_before, msgs_after)`` — raises on C1-C8
 
 P0-C — Floor preservation:
   - ``enforce_floor(msgs_before, msgs_after, cfg)`` — re-adds must-preserve msgs
@@ -41,7 +41,7 @@ class PruneValidationError(Exception):
 
     ``reason`` is a human-readable summary. ``evidence`` is a dict that
     callers (guard daemon, CLI) log; it always contains a ``failed_check``
-    key matching one of ``"C1".."C7"`` so log aggregators can group failures.
+    key matching one of ``"C1".."C8"`` so log aggregators can group failures.
     """
 
     def __init__(self, reason: str, evidence: dict):
@@ -133,7 +133,7 @@ def validate_post_prune(
 ) -> None:
     """Validate the pruned message list. Raise PruneValidationError on failure.
 
-    Checks run fail-fast in order C3 → C2 → C4 → C5 → C6 → C7 → C1 (semantic
+    Checks run fail-fast in order C3 → C2 → C4 → C5 → C6 → C7 → C1 → C8 (semantic
     checks before structural so the failure attribution is actionable):
 
       C1. parentUuid resolution — baseline-relative + orphan-shell-aware: only
@@ -154,6 +154,10 @@ def validate_post_prune(
           MUST survive.
       C7. ai-title — if msgs_before had ai-title entries, the LAST one MUST
           survive (REVIEW-max E.4).
+      C8. tool_use↔tool_result — a surviving ``tool_use`` whose paired
+          ``tool_result`` existed in msgs_before MUST keep that result in
+          msgs_after (a dangling tool_use is structurally valid but
+          unresumable; mirror of the orphaned-tool_result handling).
 
     Each check is CONDITIONAL on its precondition existing in msgs_before —
     a session that never had a permission-mode entry passes C5 trivially.
@@ -326,6 +330,61 @@ def validate_post_prune(
                     "surviving_count": len(surviving_uuids),
                 },
             )
+
+    # ── C8: surviving tool_use keeps its tool_result (baseline-relative) ──────
+    # The Anthropic API rejects an assistant ``tool_use`` block whose paired
+    # ``tool_result`` is absent on resume — the mirror of the orphaned-
+    # ``tool_result`` case ``fix_orphaned_tool_results`` already handles. A
+    # removal strategy can drop the user message carrying a ``tool_result``
+    # while leaving the assistant ``tool_use`` in place, producing a dangling
+    # ``tool_use`` that is structurally valid (DAG resolves) but unresumable.
+    # Baseline-relative, exactly like C1: only raise when the pairing EXISTED
+    # in msgs_before and the prune broke it. A ``tool_use`` that was already
+    # awaiting its result pre-prune (e.g. the session's final, in-flight turn)
+    # is NOT a prune-induced break, so it is skipped.
+    before_result_ids: set[str] = set()
+    for _, m, _ in msgs_before:
+        content = (m.get("message") or {}).get("content")
+        if isinstance(content, list):
+            for blk in content:
+                if isinstance(blk, dict) and blk.get("type") == "tool_result":
+                    rid = blk.get("tool_use_id")
+                    if rid:
+                        before_result_ids.add(rid)
+    after_result_ids: set[str] = set()
+    for _, m, _ in msgs_after:
+        content = (m.get("message") or {}).get("content")
+        if isinstance(content, list):
+            for blk in content:
+                if isinstance(blk, dict) and blk.get("type") == "tool_result":
+                    rid = blk.get("tool_use_id")
+                    if rid:
+                        after_result_ids.add(rid)
+    for _, msg, _ in msgs_after:
+        content = (msg.get("message") or {}).get("content")
+        if not isinstance(content, list):
+            continue
+        for blk in content:
+            if not (isinstance(blk, dict) and blk.get("type") == "tool_use"):
+                continue
+            tid = blk.get("id")
+            if not tid:
+                continue
+            if tid not in after_result_ids and tid in before_result_ids:
+                # tool_use survived but its tool_result (present pre-prune) was
+                # dropped — dangling tool_use, unresumable. Raise C8.
+                raise PruneValidationError(
+                    reason=(
+                        f"tool_use {tid!r} on uuid {msg.get('uuid')!r} survived "
+                        f"but its tool_result (present before prune) was dropped "
+                        f"— dangling tool_use is unresumable"
+                    ),
+                    evidence={
+                        "failed_check": "C8",
+                        "dangling_tool_use_id": tid,
+                        "uuid": msg.get("uuid"),
+                    },
+                )
 
 
 # ── P0-C — Floor preservation ─────────────────────────────────────────────────

@@ -230,6 +230,64 @@ class TestValidatePostPruneC4C5C6C7:
         assert exc_info.value.evidence["failed_check"] == "C7"
 
 
+class TestValidatePostPruneC8ToolPairing:
+    """C8 — a surviving tool_use must keep its tool_result (baseline-relative)."""
+
+    def _before(self):
+        # u0 -> a1(tool_use tu1) -> u1(tool_result tu1) -> a2
+        return [
+            _user(0, "u0", parent=None),
+            _asst(1, "a1", parent="u0",
+                  content=[{"type": "tool_use", "id": "tu1", "name": "Bash", "input": {}}]),
+            _user(2, "u1", parent="a1",
+                  content=[{"type": "tool_result", "tool_use_id": "tu1", "content": "ok"}]),
+            _asst(3, "a2", parent="u1", content="done"),
+        ]
+
+    def test_c8_dangling_tool_use_raises(self):
+        """Dropping the tool_result message but keeping the tool_use raises C8."""
+        from cozempic.safety import validate_post_prune, PruneValidationError
+
+        before = self._before()
+        # drop u1 (the tool_result carrier); relink a2 -> a1 so the DAG still resolves
+        a2 = _asst(3, "a2", parent="a1", content="done")
+        after = [before[0], before[1], a2]
+
+        with pytest.raises(PruneValidationError) as exc_info:
+            validate_post_prune(before, after)
+        assert exc_info.value.evidence["failed_check"] == "C8"
+        assert exc_info.value.evidence["dangling_tool_use_id"] == "tu1"
+
+    def test_c8_intact_pair_passes(self):
+        """Keeping the full tool_use/tool_result pair passes."""
+        from cozempic.safety import validate_post_prune
+
+        before = self._before()
+        validate_post_prune(before, before)  # no raise
+
+    def test_c8_inflight_tool_use_without_prior_result_passes(self):
+        """A tool_use that never had a tool_result before the prune (an in-flight
+        final turn) is NOT a prune-induced break — must pass (baseline-relative)."""
+        from cozempic.safety import validate_post_prune
+
+        before = [
+            _user(0, "u0", parent=None),
+            _asst(1, "a1", parent="u0",
+                  content=[{"type": "tool_use", "id": "tuX", "name": "Bash", "input": {}}]),
+        ]
+        validate_post_prune(before, before)  # no raise
+
+    def test_c8_both_halves_dropped_passes(self):
+        """Dropping BOTH the tool_use and its tool_result leaves nothing dangling."""
+        from cozempic.safety import validate_post_prune
+
+        before = self._before()
+        # drop a1 (tool_use) AND u1 (tool_result); relink a2 -> u0
+        a2 = _asst(3, "a2", parent="u0", content="done")
+        after = [before[0], a2]
+        validate_post_prune(before, after)  # no raise
+
+
 # ── Class 5: simulate_replay_readiness (REMOVED — M-1) ───────────────────────
 # simulate_replay_readiness was a dead export: implemented, exported in __all__,
 # and unit-tested, but never called by any production path. Removed per M-1.
