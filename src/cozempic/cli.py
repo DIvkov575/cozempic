@@ -9,14 +9,16 @@ import subprocess
 import sys
 from pathlib import Path
 
+from .config import load_config
 from .diagnosis import diagnose_session
 from .doctor import run_doctor
 from .executor import execute_actions, run_prescription
 from .guard import checkpoint_team, start_guard, start_guard_daemon
+from .helpers import is_ssh_session, shell_quote
 from .init import run_init
 from .recap import save_recap
 from .registry import PRESCRIPTIONS, STRATEGIES
-from .helpers import is_ssh_session, shell_quote
+from .safety import PruneValidationError
 from .session import _PruneLock, PruneConflictError, PruneLockError, find_claude_pid, find_current_session, find_sessions, get_session_cwd, load_messages, project_slug_to_path, resolve_session, save_messages, snapshot_session
 from .tokens import estimate_session_tokens, quick_token_estimate, calibrate_ratio
 from .types import PrescriptionResult, StrategyResult
@@ -251,8 +253,19 @@ def cmd_current(args):
         print_diagnosis(diag, sess["path"])
 
         print("  Estimated Savings by Prescription:")
+        # Resolve floor_config once (L-3: avoid per-prescription disk reads in the loop)
+        _floor_cfg = load_config().floor
         for rx_name, strategy_names in PRESCRIPTIONS.items():
-            new_msgs, _ = run_prescription(messages, strategy_names, {})
+            try:
+                new_msgs, _ = run_prescription(messages, strategy_names, {},
+                                               floor_config=_floor_cfg)
+            except PruneValidationError as ve:
+                # Dry-run estimation: a structural validation failure means the
+                # session is already malformed or the strategy would make it
+                # unreplayable. Report the check that failed — do not crash.
+                check = ve.evidence.get("failed_check", "?")
+                print(f"    {rx_name:<15} would be invalid ({check}): {ve.reason}")
+                continue
             final_bytes = sum(b for _, _, b in new_msgs)
             total_saved = diag["total_bytes"] - final_bytes
             pct = fmt_pct(total_saved, diag["total_bytes"])
@@ -267,8 +280,17 @@ def cmd_diagnose(args):
     print_diagnosis(diag, path)
 
     print("  Estimated Savings by Prescription:")
+    # Resolve floor_config once (L-3: avoid per-prescription disk reads in the loop)
+    _floor_cfg = load_config().floor
     for rx_name, strategy_names in PRESCRIPTIONS.items():
-        new_msgs, _ = run_prescription(messages, strategy_names, {})
+        try:
+            new_msgs, _ = run_prescription(messages, strategy_names, {},
+                                           floor_config=_floor_cfg)
+        except PruneValidationError as ve:
+            # Dry-run estimation: report structural failure instead of crashing.
+            check = ve.evidence.get("failed_check", "?")
+            print(f"    {rx_name:<15} would be invalid ({check}): {ve.reason}")
+            continue
         final_bytes = sum(b for _, _, b in new_msgs)
         total_saved = diag["total_bytes"] - final_bytes
         pct = fmt_pct(total_saved, diag["total_bytes"])
@@ -301,7 +323,20 @@ def cmd_treat(args):
     pre_te = estimate_session_tokens(messages)
     pre_ratio = calibrate_ratio(messages)
 
-    new_messages, strategy_results = run_prescription(messages, strategy_names, config)
+    try:
+        new_messages, strategy_results = run_prescription(messages, strategy_names, config)
+    except PruneValidationError as ve:
+        check = ve.evidence.get("failed_check", "?")
+        print(
+            f"  Prune validation failed ({check}): {ve.reason}",
+            file=sys.stderr,
+        )
+        print(
+            "  Session file was not modified. Fix the structural issue or choose a different prescription.",
+            file=sys.stderr,
+        )
+        sys.exit(5)
+
     final_bytes = sum(b for _, _, b in new_messages)
     final_count = len(new_messages)
 
@@ -580,7 +615,20 @@ def cmd_reload(args):
         pre_te = estimate_session_tokens(messages)
         pre_ratio = calibrate_ratio(messages)
 
-        new_messages, strategy_results = run_prescription(messages, strategy_names, config)
+        try:
+            new_messages, strategy_results = run_prescription(messages, strategy_names, config)
+        except PruneValidationError as ve:
+            check = ve.evidence.get("failed_check", "?")
+            print(
+                f"  Prune validation failed ({check}): {ve.reason}",
+                file=sys.stderr,
+            )
+            print(
+                "  Session file was not modified. Fix the structural issue or choose a different prescription.",
+                file=sys.stderr,
+            )
+            sys.exit(5)
+
         final_bytes = sum(b for _, _, b in new_messages)
         final_count = len(new_messages)
 

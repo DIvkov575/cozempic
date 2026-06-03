@@ -41,8 +41,13 @@ def strategy_compact_summary_collapse(messages: list[Message], config: dict) -> 
     if last_boundary_msg.get("hasPreservedSegment"):
         return _no_op("compact-summary-collapse", total_orig, "Skipped (hasPreservedSegment=True)")
 
-    # Metadata singletons: keep if they only appear before the boundary
-    _META_TYPES = {"last-prompt", "pr-link", "custom-title", "ai-title", "attribution-snapshot"}
+    # Metadata singletons: keep if they only appear before the boundary.
+    # "permission-mode" MUST be here — it carries the dangerouslySkipPermissions
+    # bootstrap state; losing the last occurrence silently breaks session resume.
+    _META_TYPES = {
+        "last-prompt", "pr-link", "custom-title", "ai-title",
+        "attribution-snapshot", "permission-mode",
+    }
     post_meta_types = {msg.get("type") for _, msg, _ in messages[last_boundary_pos:]}
 
     actions: list[PruneAction] = []

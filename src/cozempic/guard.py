@@ -28,6 +28,12 @@ import threading
 import time
 from pathlib import Path
 
+# P0-B: imported at module level so guard_prune_cycle can catch the exception
+# without an inner try/except that masks import errors during testing.
+# safety.py is a new module (this PR); the import is always available once
+# the package is installed from this version onwards.
+from .safety import PruneValidationError
+
 # ── HARD-threshold back-off + exit constants ────────────────────────────────
 # When ``guard_prune_cycle`` keeps returning saved_bytes == 0 at the HARD
 # threshold (because the live conversation is dominated by immutable tool-
@@ -301,17 +307,24 @@ def prune_with_team_protect(
                 if tool_use_id:
                     pending_task_ids.add(tool_use_id)
 
-    # 3. Tag team messages as protected (strategies skip via is_protected())
-    tagged_indices: list[int] = []
-    for _, msg_dict, _ in messages:
-        if _is_team_message(msg_dict, pending_task_ids):
-            msg_dict["__cozempic_team_protected__"] = True
-            tagged_indices.append(id(msg_dict))
+    # 3+4. Tag team messages as protected, then prune. The apply loop is INSIDE
+    # the try so the finally strip covers it unconditionally — including a signal
+    # delivered between the apply and run_prescription (hardening, no disk leak
+    # either way since the list is discarded on exit). Tags are still applied
+    # before run_prescription so strategies see them via is_protected().
+    try:
+        for _, msg_dict, _ in messages:
+            if _is_team_message(msg_dict, pending_task_ids):
+                msg_dict["__cozempic_team_protected__"] = True
 
-    # 4. Prune full list — team messages are protected, no list splitting needed
-    pruned_messages, results = run_prescription(messages, strategy_names, config)
+        pruned_messages, results = run_prescription(messages, strategy_names, config)
+    finally:
+        # 5. Remove tags from the source list (messages) — covers the abort path
+        # where pruned_messages may be partially built or identical to messages.
+        for _, msg_dict, _ in messages:
+            msg_dict.pop("__cozempic_team_protected__", None)
 
-    # 5. Remove tags from surviving messages
+    # 5b. Also strip from pruned_messages (they may be a different list).
     for _, msg_dict, _ in pruned_messages:
         msg_dict.pop("__cozempic_team_protected__", None)
 
@@ -988,10 +1001,28 @@ def guard_prune_cycle(
             pre_te = estimate_session_tokens(messages)
             pre_ratio = calibrate_ratio(messages)
 
-            # Prune with team protection
-            pruned_messages, results, team_state = prune_with_team_protect(
-                messages, rx_name=rx_name, config=config,
-            )
+            # Prune with team protection.
+            # P0-B: catch PruneValidationError from run_prescription inside
+            # prune_with_team_protect. On validation failure: log the failure,
+            # return _no_change immediately. The deferred writer (_write_pruned_after_exit)
+            # is NOT set (it is defined later in this function), so the file stays
+            # untouched and Claude is NOT terminated.
+            try:
+                pruned_messages, results, team_state = prune_with_team_protect(
+                    messages, rx_name=rx_name, config=config,
+                )
+            except PruneValidationError as ve:
+                check = ve.evidence.get("failed_check", "?")
+                print(
+                    f"  [{_now()}] Prune validation failed ({check}): {ve.reason} "
+                    f"— aborting prune, session file unchanged.",
+                    file=sys.stderr,
+                )
+                return {
+                    **_no_change,
+                    "validation_error": ve.reason,
+                    "evidence": ve.evidence,
+                }
 
             # #106 — never rewrite a live session that Claude holds open.
             # The no-reload tiers (SOFT 25%, agents-active HARD) reach here with

@@ -2,9 +2,52 @@
 
 from __future__ import annotations
 
-from .helpers import get_content_blocks, msg_bytes, set_content_blocks
+from .helpers import (
+    _METADATA_SINGLETON_KEY,
+    get_content_blocks,
+    msg_bytes,
+    set_content_blocks,
+)
 from .registry import STRATEGIES
 from .types import Message, PruneAction, StrategyResult
+
+
+# P0-D — last-of-type metadata singleton protection.
+# The LAST occurrence of each of these types is tagged before strategies run
+# so is_protected() skips them. The tag is internal-only and stripped before
+# run_prescription returns — it MUST NOT persist to disk.
+_LAST_OF_TYPE_PROTECTED: frozenset[str] = frozenset({
+    "ai-title",
+    "last-prompt",
+    "permission-mode",
+})
+# Re-export for callers that want to reference the tag name without importing helpers
+_SINGLETON_TAG: str = _METADATA_SINGLETON_KEY
+
+
+def _tag_last_of_metadata_types(messages: list[Message]) -> None:
+    """Mark the LAST occurrence of each protected-singleton type in-place.
+
+    Sets ``msg[_SINGLETON_TAG] = True`` on the last entry per protected type.
+    ``is_protected()`` in helpers.py honors this tag so subsequent strategies
+    skip the entry. ``_strip_metadata_singleton_tags`` MUST be called before
+    returning from ``run_prescription`` to ensure the tag does not leak to disk.
+    """
+    last_pos: dict[str, int] = {}
+    for pos, (_, msg, _) in enumerate(messages):
+        t = msg.get("type", "")
+        if t in _LAST_OF_TYPE_PROTECTED:
+            last_pos[t] = pos
+    for pos in last_pos.values():
+        _, msg, _ = messages[pos]
+        msg[_SINGLETON_TAG] = True
+
+
+def _strip_metadata_singleton_tags(messages: list[Message]) -> None:
+    """Remove the internal singleton tag from every message in-place."""
+    for _, msg, _ in messages:
+        if _SINGLETON_TAG in msg:
+            msg.pop(_SINGLETON_TAG, None)
 
 
 def execute_actions(
@@ -184,37 +227,83 @@ def run_prescription(
     messages: list[Message],
     strategy_names: list[str],
     config: dict,
+    *,
+    floor_config: "FloorConfig | None" = None,
 ) -> tuple[list[Message], list[StrategyResult]]:
     """Run strategies sequentially, each on the result of the previous.
 
     This ensures replacements compose correctly when multiple strategies
-    modify the same message. After all strategies run, a validation pass
-    removes any orphaned tool_result blocks to prevent API 400 errors.
+    modify the same message. After all strategies run, the pipeline is:
+
+      Step 0. (P0-D) Tag last-of-type metadata singletons so strategies that
+              honor is_protected() skip them. Strip runs in finally.
+      Step 1. Run each strategy in order.
+      Step 2. (P0-C) enforce_floor — re-add must-preserve messages.
+              ``floor_config=None`` → resolve via ``load_config().floor``
+              (always-on in production). Pass ``FloorConfig.disabled()`` to
+              opt out (test code only — not reachable from external JSON config,
+              satisfying review finding H-2).
+      Step 3. fix_orphaned_tool_results. Runs AFTER floor so floor re-adds
+              that resurrect tool_result carriers are cleaned before save.
+      Step 4. (P0-B) validate_post_prune — C1-C7 structural checks. Propagates
+              PruneValidationError to caller on failure; caller skips the save.
     """
+    # Lazy imports — safety.py and config.py are new modules introduced by this
+    # PR. Importing at the top level would break all existing callers that import
+    # executor.py before safety.py/config.py are available during partial installs.
+    from .config import FloorConfig, load_config
+    from .safety import enforce_floor, validate_post_prune
+
+    # Step 0 (P0-D): tag last-of-type metadata singletons before strategies run.
+    _tag_last_of_metadata_types(messages)
+
     current = messages
     results: list[StrategyResult] = []
-    for sname in strategy_names:
-        if sname not in STRATEGIES:
-            continue
-        sr = STRATEGIES[sname].func(current, config)
-        results.append(sr)
-        if sr.actions:
-            old_current = current
-            current = execute_actions(current, sr.actions)
-            del old_current  # Free previous list immediately
+    # Wrap from this point in try/finally so the singleton-tag strip ALWAYS runs
+    # even if a downstream step (validation) raises. Without the finally, a
+    # PruneValidationError leaves the caller's input list carrying the internal
+    # __cozempic_metadata_singleton__ flag, which would leak to disk on the next
+    # successful save_messages call (REVIEW-max A.3).
+    try:
+        # Step 1: run strategies
+        for sname in strategy_names:
+            if sname not in STRATEGIES:
+                continue
+            sr = STRATEGIES[sname].func(current, config)
+            results.append(sr)
+            if sr.actions:
+                old_current = current
+                current = execute_actions(current, sr.actions)
+                del old_current  # Free previous list immediately
 
-    # Post-treatment validation: fix orphaned tool_results
-    current, orphans = fix_orphaned_tool_results(current)
-    if orphans > 0:
-        results.append(StrategyResult(
-            strategy_name="orphan-fix",
-            actions=[],
-            original_bytes=0,
-            pruned_bytes=0,
-            messages_affected=orphans,
-            messages_removed=0,
-            messages_replaced=orphans,
-            summary=f"Fixed {orphans} orphaned tool_result block(s)",
-        ))
+        # Step 2 (P0-C): floor preservation — re-add must-preserve messages.
+        cfg_floor = floor_config if floor_config is not None else load_config().floor
+        current = enforce_floor(messages, current, cfg=cfg_floor)
+
+        # Step 3: orphaned tool_result cleanup. Runs AFTER floor so a re-added
+        # user carrying a tool_result whose paired tool_use is still missing
+        # has its orphan block stripped before save.
+        current, orphans = fix_orphaned_tool_results(current)
+        if orphans > 0:
+            results.append(StrategyResult(
+                strategy_name="orphan-fix",
+                actions=[],
+                original_bytes=0,
+                pruned_bytes=0,
+                messages_affected=orphans,
+                messages_removed=0,
+                messages_replaced=orphans,
+                summary=f"Fixed {orphans} orphaned tool_result block(s)",
+            ))
+
+        # Step 4 (P0-B): structural validation. Raises PruneValidationError on failure.
+        validate_post_prune(messages, current)
+
+    finally:
+        # Strip the internal singleton tag from every surviving entry so it
+        # does not leak to the saved JSONL. Also strip from the input msgs_before
+        # list — the tag was applied in place there too (REVIEW-max A.3).
+        _strip_metadata_singleton_tags(current)
+        _strip_metadata_singleton_tags(messages)
 
     return current, results
