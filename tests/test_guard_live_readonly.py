@@ -90,6 +90,72 @@ class TestReadOnlyLiveGuard(unittest.TestCase):
         self.assertFalse(result.get("live_write_skipped"))
         self.assertEqual(len(save_calls), 1, "deferred writer must perform the save")
 
+    def _run_mocked_counting_savings(self, read_only_live, invoke_writer):
+        """Like _run_mocked but also counts record_savings calls and lets the
+        caller choose whether to invoke the deferred writer (simulate persisted
+        vs futile/never-written)."""
+        from cozempic.team import TeamState
+        from cozempic.guard import guard_prune_cycle
+
+        team = MagicMock(spec=TeamState)
+        team.is_empty.return_value = True
+        team.team_name = None
+        team.message_count = 0
+        orig = [(0, {"type": "user"}, 100_000)]
+        pruned = [(0, {"type": "user"}, 40_000)]
+        save_calls = []
+        savings_calls = []
+        # pre-prune total > post-prune total so tokens_saved > 0 (a real saving);
+        # otherwise _record_persisted_savings correctly no-ops on 0 savings.
+        _totals = iter([100_000, 40_000])
+
+        def _est(*a, **k):
+            try:
+                return MagicMock(total=next(_totals))
+            except StopIteration:
+                return MagicMock(total=40_000)
+
+        with patch("cozempic.guard.load_messages", return_value=orig), \
+             patch("cozempic.guard.prune_with_team_protect",
+                   return_value=(pruned, {}, team)), \
+             patch("cozempic.guard.save_messages",
+                   side_effect=lambda *a, **k: save_calls.append(True)), \
+             patch("cozempic.guard.snapshot_session", return_value=MagicMock()), \
+             patch("cozempic.helpers.record_savings",
+                   side_effect=lambda *a, **k: savings_calls.append(a)), \
+             patch("cozempic.tokens.estimate_session_tokens", side_effect=_est), \
+             patch("cozempic.tokens.calibrate_ratio", return_value=0.5):
+            result = guard_prune_cycle(
+                session_path=self.session_path,
+                rx_name="gentle",
+                config=None,
+                auto_reload=False,
+                read_only_live=read_only_live,
+            )
+            writer = result.get("_deferred_writer")
+            if invoke_writer and writer is not None:
+                writer()
+        return result, savings_calls
+
+    def test_savings_not_recorded_when_read_only(self):
+        # read-only cycle never writes -> must NOT increment the prune/tokens counter
+        result, savings_calls = self._run_mocked_counting_savings(
+            read_only_live=True, invoke_writer=True)
+        self.assertEqual(savings_calls, [], "read-only cycle must not record savings")
+
+    def test_savings_not_recorded_when_writer_never_invoked(self):
+        # deferred prune that is never persisted (futile/looping cycle) must NOT
+        # inflate the counter — this is the in-the-wild prune-spike fix.
+        result, savings_calls = self._run_mocked_counting_savings(
+            read_only_live=False, invoke_writer=False)
+        self.assertEqual(savings_calls, [], "un-persisted prune must not record savings")
+
+    def test_savings_recorded_once_when_persisted(self):
+        # deferred prune that IS persisted records savings exactly once.
+        result, savings_calls = self._run_mocked_counting_savings(
+            read_only_live=False, invoke_writer=True)
+        self.assertEqual(len(savings_calls), 1, "persisted prune records savings once")
+
     def test_live_fd_held_guard_refuses_mutation(self):
         """@Snailflyer's exact race (issue #106): hold a LIVE writer fd on the
         JSONL, append a sentinel line through it, then run a no-reload guard

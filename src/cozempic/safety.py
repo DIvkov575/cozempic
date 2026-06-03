@@ -427,6 +427,14 @@ def enforce_floor(
     # ── Step 2: must-preserve candidates ─────────────────────────────────────
     must_preserve: set[str] = set()
 
+    # preserve_first_message pins the first parentUuid=null root. NOTE: with the
+    # default (True) this also satisfies validate_post_prune C2 (which requires an
+    # original root to survive). Setting preserve_first_message=False together with
+    # an aggressive root-dropping prune can therefore produce a result C2 rejects —
+    # an unsupported combination (the guard will defer such prunes). It is left as
+    # a gated knob rather than force-preserving here, because unconditionally
+    # re-adding the original root would undo compact-summary-collapse, which
+    # legitimately drops the pre-boundary root in favor of the compact summary.
     if cfg.preserve_first_message:
         for _, msg, _ in msgs_before:
             if msg.get("parentUuid") is None and msg.get("uuid"):
@@ -436,12 +444,28 @@ def enforce_floor(
     users_in_order = [
         (idx, m) for idx, m, _ in msgs_before if m.get("type") == "user"
     ]
+    # Real conversational user turns exclude tool_result-carrier user messages
+    # (whose content is tool_result blocks, not a user utterance) — used for the
+    # last-K-turns floor so `preserve_last_k_turns=K` preserves K actual turns,
+    # not K tool-result envelopes (the tool pairs are re-added by step-3 closure).
+    def _is_real_user_turn(m: dict) -> bool:
+        c = (m.get("message") or {}).get("content", "")
+        if isinstance(c, str):
+            return True
+        if isinstance(c, list):
+            return any(isinstance(b, dict) and b.get("type") == "text" for b in c)
+        return False
+
+    user_turns_in_order = [
+        (idx, m) for idx, m, _ in msgs_before
+        if m.get("type") == "user" and _is_real_user_turn(m)
+    ]
     asst_in_order = [
         (idx, m) for idx, m, _ in msgs_before if m.get("type") == "assistant"
     ]
 
     last_k = max(0, int(cfg.preserve_last_k_turns))
-    for _, m in (users_in_order[-last_k:] if last_k > 0 else []):
+    for _, m in (user_turns_in_order[-last_k:] if last_k > 0 else []):
         if m.get("uuid"):
             must_preserve.add(m["uuid"])
     for _, m in (asst_in_order[-last_k:] if last_k > 0 else []):

@@ -1116,9 +1116,19 @@ def guard_prune_cycle(
         print(f"  [{_now()}] Prune deferred — conflict detected: {exc}", file=sys.stderr)
         return _no_change
 
-    # Track lifetime savings
+    # Projected savings — recorded to the lifetime tracker + global prune counter
+    # ONLY after the prune is CONFIRMED persisted (see the written-gate in the
+    # reload block below). Recording here (pre-write) inflated the prune/tokens
+    # counters on every deferred or looping cycle that never actually wrote — the
+    # in-the-wild prune-spike signature: a stuck guard re-pruning every interval
+    # bumps the counter each time despite persisting nothing.
     tokens_saved = pre_te.total - post_te.total if pre_te.total and post_te.total else 0
-    if tokens_saved > 0:
+
+    def _record_persisted_savings():
+        """Record savings to the lifetime tracker / global counter. Call ONLY
+        once the prune has actually been written to disk."""
+        if tokens_saved <= 0:
+            return
         from .helpers import record_savings, get_msg_type
         turn_count = sum(1 for _, m, _ in messages
                        if get_msg_type(m) == "user"
@@ -1142,6 +1152,12 @@ def guard_prune_cycle(
                 cleanup_old_backups(session_path, keep=3)
             _write_holder["backup"] = bk
             _write_holder["written"] = True
+            # Record savings ONLY now that the prune is confirmed persisted. This
+            # is the single recording point for BOTH the auto_reload terminate-
+            # first path and the auto_reload=False overflow path (both invoke this
+            # writer post-death), so a deferred/futile/looping cycle that never
+            # writes can never inflate the prune/tokens counters.
+            _record_persisted_savings()
         except (PruneConflictError, PruneLockError) as exc:
             _write_holder["error"] = "conflict"
             print(f"  [{_now()}] Deferred prune write skipped — {exc}", file=sys.stderr)

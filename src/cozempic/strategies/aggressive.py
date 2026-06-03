@@ -184,7 +184,14 @@ def strategy_background_poll_collapse(messages: list[Message], config: dict) -> 
                     break
             if run_end - run_start > 1:
                 for j in range(run_start, run_end - 1):
-                    rm_idx, _, rm_size = messages[j]
+                    rm_idx, rm_msg, rm_size = messages[j]
+                    # Per-message protection re-check (defense-in-depth): run
+                    # extension already excludes protected types by run-type, but
+                    # re-checking keeps this uniform with progress-collapse /
+                    # http-spam so a future change to run semantics can't silently
+                    # drop a protected singleton interior to a run.
+                    if is_protected(rm_msg):
+                        continue
                     actions.append(PruneAction(
                         line_index=rm_idx,
                         action="remove",
@@ -220,7 +227,9 @@ def strategy_background_poll_collapse(messages: list[Message], config: dict) -> 
                         break
                 if run_end - run_start > 2:
                     for j in range(run_start + 1, run_end - 1):
-                        rm_idx, _, rm_size = messages[j]
+                        rm_idx, rm_msg, rm_size = messages[j]
+                        if is_protected(rm_msg):
+                            continue
                         actions.append(PruneAction(
                             line_index=rm_idx,
                             action="remove",
