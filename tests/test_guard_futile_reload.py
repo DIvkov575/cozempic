@@ -91,7 +91,8 @@ class TestMarginalPruneSkipsReload(unittest.TestCase):
 
         from cozempic.guard import guard_prune_cycle
 
-        with patch("cozempic.guard.load_messages", return_value=fake_messages_orig), \
+        with patch("cozempic.guard._guard_tmp_root", return_value=self.tmpdir), \
+             patch("cozempic.guard.load_messages", return_value=fake_messages_orig), \
              patch("cozempic.guard.prune_with_team_protect",
                    return_value=(fake_messages_pruned, {}, fake_team_state)), \
              patch("cozempic.guard.save_messages", return_value=None), \
@@ -164,7 +165,8 @@ class TestSubstantialPruneProceedsWithReload(unittest.TestCase):
 
         from cozempic.guard import guard_prune_cycle
 
-        with patch("cozempic.guard.load_messages", return_value=fake_messages_orig), \
+        with patch("cozempic.guard._guard_tmp_root", return_value=self.tmpdir), \
+             patch("cozempic.guard.load_messages", return_value=fake_messages_orig), \
              patch("cozempic.guard.prune_with_team_protect",
                    return_value=(fake_messages_pruned, {}, fake_team_state)), \
              patch("cozempic.guard.save_messages", return_value=None), \
@@ -172,7 +174,7 @@ class TestSubstantialPruneProceedsWithReload(unittest.TestCase):
              patch("cozempic.guard._terminate_and_resume",
                    side_effect=lambda *a, **kw: terminate_called.append(True)), \
              patch("cozempic.tokens.estimate_session_tokens",
-                   return_value=MagicMock(total=50000)), \
+                   side_effect=lambda msgs, *a, **k: MagicMock(total=sum(b for _, _, b in msgs) // 2)), \
              patch("cozempic.tokens.calibrate_ratio", return_value=0.5):
 
             result = guard_prune_cycle(
@@ -185,7 +187,7 @@ class TestSubstantialPruneProceedsWithReload(unittest.TestCase):
                 claude_pid=89113,
             )
 
-        # With 15% savings, normal reload path. reloading=True means
+        # With 15% savings (bytes AND tokens drop ~15%), normal reload path. reloading=True means
         # _terminate_and_resume was called (which sets reloading via guard loop).
         # The function itself returns reloading=True after calling _terminate_and_resume.
         self.assertFalse(
@@ -247,6 +249,7 @@ class TestMinPruneRatioEnvVarOverride(unittest.TestCase):
 
         with patch.dict(os.environ, {"COZEMPIC_MIN_PRUNE_RATIO": "0.05"}), \
              patch.object(guard_mod, "_MIN_PRUNE_RATIO", 0.05), \
+             patch("cozempic.guard._guard_tmp_root", return_value=self.tmpdir), \
              patch("cozempic.guard.load_messages", return_value=fake_messages_orig), \
              patch("cozempic.guard.prune_with_team_protect",
                    return_value=(fake_messages_pruned, {}, fake_team_state)), \
@@ -255,7 +258,7 @@ class TestMinPruneRatioEnvVarOverride(unittest.TestCase):
              patch("cozempic.guard._terminate_and_resume",
                    side_effect=lambda *a, **kw: terminate_called.append(True)), \
              patch("cozempic.tokens.estimate_session_tokens",
-                   return_value=MagicMock(total=50000)), \
+                   side_effect=lambda msgs, *a, **k: MagicMock(total=sum(b for _, _, b in msgs) // 2)), \
              patch("cozempic.tokens.calibrate_ratio", return_value=0.5):
 
             result = guard_prune_cycle(
@@ -497,7 +500,8 @@ class TestFutileReloadWritesTeamCheckpoint(unittest.TestCase):
 
         from cozempic.guard import guard_prune_cycle
 
-        with patch("cozempic.guard.load_messages", return_value=fake_messages_orig), \
+        with patch("cozempic.guard._guard_tmp_root", return_value=self.tmpdir), \
+             patch("cozempic.guard.load_messages", return_value=fake_messages_orig), \
              patch("cozempic.guard.prune_with_team_protect",
                    return_value=(fake_messages_pruned, {}, fake_team_state)), \
              patch("cozempic.guard.save_messages", return_value=None), \

@@ -1098,6 +1098,59 @@ def guard_prune_cycle(
             # Token estimate after pruning — pass pre-calibrated ratio
             post_te = estimate_session_tokens(pruned_messages, pre_calibrated_ratio=pre_ratio)
 
+            # Post-prune TOKEN-PROGRESS gate (the confirmed-write reload-loop fix).
+            # The byte gate above (saved_bytes < 10% of original) catches a prune
+            # that freed little DATA, but a prune can free >10% of *bytes* while
+            # barely reducing *tokens* (low-token-density content: progress ticks,
+            # whitespace, repeated boilerplate). Reloading then resumes a session
+            # whose token count is essentially unchanged, which immediately
+            # re-triggers HARD — and because a successful reload makes the daemon
+            # exit (a fresh guard respawns with the in-process breaker reborn at 0),
+            # this loops one CONFIRMED prune+counter-ping per cycle, invisible to
+            # the per-process circuit breaker. If the prune did not reduce TOKENS
+            # by at least _MIN_PRUNE_RATIO, treat the reload as futile: skip it
+            # (read-only, #106) and advance the breaker so the daemon backs off and
+            # exits. Gating on PROGRESS (not an absolute token floor) deliberately
+            # ALLOWS a prune that frees real headroom to reload even if it lands
+            # just above the trigger band — that converges over a cycle or two, and
+            # the disk reload-rate ledger below bounds any residual regrow loop.
+            # NB: gate on pre_te.total only — a maximal prune to post_te.total==0
+            # is FULL progress (pre - 0), not zero; `and post_te.total` would
+            # wrongly read it as 0 progress and skip the reload.
+            _tokens_saved_now = (
+                pre_te.total - post_te.total if pre_te.total else 0
+            )
+            if (
+                auto_reload
+                and pre_te.total
+                and _tokens_saved_now < pre_te.total * _MIN_PRUNE_RATIO
+            ):
+                checkpoint_path = None
+                if not team_state.is_empty():
+                    project_dir = session_path.parent
+                    checkpoint_path = write_team_checkpoint(team_state, project_dir)
+                print(
+                    f"  [{_now()}] Reload skipped — prune reduced tokens by only "
+                    f"{_tokens_saved_now:,} (<{int(_MIN_PRUNE_RATIO * 100)}% of "
+                    f"{pre_te.total:,}); a reload would re-trigger HARD immediately "
+                    f"(futile).",
+                    file=sys.stderr,
+                )
+                return {
+                    "saved_mb": 0.0,  # nothing persisted — live write skipped (#106)
+                    "would_free_mb": saved_bytes / 1024 / 1024,
+                    "original_bytes": original_bytes,
+                    "original_tokens": pre_te.total,
+                    "final_tokens": post_te.total,
+                    "team_name": team_state.team_name or None,
+                    "team_messages": team_state.message_count,
+                    "checkpoint_path": str(checkpoint_path) if checkpoint_path else None,
+                    "backup_path": None,
+                    "reloading": False,
+                    "futile_reload_skipped": True,
+                    "token_progress_insufficient": True,
+                }
+
             # Write checkpoint if team exists
             checkpoint_path = None
             if not team_state.is_empty():
@@ -1189,6 +1242,28 @@ def guard_prune_cycle(
     if auto_reload:
         reload_pid = claude_pid if claude_pid is not None else find_claude_pid()
         if reload_pid:
+            # Cross-respawn reload-rate cap: if this session has already reloaded
+            # too many times within the window, stop auto-reloading it. A session
+            # that re-bloats to threshold immediately after each prune would
+            # otherwise churn kill→resume→re-bloat forever (one confirmed prune+
+            # ping per cycle), invisible to the per-process breaker which is reborn
+            # at 0 on every respawn. The ledger is on disk so it survives respawn.
+            _ledger = _reload_ledger_path(session_id, session_path)
+            _capped, _n = _reload_rate_exceeded(_ledger)
+            if _capped:
+                print(
+                    f"  [{_now()}] Reload rate cap hit ({_n} reloads in "
+                    f"{_reload_ledger_window_s() // 60}min) — this session is "
+                    f"regrowing to the threshold immediately after each prune. "
+                    f"Stopping auto-reload to avoid a kill→resume→re-bloat loop. "
+                    f"Consider /clear or splitting the work into a fresh session.",
+                    file=sys.stderr,
+                )
+                result["saved_mb"] = 0.0
+                result["live_write_skipped"] = True
+                result["reload_rate_capped"] = True
+                result["futile_reload_skipped"] = True  # account to breaker → exit
+                return result
             from .reload_lock import (
                 _ReloadLock, ReloadLockHeld,
                 INIT_GUARD_HARD1, INIT_GUARD_HARD2,
@@ -1803,6 +1878,66 @@ def _guard_tmp_root() -> Path:
     if os.name == "nt":
         return Path(tempfile.gettempdir())
     return Path("/tmp")
+
+
+# ── Cross-respawn reload-rate ledger (regrow-loop / reload-storm backstop) ────
+# A confirmed prune that frees real bytes but leaves the session destined to
+# re-hit the HARD threshold reloads, exits the daemon, and a fresh guard
+# respawns with the in-process circuit breaker reborn at 0 — so a session that
+# keeps re-bloating reloads indefinitely, one confirmed prune+ping per cycle,
+# invisible to the per-process breaker. This DISK-backed ledger survives the
+# respawn: if a session reloads too many times within a window, the guard stops
+# auto-reloading it (and accounts it to the breaker so the daemon exits) rather
+# than churning kill→resume→re-bloat forever. Window/cap are env-overridable.
+def _reload_ledger_window_s() -> int:
+    try:
+        return max(60, int(os.environ.get("COZEMPIC_RELOAD_WINDOW_S", "600")))
+    except Exception:
+        return 600
+
+
+def _reload_ledger_max() -> int:
+    try:
+        return max(1, int(os.environ.get("COZEMPIC_RELOAD_MAX", "3")))
+    except Exception:
+        return 3
+
+
+def _reload_ledger_path(session_id: str | None, session_path: Path) -> Path:
+    raw = (session_id or session_path.stem or "session")
+    slug = re.sub(r"[^a-z0-9_-]", "_", raw.lower())[:12] or "session"
+    return _guard_tmp_root() / f"cozempic_reload_{slug}.history"
+
+
+def _reload_rate_exceeded(ledger_path: Path, now: float | None = None) -> tuple[bool, int]:
+    """Return (exceeded, count_in_window) for the per-session reload ledger.
+
+    Prunes entries older than the window. If the in-window count has reached the
+    cap, returns (True, count) WITHOUT recording — the caller must skip the
+    reload. Otherwise records ``now`` and returns (False, count_after_record).
+    Best-effort: any IO/JSON error degrades to (False, 0) so the ledger can
+    never block a legitimate reload on a transient error.
+    """
+    import time as _time
+    import json as _json
+    if now is None:
+        now = _time.time()
+    window = _reload_ledger_window_s()
+    try:
+        hist = _json.loads(ledger_path.read_text()) if ledger_path.exists() else []
+        if not isinstance(hist, list):
+            hist = []
+    except Exception:
+        hist = []
+    hist = [t for t in hist if isinstance(t, (int, float)) and 0 <= now - t < window]
+    if len(hist) >= _reload_ledger_max():
+        return True, len(hist)
+    hist.append(now)
+    try:
+        ledger_path.write_text(_json.dumps(hist[-50:]))
+    except Exception:
+        pass
+    return False, len(hist)
 
 
 def _pid_file_for_session(session_id: str) -> Path:

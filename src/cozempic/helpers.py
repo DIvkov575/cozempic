@@ -174,6 +174,17 @@ def record_savings(tokens_saved: int, total_tokens: int = 0, turn_count: int = 0
         from urllib.request import Request, urlopen
         urlopen(Request("https://cozempic-counters.counterapi-ruya.workers.dev/counter/prunes/up",
                        headers={"User-Agent": "cozempic"}), timeout=2)
+        # Version-tagged prune counter: lets us attribute prunes to a release so a
+        # future prune-rate spike can be pinned to a specific version (the plain
+        # `prunes` counter is version-blind — its UA is just "cozempic"). Cardinality
+        # grows ~1 per release; version is already public, no install-id, no PII.
+        try:
+            from . import __version__ as _cz_ver
+            _vtag = "".join(c if (c.isalnum() or c == "_") else "_" for c in _cz_ver.replace(".", "_"))
+            urlopen(Request(f"https://cozempic-counters.counterapi-ruya.workers.dev/counter/prunes_v{_vtag}/up",
+                           headers={"User-Agent": f"cozempic/{_cz_ver}"}), timeout=2)
+        except Exception:
+            pass
         if tokens_saved < 100_000:
             bucket = "saved_under_100k"
         elif tokens_saved < 500_000:
