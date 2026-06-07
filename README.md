@@ -16,12 +16,16 @@ Cozempic removes it with **18 composable strategies** across 3 prescription tier
 
 - **18 pruning strategies** — gentle (5), standard (11), aggressive (18)
 - **Guard daemon** — auto-starts via SessionStart hook, monitors and prunes continuously
+- **Interactive "prune now?" nudge** — a non-blocking heads-up at 25% / 55% / 80% context (once per tier) recommending `cozempic reload`, so interactive users get cozempic's higher-fidelity prune+resume on their own terms instead of falling back to lossy autocompact. Takes no action on its own; silence with `COZEMPIC_NUDGE_OFF=1`
+- **Interactive-safe reload** — in interactive sessions the guard warns first and reloads only at an idle breakpoint (never mid-turn); headless sessions reload as before
+- **Safe-point protection** — the guard never terminates-and-resumes through in-flight work: a running Workflow, a background subagent, an agent team, or an open tool call defers the reload so nothing is lost
 - **compact-summary-collapse** — 85-95% savings by removing pre-compaction messages already in the summary
 - **Agent Teams protection** — checkpoints team state through compaction, reactive overflow recovery
 - **Behavioral digest** — extracts your corrections ("don't do X"), persists them to Claude Code's memory system so they survive compaction
 - **13 doctor checks** — diagnose and auto-fix session corruption, orphaned tool results, zombie teams
 - **Token-aware diagnostics** — exact token counts from `usage` fields, cache hit rate, context % bar
 - **Auto-detects 1M context** — correct thresholds for both 200K and 1M models
+- **Efficient idle polling** — backs off the poll cadence when the session is quiet and skips redundant no-op checkpoints
 - **Auto-updates** — checks PyPI daily, upgrades in-place
 
 **Zero external dependencies.** Python 3.10+ stdlib only.
@@ -135,9 +139,13 @@ cozempic guard --daemon
 | Tier | Threshold | Action | Reload? |
 |------|-----------|--------|---------|
 | Soft | 25% | gentle file cleanup | No |
-| Hard | 55% | standard prune | Yes (deferred if agents active) |
-| Emergency | 80% | aggressive prune | Yes (forced) |
+| Hard | 55% | standard prune | Yes (interactive: at a breakpoint; deferred if agents active) |
+| Hard2 | 80% | aggressive prune | Yes (gated by the safe-point check) |
 | User | 90% | manual aggressive | Yes |
+
+**Interactive sessions** — instead of a surprise reload mid-work, the guard surfaces a [nudge](#key-features) and reloads only once you pause between turns, after warning you. Near the wall (≈88%) it reloads even mid-turn — a higher-fidelity prune beats hitting autocompact. Detection is automatic (`COZEMPIC_INTERACTIVE=auto`); `on`/`off` force it. Headless/CI sessions reload immediately as before.
+
+**Safe-point reload** — a reload terminates and resumes the Claude process, so the guard validates first: if a Workflow, a background subagent, an agent team, or an open tool call is in flight, the reload defers (read-only checkpoint) rather than destroying that work. Tune the near-wall force point with `COZEMPIC_FORCE_RELOAD_PCT` (default `0.88`).
 
 **Reactive overflow recovery** — kqueue/polling file watcher detects inbox-flood overflow within milliseconds, auto-prunes with escalating prescriptions, circuit breaker prevents loops.
 
@@ -258,6 +266,14 @@ After `cozempic init`, these hooks are wired automatically:
 ```
 
 ## Changelog
+
+### v1.8.22
+
+- **Interactive "prune now?" nudge** — non-blocking heads-up at 25% / 55% / 80% context (once per tier, with hysteresis so it never nags), recommending `cozempic reload`. Brings cozempic's higher-fidelity prune+resume to interactive sessions without surprise reloads. Tunable via `COZEMPIC_NUDGE_PCTS`; silence with `COZEMPIC_NUDGE_OFF=1`
+- **Interactive-safe reload** — warns first, then reloads only at an idle breakpoint (never mid-turn); near the wall (`COZEMPIC_FORCE_RELOAD_PCT`, default 88%) it reloads even mid-turn. Headless/CI behaviour unchanged
+- **Safe-point protection** — the guard never terminates-and-resumes through a running Workflow, background subagent, agent team, or open tool call; the reload defers instead so in-flight work is preserved
+- **Interactivity detection** — `COZEMPIC_INTERACTIVE=auto|on|off`
+- **Efficient idle polling** — exponential poll back-off when the session is quiet (`COZEMPIC_IDLE_BACKOFF_CYCLES`) and skips redundant no-op SOFT checkpoints
 
 ### v1.7.1
 
