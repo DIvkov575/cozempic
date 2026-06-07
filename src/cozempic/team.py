@@ -636,6 +636,14 @@ def extract_team_state(messages: list[Message]) -> TeamState:
                     result_summary=result[:300],
                 )
 
+            # Propagate the terminal status to the TEAMMATE of the same agent_id.
+            # Without this, TeamCreate/SendMessage left teammate.status stuck at
+            # "running" forever (nothing transitioned it), so the safe-point reload
+            # gate could never recognize a finished team as quiesced — every
+            # agent-team session (the guard's primary use case) would never reload.
+            if task_id in seen_teammates:
+                seen_teammates[task_id].status = status
+
             state.message_count += 1
 
     state.teammates = list(seen_teammates.values())

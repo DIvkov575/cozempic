@@ -2148,6 +2148,11 @@ _INFLIGHT_DONE = {"completed", "complete", "failed", "cancelled", "canceled",
 # "unknown" (conservative: a subagent we can't classify is treated as live).
 _SUBAGENT_ACTIVE = {"running", "unknown", "active", "in_progress", "working",
                     "queued", "pending", "started", "launched"}
+# Teammate statuses that mean "actively working" → block a reload. Narrower than
+# _SUBAGENT_ACTIVE: it EXCLUDES "unknown" and config-only states so a benign/idle
+# membership marker can't wedge the gate forever (teammate status is propagated
+# from completions but, unlike subagents, may legitimately sit at "unknown").
+_TEAMMATE_ACTIVE = {"running", "active", "in_progress", "working", "sending"}
 
 
 def _msg_dict(item) -> dict:
@@ -2279,6 +2284,18 @@ def safe_to_reload(team_state, messages, session_path) -> tuple[bool, str]:
             if any((s.status or "").strip().lower() in _SUBAGENT_ACTIVE
                    for s in (team_state.subagents or [])):
                 return (False, "subagent mid-execution")
+            # Teammate block: ONLY genuinely-active states (not the old "anything
+            # not done" allowlist, which wedged forever because nothing cleared
+            # 'running'). extract_team_state now propagates task-notification
+            # completions to teammates, so a finished team reads terminal here. A
+            # teammate that is actively working (and has no subagent entry yet,
+            # in the SendMessage→completion window) is caught HERE, closing the
+            # destroy-active-teammate gap; if its completion never arrives it stays
+            # 'running' and we keep deferring — safe, and PreCompact/PostCompact
+            # re-injects the team checkpoint if the autocompact wall is hit.
+            if any((t.status or "").strip().lower() in _TEAMMATE_ACTIVE
+                   for t in (team_state.teammates or [])):
+                return (False, "teammate mid-execution")
             active_tasks, _, _ = team_state._task_groups()
             if active_tasks:
                 return (False, "active task in flight")

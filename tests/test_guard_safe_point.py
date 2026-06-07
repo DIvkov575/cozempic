@@ -165,20 +165,47 @@ class TestSafeToReload(unittest.TestCase):
         self.assertFalse(safe)
         self.assertIn("subagent", reason)
 
-    def test_team_with_completed_subagents_but_running_teammate_is_safe(self):
-        # P0 regression: TeamCreate leaves teammate.status="running" forever (never
-        # transitioned to terminal). The gate must NOT wedge on that — a finished
-        # team (subagents completed, no active tasks) must be allowed to reload,
-        # which is the guard's whole purpose for agent teams.
+    def test_finished_team_is_safe(self):
+        # P0-2 regression: a FINISHED team must be allowed to reload (the guard's
+        # whole purpose for teams). After extract_team_state propagates completions,
+        # teammates read terminal — so the gate is SAFE.
         from cozempic.guard import safe_to_reload
         from cozempic.team import TeamState, SubagentInfo, TeammateInfo
         st = TeamState(team_name="t",
                        subagents=[SubagentInfo("a1", "d", status="completed"),
                                   SubagentInfo("a2", "d", status="completed")],
-                       teammates=[TeammateInfo("a1", "alice", status="running"),
-                                  TeammateInfo("a2", "bob", status="running")])
+                       teammates=[TeammateInfo("a1", "alice", status="completed"),
+                                  TeammateInfo("a2", "bob", status="completed")])
         safe, _ = safe_to_reload(st, [], None)
-        self.assertTrue(safe, "finished team must reload despite stuck teammate.status")
+        self.assertTrue(safe, "finished team must be allowed to reload")
+
+    def test_active_teammate_unsafe(self):
+        # The destroy-active-teammate window: a teammate working in the
+        # SendMessage→completion gap has no subagent entry yet, only a 'running'
+        # teammate entry. The gate must block on it (don't SIGKILL active work).
+        from cozempic.guard import safe_to_reload
+        from cozempic.team import TeamState, TeammateInfo
+        st = TeamState(team_name="t", teammates=[TeammateInfo("a1", "alice", status="running")])
+        safe, reason = safe_to_reload(st, [], None)
+        self.assertFalse(safe)
+        self.assertIn("teammate", reason)
+
+    def test_extract_propagates_completion_to_teammate(self):
+        # The root-cause fix: a task-notification completion must transition the
+        # matching TEAMMATE (not just the subagent) to terminal.
+        from cozempic.team import extract_team_state
+        msgs = [
+            (0, {"message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "u1", "name": "TeamCreate",
+                 "input": {"team_name": "t", "teammates": [{"agent_id": "alice", "name": "Alice"}]}}]}}, 100),
+            (0, {"type": "queue-operation",
+                 "content": "<task-notification><task-id>alice</task-id><status>completed</status>"
+                            "<summary>done</summary><result>r</result></task-notification>"}, 100),
+        ]
+        st = extract_team_state(msgs)
+        mate = next((t for t in st.teammates if t.agent_id == "alice"), None)
+        self.assertIsNotNone(mate)
+        self.assertEqual(mate.status, "completed", "completion must propagate to teammate")
 
 
 class TestGuardCycleGate(unittest.TestCase):
