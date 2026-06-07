@@ -177,6 +177,19 @@ class TestArmNudgeFromResult(unittest.TestCase):
         self.assertTrue(armed["warned"])
         self.assertIn("armed_at", armed)
 
+    def test_warned_is_sticky_across_rearm(self):
+        # P0 regression: the nudge upserts warned (tier 0), then the daemon re-arms
+        # at tier 80 — warned MUST stay True (escalating the tier or re-arming must
+        # not un-warn the user, or the reload waits on the blind grace timer / wedges).
+        from cozempic import guard
+        with patch("cozempic.guard._guard_tmp_root", return_value=self.scratch):
+            guard.mark_armed_warned("sticky1", None)         # nudge warns first (tier 0)
+            self.assertTrue(guard.read_armed("sticky1", None)["warned"])
+            guard.write_armed("sticky1", None, 80, 30.0)      # daemon re-arms at 80
+            a = guard.read_armed("sticky1", None)
+        self.assertTrue(a["warned"], "warned must survive a re-arm at a different tier")
+        self.assertEqual(a["tier"], 80)
+
 
 if __name__ == "__main__":
     unittest.main()

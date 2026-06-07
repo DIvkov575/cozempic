@@ -476,7 +476,7 @@ def get_session_nudge_tiers(session_id: str) -> "list | None":
     if not session_id:
         return None
     rec = _load_sidecar().get(session_id)
-    tiers = rec.get("nudge_tiers") if rec else None
+    tiers = rec.get("nudge_tiers") if isinstance(rec, dict) else None
     if isinstance(tiers, (list, tuple)) and tiers:
         try:
             vals = sorted(float(t) for t in tiers if 0.0 < float(t) <= 1.0)
@@ -491,7 +491,7 @@ def get_session_cwd(session_id: str) -> str | None:
     if not session_id:
         return None
     rec = _load_sidecar().get(session_id)
-    return rec.get("cwd") if rec else None
+    return rec.get("cwd") if isinstance(rec, dict) else None
 
 
 def get_session_context_window(session_id: str) -> int | None:
@@ -499,7 +499,7 @@ def get_session_context_window(session_id: str) -> int | None:
     if not session_id:
         return None
     rec = _load_sidecar().get(session_id)
-    return rec.get("context_window") if rec else None
+    return rec.get("context_window") if isinstance(rec, dict) else None
 
 
 # ─── JSONL I/O ────────────────────────────────────────────────────────────────

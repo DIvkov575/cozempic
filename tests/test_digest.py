@@ -20,6 +20,7 @@ from cozempic.digest import (
     DigestStore,
     _find_duplicate,
     _get_memdir,
+    _project_dir_exists,
     _to_prohibition,
     admit_rule,
     build_injection_text,
@@ -2987,11 +2988,10 @@ class TestGetMemdirUnderscoreProject(unittest.TestCase):
         self.assertEqual(result, mem_dir)
 
 
-class TestMemdirCreateFirstRun(unittest.TestCase):
-    """1.8.22: on a brand-new project Claude Code creates memory/ lazily, so the
-    first SessionStart sync found nothing. sync_to_memdir now CREATES memory/ under
-    an existing project dir (proving the slug is right) but never fabricates the
-    project dir (slug-mismatch safety)."""
+class TestMemdirIsReadOnly(unittest.TestCase):
+    """1.8.22: cozempic does NOT create the memory dir — Claude Code owns it. A
+    brand-new folder is not proactively populated with the (global) digest; sync
+    waits until Claude Code's memory dir exists. (Reverted an earlier eager-create.)"""
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
@@ -3004,27 +3004,14 @@ class TestMemdirCreateFirstRun(unittest.TestCase):
         import shutil
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_create_false_is_noncreating(self):
+    def test_get_memdir_does_not_create(self):
         self.proj.mkdir(parents=True)  # project dir exists, memory/ absent
         with patch.dict("os.environ", {"CLAUDE_CONFIG_DIR": str(self.config)}):
-            self.assertIsNone(_get_memdir(self.cwd))                 # default: no create
-            self.assertFalse((self.proj / "memory").exists())
+            self.assertIsNone(_get_memdir(self.cwd))
+            self.assertFalse((self.proj / "memory").exists(), "must NOT create memory/")
 
-    def test_create_true_makes_memdir_under_existing_project(self):
-        self.proj.mkdir(parents=True)
-        with patch.dict("os.environ", {"CLAUDE_CONFIG_DIR": str(self.config)}):
-            md = _get_memdir(self.cwd, create=True)
-        self.assertIsNotNone(md)
-        self.assertTrue(md.exists() and md.name == "memory")
-
-    def test_create_true_does_not_fabricate_project_dir(self):
-        # project dir does NOT exist → must not create anything under a guessed slug
-        with patch.dict("os.environ", {"CLAUDE_CONFIG_DIR": str(self.config)}):
-            self.assertIsNone(_get_memdir(self.cwd, create=True))
-        self.assertFalse(self.proj.exists())
-
-    def test_sync_creates_memdir_and_writes_on_first_run(self):
-        self.proj.mkdir(parents=True)  # project exists (transcript), memory/ does not
+    def test_sync_does_not_create_memdir(self):
+        self.proj.mkdir(parents=True)  # project exists, memory/ does not
         store = DigestStore(project=self.cwd)
         store.strategy_rules.append(DigestRule(
             id="R001", rule="Always run tests before commit", priority="hard",
@@ -3033,22 +3020,29 @@ class TestMemdirCreateFirstRun(unittest.TestCase):
         ))
         with patch.dict("os.environ", {"CLAUDE_CONFIG_DIR": str(self.config)}):
             n = sync_to_memdir(store, cwd=self.cwd)
-        self.assertGreater(n, 0)
-        self.assertTrue((self.proj / "memory" / "cozempic_digest.md").exists())
+        self.assertEqual(n, 0, "no sync until Claude Code creates memory/")
+        self.assertFalse((self.proj / "memory").exists(), "must NOT create memory/")
+
+    def test_project_dir_exists_helper(self):
+        with patch.dict("os.environ", {"CLAUDE_CONFIG_DIR": str(self.config)}):
+            self.assertFalse(_project_dir_exists(self.cwd))
+            self.proj.mkdir(parents=True)
+            self.assertTrue(_project_dir_exists(self.cwd))
 
 
 class TestDigestInjectMessage(unittest.TestCase):
-    """1.8.22: the `inject` CLI message must distinguish a genuinely-missing memory
-    dir from 'no active rules to sync' — the old code printed 'Could not find Claude
-    Code memory directory' for both (overloaded → misleading on first run)."""
+    """1.8.22: the `inject` message must distinguish 'no ACTIVE rules' (rules need 2
+    occurrences) from 'Claude Code hasn't made the memory dir yet' — the old code
+    printed 'Could not find Claude Code memory directory' for every synced==0 case."""
 
-    def _run(self, memdir, synced):
+    def _run(self, memdir, synced, active):
         from unittest.mock import MagicMock as _MM
         from types import SimpleNamespace
         import io
         from cozempic.cli import cmd_digest
         store = _MM()
         store.is_empty.return_value = False
+        store.active_rules.return_value = active
         buf = io.StringIO()
         with patch("cozempic.digest.load_digest_store", return_value=store), \
              patch("cozempic.digest.sync_to_memdir", return_value=synced), \
@@ -3058,16 +3052,19 @@ class TestDigestInjectMessage(unittest.TestCase):
             cmd_digest(SimpleNamespace(digest_action="inject", cwd="/x"))
         return buf.getvalue()
 
-    def test_dir_missing_says_not_found_yet(self):
-        out = self._run(None, 0)
-        self.assertIn("not found yet", out)
+    def test_no_active_rules(self):
+        # synced==0 with no active rules → accurate, regardless of dir state
+        out = self._run(None, 0, [])
+        self.assertIn("No active rules", out)
+        self.assertNotIn("not created", out)
+
+    def test_active_rules_but_no_memdir(self):
+        # active rules present but memory dir absent → "not created yet", NOT
+        # the old "No active rules" / "Could not find" mislabel
+        out = self._run(None, 0, ["rule"])
+        self.assertIn("not created", out)
         self.assertNotIn("No active rules", out)
 
-    def test_dir_exists_no_active_rules(self):
-        out = self._run(Path("/x/memory"), 0)
-        self.assertIn("No active rules", out)
-        self.assertNotIn("Could not find", out)
-
     def test_synced_count(self):
-        out = self._run(Path("/x/memory"), 3)
+        out = self._run(Path("/x/memory"), 3, ["rule"])
         self.assertIn("Synced 3", out)

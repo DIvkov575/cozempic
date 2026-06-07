@@ -853,7 +853,10 @@ def start_guard(
                     if _warned or _grace_ok:
                         defer_for_turn = False                 # warned/waited → reload
                     else:
-                        if not _armed:                          # arm so the nudge can warn
+                        # Arm (so the nudge can warn) when unarmed OR when an
+                        # existing sentinel lacks the grace clock — backfilling
+                        # armed_at so a corrupt/old sentinel can't wedge forever.
+                        if not _armed or _at is None:
                             _arm_tier = 80 if (hard2_threshold_tokens and current_tokens
                                                and current_tokens >= hard2_threshold_tokens) else 55
                             write_armed(sess["session_id"], session_path, _arm_tier, 0.0)
@@ -2275,6 +2278,24 @@ def _block_text(b: dict) -> str:
     return "\n".join(parts)
 
 
+def _completion_text(msg: dict) -> str:
+    """Text from a message's GENUINE harness-delivery surfaces only — the root
+    `content` string (queue-operation notifications, verified to be where real
+    task-notifications land) and a user message's top-level string content. It
+    deliberately EXCLUDES tool_result blocks and assistant text blocks, so a
+    <task-notification> merely quoted/echoed inside some tool's output or the
+    model's prose cannot CLEAR a genuinely in-flight launch (a false-negative →
+    SIGKILL). Mirror of the launch side's tool-type correlation."""
+    parts = []
+    root = msg.get("content")
+    if isinstance(root, str):
+        parts.append(root)
+    c = (msg.get("message") or {}).get("content")
+    if isinstance(c, str):
+        parts.append(c)
+    return "\n".join(parts)
+
+
 # Which tool a launch marker must be paired with to count as a REAL launch (vs a
 # marker-shaped string merely quoted/echoed inside some other tool's output, or
 # written as prose). Keyed by marker kind.
@@ -2311,7 +2332,7 @@ def detect_in_flight(messages) -> dict:
         msg = _msg_dict(item)
         if not msg:
             continue
-        text = _msg_text(msg)
+        text = _completion_text(msg)   # genuine deliveries only (not quoted/echoed)
         if text:
             for blk in _TN_BLOCK_RE.findall(text):
                 ids = _TN_ID_RE.findall(blk)
@@ -2341,7 +2362,10 @@ def detect_in_flight(messages) -> dict:
 
     def _ok(tid, names):
         nm = use_name.get(tid)
-        return nm is None or nm in names  # unknown (pruned) → conservative credit
+        # unknown (pruned tool_use) → conservative credit; match the tool name
+        # case-insensitively so a harness casing drift ("workflow" vs "Workflow")
+        # can't strand a real launch into a missed-launch SIGKILL.
+        return nm is None or nm.strip().lower() in {x.lower() for x in names}
 
     for tid, rtext in results:
         if not rtext:
@@ -2453,20 +2477,31 @@ def read_armed(session_id: str | None, session_path: Path | None = None) -> dict
         return None
 
 
-def write_armed(session_id, session_path, tier: int, projected_pct: float) -> None:
+def _write_armed_atomic(path: Path, data: dict) -> None:
+    """Atomically write the armed sentinel (temp + os.replace) so the daemon and
+    the nudge process — which both write it — can't tear each other's writes."""
     import json as _json
+    tmp = path.with_suffix(path.suffix + f".tmp{os.getpid()}")
+    tmp.write_text(_json.dumps(data))
+    os.replace(tmp, path)
+
+
+def write_armed(session_id, session_path, tier: int, projected_pct: float) -> None:
     import time as _time
     try:
         p = _reload_armed_path(session_id, session_path)
         existing = read_armed(session_id, session_path) or {}
-        # Preserve warned across a re-arm of the SAME tier; preserve the grace
-        # clock (armed_at) so re-arming never resets the warned-before-reload
-        # timeout; keep a known projection if this call has none.
-        warned = bool(existing.get("warned")) and existing.get("tier") == tier
+        # `warned` is STICKY: once the user has been warned of a queued reload it
+        # stays warned until the reload consumes the sentinel (clear_armed) —
+        # escalating the tier (55→80) or the daemon re-arming must NOT un-warn
+        # them (the bug: a tier-0 upsert from the nudge + a tier-80 re-arm dropped
+        # warned). Preserve the grace clock (armed_at) so re-arming never resets
+        # the warned-before-reload timeout; keep a known projection if none given.
+        warned = bool(existing.get("warned"))
         armed_at = existing.get("armed_at") or _time.time()
         proj = round(projected_pct, 1) if projected_pct else existing.get("projected_pct", 0.0)
-        p.write_text(_json.dumps({"tier": tier, "projected_pct": proj,
-                                  "warned": warned, "armed_at": armed_at}))
+        _write_armed_atomic(p, {"tier": tier, "projected_pct": proj,
+                                "warned": warned, "armed_at": armed_at})
     except Exception:
         pass
 
@@ -2475,7 +2510,6 @@ def mark_armed_warned(session_id, session_path: Path | None = None) -> None:
     """Mark the armed reload as warned. UPSERTS — if no sentinel exists yet (the
     nudge fired before the daemon's poll armed it), create one with warned=True so
     the warning can't be lost to that race."""
-    import json as _json
     import time as _time
     try:
         p = _reload_armed_path(session_id, session_path)
@@ -2484,7 +2518,7 @@ def mark_armed_warned(session_id, session_path: Path | None = None) -> None:
         d.setdefault("armed_at", _time.time())
         d.setdefault("tier", 0)
         d.setdefault("projected_pct", 0.0)
-        p.write_text(_json.dumps(d))
+        _write_armed_atomic(p, d)
     except Exception:
         pass
 

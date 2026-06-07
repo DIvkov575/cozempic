@@ -893,18 +893,29 @@ def build_injection_text(store: DigestStore) -> str | None:
     return "\n".join(lines)
 
 
-def _get_memdir(cwd: str = "", create: bool = False) -> Path | None:
+def _project_dir_exists(cwd: str = "") -> bool:
+    """True if Claude Code's project dir for this cwd exists (transcript lives
+    there). Used to give an accurate sync message without creating anything."""
+    from .session import cwd_to_project_slug, get_projects_dir
+    if not cwd:
+        cwd = os.getcwd()
+    claude_dir = get_projects_dir()
+    if not claude_dir.exists():
+        return False
+    return (claude_dir / cwd_to_project_slug(cwd)).exists()
+
+
+def _get_memdir(cwd: str = "") -> Path | None:
     """Find the Claude Code memory directory for the given project.
 
     Delegates profile resolution to `session.get_projects_dir()` which honours
     `CLAUDE_CONFIG_DIR` (used by the `claudes` profile launcher) before
     falling back to `~/.claude`. Prevents cross-profile leaks.
 
-    With ``create=True``, creates the ``memory/`` subdir when the project dir
-    already exists but the subdir doesn't — Claude Code creates it lazily, so on a
-    brand-new project the first SessionStart sync would otherwise find nothing and
-    have to wait. We only create UNDER an existing project dir (whose presence
-    proves the slug is the one Claude Code uses), never fabricate the project dir.
+    Read-only: cozempic does NOT create this dir — Claude Code owns it and creates
+    it lazily. We only sync into it once it exists, so a brand-new folder isn't
+    proactively populated with the (global) digest until Claude Code establishes
+    its memory dir.
     """
     from .session import cwd_to_project_slug, get_projects_dir
     if not cwd:
@@ -921,15 +932,7 @@ def _get_memdir(cwd: str = "", create: bool = False) -> Path | None:
         # dir in claude_dir can have that exact name — the scan would be dead code.
         return None
     mem_dir = project_dir / "memory"
-    if mem_dir.exists():
-        return mem_dir
-    if create:
-        try:
-            mem_dir.mkdir(parents=True, exist_ok=True)
-            return mem_dir
-        except Exception:
-            return None
-    return None
+    return mem_dir if mem_dir.exists() else None
 
 
 def sync_to_memdir(store: DigestStore, cwd: str = "") -> int:
@@ -941,27 +944,24 @@ def sync_to_memdir(store: DigestStore, cwd: str = "") -> int:
 
     Returns number of rules synced.
     """
+    # Read-only on the dir: we sync into Claude Code's memory dir only once it
+    # exists (Claude Code owns/creates it). We never create it ourselves, so a
+    # brand-new folder is not proactively populated with the global digest.
+    mem_dir = _get_memdir(cwd)
+    if mem_dir is None:
+        return 0
+
     active = store.active_rules()
     if not active:
-        # No active rules: just clean up a stale digest if one exists (don't
-        # create the dir for nothing).
-        mem_dir = _get_memdir(cwd)
-        if mem_dir is not None:
-            digest_mem = mem_dir / "cozempic_digest.md"
-            if digest_mem.exists():
-                digest_mem.unlink()
+        # Remove existing digest memory if no active rules
+        digest_mem = mem_dir / "cozempic_digest.md"
+        if digest_mem.exists():
+            digest_mem.unlink()
         return 0
 
     # Build the memory file content
     text = build_injection_text(store)
     if not text:
-        return 0
-
-    # We have content to write — create memory/ if Claude Code hasn't yet (first
-    # run on a brand-new project), so the digest lands immediately instead of
-    # waiting for a later turn.
-    mem_dir = _get_memdir(cwd, create=True)
-    if mem_dir is None:
         return 0
 
     content = f"""---

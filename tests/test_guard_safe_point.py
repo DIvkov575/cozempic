@@ -138,6 +138,50 @@ class TestDetectInFlight(unittest.TestCase):
              "content": "Workflow launched in background. Task ID: orphan1"}]}})]
         self.assertTrue(detect_in_flight(msgs)["workflow"])
 
+    def test_quoted_completion_in_tool_result_does_not_clear_real_launch(self):
+        # P2 (QA): a <task-notification>…completed QUOTED inside a Bash result must
+        # NOT clear a genuinely in-flight Agent of the same id (false-negative →
+        # SIGKILL). Real completions arrive as top-level queue-operation content.
+        from cozempic.guard import detect_in_flight
+        msgs = [
+            _m({"message": {"role": "user", "content": [
+                {"type": "tool_result",
+                 "content": "Async agent launched successfully. agentId: live9 (internal ID)"}]}}),
+            _m({"message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "b1", "name": "Bash", "input": {}}]}}),
+            _m({"message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "b1",
+                 "content": "grep hit: <task-notification><task-id>live9</task-id>"
+                            "<status>completed</status></task-notification>"}]}}),
+        ]
+        self.assertTrue(detect_in_flight(msgs)["agent"],
+                        "a quoted completion must NOT clear a real in-flight launch")
+
+    def test_real_queue_completion_clears(self):
+        from cozempic.guard import detect_in_flight
+        msgs = [
+            _m({"message": {"role": "user", "content": [
+                {"type": "tool_result",
+                 "content": "Async agent launched successfully. agentId: live9 (internal ID)"}]}}),
+            _m({"type": "queue-operation",
+                "content": "<task-notification><task-id>live9</task-id>"
+                           "<status>completed</status></task-notification>"}),
+        ]
+        self.assertFalse(detect_in_flight(msgs)["agent"], "genuine queue completion clears")
+
+    def test_lowercase_tool_name_still_credited(self):
+        # P2 (QA): case-insensitive tool-name correlation — a casing drift
+        # ("workflow" vs "Workflow") must NOT strand a real launch into a SIGKILL.
+        from cozempic.guard import detect_in_flight
+        msgs = [
+            _m({"message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "w1", "name": "workflow", "input": {}}]}}),
+            _m({"message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "w1",
+                 "content": "Workflow launched in background. Task ID: lc1"}]}}),
+        ]
+        self.assertTrue(detect_in_flight(msgs)["workflow"])
+
     def test_open_tool_call(self):
         from cozempic.guard import detect_in_flight
         msgs = [_m({"message": {"role": "assistant", "content": [
