@@ -190,6 +190,36 @@ class TestArmNudgeFromResult(unittest.TestCase):
         self.assertTrue(a["warned"], "warned must survive a re-arm at a different tier")
         self.assertEqual(a["tier"], 80)
 
+    def test_terminate_and_resume_clears_armed(self):
+        # P1: every reload path funnels through _terminate_and_resume; it MUST clear
+        # the sentinel so a sticky warned=True can't survive into the resumed
+        # session (same session_id) and cause an unwarned reload there.
+        from cozempic import guard
+        called = []
+        with patch("cozempic.guard.clear_armed", side_effect=lambda *a, **k: called.append(a)), \
+             patch("cozempic.guard._detect_claude_flags", return_value=""), \
+             patch("cozempic.guard._detect_terminal_env", return_value={}), \
+             patch("cozempic.guard._is_claude_process", return_value=False), \
+             patch("cozempic.guard.platform.system", return_value="Unknown"):
+            try:
+                guard._terminate_and_resume(99999, "/tmp", session_id="term1", session_path=None)
+            except Exception:
+                pass
+        self.assertTrue(called, "_terminate_and_resume must clear the armed sentinel")
+        self.assertEqual(called[0][0], "term1")
+
+    def test_clear_armed_neutralizes_on_unlink_failure(self):
+        # P1 defense-in-depth: if unlink fails, clear_armed must NEUTRALIZE the
+        # sentinel (warned=False) so a survivor can't carry a stale warning.
+        from cozempic import guard
+        with patch("cozempic.guard._guard_tmp_root", return_value=self.scratch):
+            guard.mark_armed_warned("cn1", None)
+            self.assertTrue(guard.read_armed("cn1", None)["warned"])
+            with patch("pathlib.Path.unlink", side_effect=OSError("locked")):
+                guard.clear_armed("cn1", None)
+            a = guard.read_armed("cn1", None)
+        self.assertFalse((a or {}).get("warned"), "must neutralize warned on unlink failure")
+
 
 if __name__ == "__main__":
     unittest.main()

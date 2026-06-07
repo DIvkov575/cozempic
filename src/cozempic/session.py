@@ -401,11 +401,14 @@ def get_sidecar_path() -> Path:
 
 
 def _load_sidecar() -> dict:
-    """Load the sidecar store. Returns {} on missing or corrupt file."""
+    """Load the sidecar store. Returns {} on missing, corrupt, or non-dict file
+    (a top-level list/string would otherwise crash the `.get()` callers)."""
     p = get_sidecar_path()
     try:
         if p.exists():
-            return json.loads(p.read_text(encoding="utf-8"))
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
     except Exception:
         pass
     return {}

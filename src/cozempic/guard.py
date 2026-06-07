@@ -1801,6 +1801,13 @@ def _terminate_and_resume(
     and future callers may pass rx_name/config/auto_reload without causing a
     TypeError (blueprint § NEW-1 test compat).
     """
+    # Consume the armed-reload sentinel at THE single choke point every reload
+    # path funnels through (daemon HARD tiers + OverflowRecovery), so a stale
+    # warned=True can't survive into the resumed session (same session_id → same
+    # slug) and cause an UNWARNED reload there. clear_armed is best-effort; this
+    # is the authoritative clear regardless of which caller initiated the reload.
+    clear_armed(session_id, session_path)
+
     resume_flag = f"--resume {session_id}" if session_id else "--resume"
 
     # Preserve all CLI flags from the original Claude process
@@ -2207,7 +2214,7 @@ def _reload_ledger_max() -> int:
 _AGENT_LAUNCH_RE = re.compile(r"Async agent launched successfully\.?\s*agentId:\s*([A-Za-z0-9_-]+)", re.IGNORECASE)
 _WF_LAUNCH_RE = re.compile(r"[Ww]orkflow launched in (?:the )?background[.,]?\s*(?:Task|Run) ID:\s*([A-Za-z0-9_-]+)", re.IGNORECASE)
 _BG_LAUNCH_RE = re.compile(r"running in (?:the )?background(?: with| \()?\s*ID[:=]?\s*([A-Za-z0-9_-]+)", re.IGNORECASE)
-_TN_BLOCK_RE = re.compile(r"<task-notification>(.*?)</task-notification>", re.DOTALL | re.IGNORECASE)
+_TN_BLOCK_RE = re.compile(r"<task-notification(?:\s[^>]*)?>(.*?)</task-notification>", re.DOTALL | re.IGNORECASE)
 _TN_ID_RE = re.compile(r"<task-id>([^<]+)</task-id>", re.IGNORECASE)
 _TN_STATUS_RE = re.compile(r"<status>([^<]+)</status>", re.IGNORECASE)
 # Terminal completion vocabulary — broadened so a harness phrasing skew (success/
@@ -2235,32 +2242,6 @@ def _msg_dict(item) -> dict:
     if isinstance(item, tuple):
         return item[1] if len(item) > 1 and isinstance(item[1], dict) else {}
     return item if isinstance(item, dict) else {}
-
-
-def _msg_text(msg: dict) -> str:
-    """Collect all human/tool text from a message for marker scanning."""
-    out = []
-    root = msg.get("content")
-    if isinstance(root, str):
-        out.append(root)
-    inner = (msg.get("message") or {})
-    c = inner.get("content")
-    if isinstance(c, str):
-        out.append(c)
-    elif isinstance(c, list):
-        for b in c:
-            if not isinstance(b, dict):
-                continue
-            if isinstance(b.get("text"), str):
-                out.append(b["text"])
-            rc = b.get("content")
-            if isinstance(rc, str):
-                out.append(rc)
-            elif isinstance(rc, list):
-                for sub in rc:
-                    if isinstance(sub, dict) and isinstance(sub.get("text"), str):
-                        out.append(sub["text"])
-    return "\n".join(out)
 
 
 def _block_text(b: dict) -> str:
@@ -2479,11 +2460,18 @@ def read_armed(session_id: str | None, session_path: Path | None = None) -> dict
 
 def _write_armed_atomic(path: Path, data: dict) -> None:
     """Atomically write the armed sentinel (temp + os.replace) so the daemon and
-    the nudge process — which both write it — can't tear each other's writes."""
+    the nudge process — which both write it — can't tear each other's writes. The
+    temp is always cleaned up (no .tmp orphan on a write/replace failure)."""
     import json as _json
     tmp = path.with_suffix(path.suffix + f".tmp{os.getpid()}")
-    tmp.write_text(_json.dumps(data))
-    os.replace(tmp, path)
+    try:
+        tmp.write_text(_json.dumps(data))
+        os.replace(tmp, path)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)  # no-op after a successful replace
+        except Exception:
+            pass
 
 
 def write_armed(session_id, session_path, tier: int, projected_pct: float) -> None:
@@ -2524,10 +2512,17 @@ def mark_armed_warned(session_id, session_path: Path | None = None) -> None:
 
 
 def clear_armed(session_id, session_path: Path | None = None) -> None:
+    p = _reload_armed_path(session_id, session_path)
     try:
-        _reload_armed_path(session_id, session_path).unlink(missing_ok=True)
+        p.unlink(missing_ok=True)
     except Exception:
-        pass
+        # Couldn't remove it — NEUTRALIZE it instead, so a survivor can't carry a
+        # stale warned=True / armed_at into the resumed session and trigger an
+        # unwarned reload (warned=False + no armed_at → the gate re-arms fresh).
+        try:
+            _write_armed_atomic(p, {"warned": False})
+        except Exception:
+            pass
 
 
 def _reload_ledger_path(session_id: str | None, session_path: Path) -> Path:
