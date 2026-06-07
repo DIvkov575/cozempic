@@ -1058,6 +1058,118 @@ def cmd_self_update(args):
         sys.exit(1)
 
 
+_NUDGE_DEFAULT_TIERS = (0.25, 0.55, 0.80)
+
+
+def _build_nudge_message(tier_key: int, pct: float, proj: float | None) -> str:
+    """Locked 1.8.22 nudge copy. `proj` = real projected reduction % from the
+    daemon's armed sentinel (omitted if unavailable)."""
+    pct_disp = int(round(pct * 100))
+    if tier_key <= 25:
+        return (f"✦ Cozempic: context {pct_disp}%. Optional — `cozempic reload` does a "
+                f"lossless prune+resume at any breakpoint (higher fidelity than autocompact).")
+    reclaim = f"reclaims ~{int(round(proj))}% by pruning bloat" if proj else "prunes bloat"
+    if tier_key <= 55:
+        return (f"✦ Cozempic: you're at {pct_disp}% context. A safe reload {reclaim} and "
+                f"resumes automatically (conversation preserved). Your call:\n"
+                f"    • run `cozempic reload` now to control the timing, or\n"
+                f"    • do nothing — the guard auto-reloads at your next idle.")
+    reclaim80 = f"reclaims ~{int(round(proj))}% without loss" if proj else "prunes bloat without losing your conversation"
+    return (f"✦ Cozempic: context {pct_disp}% — approaching the autocompact wall. A reload "
+            f"{reclaim80}. Run `cozempic reload` now to pick the moment or wait for the "
+            f"autoreload to kick in.")
+
+
+def cmd_nudge(args):
+    """Stop-hook: emit a non-blocking systemMessage nudging the user to
+    `cozempic reload` at 25/55/80% context, ONCE per tier. Takes NO action — no
+    prune, no reload, never blocks the stop, never fed to the model. Always exit 0.
+    """
+    import json as _json
+    if os.environ.get("COZEMPIC_NUDGE_OFF"):
+        return
+    try:
+        payload = _json.load(sys.stdin)
+    except Exception:
+        return
+    transcript = payload.get("transcript_path") or ""
+    session = payload.get("session_id") or transcript
+    if not transcript or not os.path.exists(transcript):
+        return
+    try:
+        from .session import load_messages
+        from .tokens import detect_context_window, extract_usage_tokens
+        messages = load_messages(Path(transcript))
+        usage = extract_usage_tokens(messages)
+        window = detect_context_window(messages)
+    except Exception:
+        return
+    if not usage or not window:
+        return
+    tokens = int(usage.get("total") or 0)
+    if tokens <= 0 or window <= 0:
+        return
+    pct = tokens / window
+    tiers = _NUDGE_DEFAULT_TIERS
+    raw = os.environ.get("COZEMPIC_NUDGE_PCTS")
+    if raw:
+        try:
+            tiers = tuple(sorted(float(x) for x in raw.split(",") if x.strip()))
+        except Exception:
+            tiers = _NUDGE_DEFAULT_TIERS
+    crossed = max((t for t in tiers if pct >= t), default=None)
+    tier_key = int(round(crossed * 100)) if crossed is not None else None
+    # Once-per-tier latch with re-arm: drop tiers we've fallen BELOW (so they
+    # re-fire on a later re-cross), persist that drop in EVERY path, then fire the
+    # current tier only if not already latched.
+    state_file = Path.home() / ".claude" / "cozempic-metrics" / "nudge-state.json"
+    try:
+        state = _json.loads(state_file.read_text()) if state_file.exists() else {}
+    except Exception:
+        state = {}
+    sess_state = state.get(session) or {}
+    prev_fired = {int(t) for t in sess_state.get("tiers_fired", [])}
+    fired = {t for t in prev_fired if (t / 100.0) <= pct}
+    emit = tier_key is not None and tier_key not in fired
+    if emit:
+        fired.add(tier_key)
+
+    def _persist():
+        sess_state["tiers_fired"] = sorted(fired)
+        state[session] = sess_state
+        try:
+            state_file.parent.mkdir(parents=True, exist_ok=True)
+            state_file.write_text(_json.dumps(state))
+        except Exception:
+            pass
+
+    if not emit:
+        if fired != prev_fired:  # a drop occurred — persist the re-arm
+            _persist()
+        return
+    # Real projected reduction from the daemon's armed sentinel (omitted if absent).
+    proj = None
+    try:
+        from .guard import read_armed, mark_armed_warned
+        armed = read_armed(session, Path(transcript))
+        if armed and isinstance(armed.get("projected_pct"), (int, float)):
+            proj = float(armed["projected_pct"])
+    except Exception:
+        pass
+    msg = _build_nudge_message(tier_key, pct, proj)
+    # First-nudge-only opt-out hint.
+    if not sess_state.get("hint_shown"):
+        msg += "  ·  silence: COZEMPIC_NUDGE_OFF=1"
+        sess_state["hint_shown"] = True
+    _persist()  # records the newly-fired tier (and any drop)
+    # Tell the daemon (component E) the user has been warned of a queued reload.
+    try:
+        mark_armed_warned(session, Path(transcript))
+    except Exception:
+        pass
+    _json.dump({"systemMessage": msg}, sys.stdout)
+
+
 def cmd_remind(args):
     """Periodic rule reinforcement — outputs active digest rules to stderr.
 
@@ -1348,6 +1460,9 @@ def build_parser() -> argparse.ArgumentParser:
     # remind
     p_remind = sub.add_parser("remind", help="Output active behavioral rules (for PostToolUse hook)")
     p_remind.add_argument("--interval", type=_positive_int, default=25, help="Output every N tool calls (default: 25)")
+
+    # nudge (Stop hook — non-blocking context nudge, no action)
+    sub.add_parser("nudge", help="Stop-hook: non-blocking 'prune now?' nudge at 25/55/80%% (no action)")
 
     # digest
     p_digest = sub.add_parser("digest", help="Manage behavioral correction rules")
@@ -1806,6 +1921,7 @@ def main():
         "digest": cmd_digest,
         "self-update": cmd_self_update,
         "remind": cmd_remind,
+        "nudge": cmd_nudge,
     }
 
     try:

@@ -2070,6 +2070,59 @@ def safe_to_reload(team_state, messages, session_path) -> tuple[bool, str]:
     return (True, "quiescent")
 
 
+# ── Armed-reload sentinel (1.8.22 components D+E) ────────────────────────────
+# When the daemon detects a HARD threshold crossed mid-turn it ARMS a reload by
+# writing this sentinel (with the real projected reduction %); the Stop-hook
+# nudge READS it to warn the user ("reload queued, reclaims ~N%") and marks it
+# warned; the daemon EXECUTEs the reload only once warned AND safe AND idle. The
+# user clears it by running `cozempic reload` themselves. Shared by guard (write/
+# execute) and cli `nudge` (read/warn).
+def _reload_armed_path(session_id: str | None, session_path: Path | None = None) -> Path:
+    raw = (session_id or (session_path.stem if session_path else None) or "session")
+    slug = re.sub(r"[^a-z0-9_-]", "_", str(raw).lower())[:12] or "session"
+    return _guard_tmp_root() / f"cozempic_reload_armed_{slug}.json"
+
+
+def read_armed(session_id: str | None, session_path: Path | None = None) -> dict | None:
+    import json as _json
+    try:
+        p = _reload_armed_path(session_id, session_path)
+        return _json.loads(p.read_text()) if p.exists() else None
+    except Exception:
+        return None
+
+
+def write_armed(session_id, session_path, tier: int, projected_pct: float) -> None:
+    import json as _json
+    try:
+        p = _reload_armed_path(session_id, session_path)
+        existing = read_armed(session_id, session_path) or {}
+        # Preserve a prior warned=True so re-arming the same tier doesn't reset it.
+        warned = bool(existing.get("warned")) and existing.get("tier") == tier
+        p.write_text(_json.dumps({"tier": tier, "projected_pct": round(projected_pct, 1), "warned": warned}))
+    except Exception:
+        pass
+
+
+def mark_armed_warned(session_id, session_path: Path | None = None) -> None:
+    import json as _json
+    try:
+        p = _reload_armed_path(session_id, session_path)
+        d = read_armed(session_id, session_path)
+        if d is not None:
+            d["warned"] = True
+            p.write_text(_json.dumps(d))
+    except Exception:
+        pass
+
+
+def clear_armed(session_id, session_path: Path | None = None) -> None:
+    try:
+        _reload_armed_path(session_id, session_path).unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 def _reload_ledger_path(session_id: str | None, session_path: Path) -> Path:
     raw = (session_id or session_path.stem or "session")
     slug = re.sub(r"[^a-z0-9_-]", "_", raw.lower())[:12] or "session"
