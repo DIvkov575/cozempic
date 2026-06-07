@@ -50,7 +50,7 @@ def _positive_int(val: str) -> int:
 
 def _positive_float(val: str) -> float:
     """argparse type= for strictly-positive floats. Used for --threshold
-    and --soft-threshold (MB thresholds)."""
+    and --soft-threshold (MB thresholds). Rejects NaN and infinity."""
     try:
         f = float(val)
     except ValueError:
