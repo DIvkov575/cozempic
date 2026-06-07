@@ -2835,6 +2835,17 @@ def reload_self_daemon(
 
     Returns dict: {reloaded: bool, old_pid, new_pid, log_file, reason}.
     """
+    # Validate BEFORE any destructive action — a NaN/inf threshold must not
+    # kill the live daemon and then fail to spawn a replacement, leaving the
+    # session unprotected.  Mirrors the belt-and-braces checks in start_guard
+    # and start_guard_daemon.
+    _validate_finite_thresholds(
+        threshold_mb=threshold_mb,
+        soft_threshold_mb=soft_threshold_mb,
+        interval=interval,
+        threshold_tokens=threshold_tokens,
+        soft_threshold_tokens=soft_threshold_tokens,
+    )
     cwd = cwd or os.getcwd()
 
     if not session_id:
