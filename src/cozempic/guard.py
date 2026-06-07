@@ -2260,6 +2260,27 @@ def _msg_text(msg: dict) -> str:
     return "\n".join(out)
 
 
+def _block_text(b: dict) -> str:
+    """Text of a single content block (tool_result content as str or list-of-{text})."""
+    parts = []
+    if isinstance(b.get("text"), str):
+        parts.append(b["text"])
+    rc = b.get("content")
+    if isinstance(rc, str):
+        parts.append(rc)
+    elif isinstance(rc, list):
+        for sub in rc:
+            if isinstance(sub, dict) and isinstance(sub.get("text"), str):
+                parts.append(sub["text"])
+    return "\n".join(parts)
+
+
+# Which tool a launch marker must be paired with to count as a REAL launch (vs a
+# marker-shaped string merely quoted/echoed inside some other tool's output, or
+# written as prose). Keyed by marker kind.
+_LAUNCH_TOOLS = {"wf": ("Workflow",), "agent": ("Agent", "Task"), "bg": ("Bash",)}
+
+
 def detect_in_flight(messages) -> dict:
     """Detect harness-side in-flight work the transcript reload would destroy.
 
@@ -2268,6 +2289,14 @@ def detect_in_flight(messages) -> dict:
     (Workflow tool, run_in_background Bash, and the `Agent` tool respectively);
     open_call = a tool_use with no matching tool_result (synchronous mid-call).
     Ids are compared case-insensitively so a casing skew can't strand a launch.
+
+    A launch marker only counts inside a tool_result whose paired tool_use is of
+    the matching type — so a marker-shaped string quoted in another tool's output
+    or in the model's prose can't fabricate a PHANTOM in-flight task that wedges
+    the gate (verified against a live workflow run). A result whose tool_use was
+    pruned away is credited conservatively, so a REAL launch is never missed (the
+    catastrophic direction). Completions are matched broadly — they only ever
+    CLEAR an id, so a quoted one is harmless.
     """
     launched_wf: set[str] = set()
     launched_bg: set[str] = set()
@@ -2275,6 +2304,8 @@ def detect_in_flight(messages) -> dict:
     completed: set[str] = set()
     use_ids: set[str] = set()
     res_ids: set[str] = set()
+    use_name: dict = {}            # tool_use_id -> tool name
+    results: list = []            # (tool_use_id|None, text) per tool_result
     open_unkeyed = False
     for item in messages or []:
         msg = _msg_dict(item)
@@ -2282,12 +2313,6 @@ def detect_in_flight(messages) -> dict:
             continue
         text = _msg_text(msg)
         if text:
-            for m in _WF_LAUNCH_RE.findall(text):
-                launched_wf.add(m.strip().lower())
-            for m in _BG_LAUNCH_RE.findall(text):
-                launched_bg.add(m.strip().lower())
-            for m in _AGENT_LAUNCH_RE.findall(text):
-                launched_agent.add(m.strip().lower())
             for blk in _TN_BLOCK_RE.findall(text):
                 ids = _TN_ID_RE.findall(blk)
                 sts = _TN_STATUS_RE.findall(blk)
@@ -2299,15 +2324,37 @@ def detect_in_flight(messages) -> dict:
             for b in c:
                 if not isinstance(b, dict):
                     continue
-                if b.get("type") == "tool_use":
+                t = b.get("type")
+                if t == "tool_use":
                     if b.get("id"):
                         use_ids.add(b["id"])
+                        use_name[b["id"]] = (b.get("name") or "")
                     else:
                         # A tool_use with no id can never be paired to a result —
                         # fail toward "open" rather than silently treat it closed.
                         open_unkeyed = True
-                elif b.get("type") == "tool_result" and b.get("tool_use_id"):
-                    res_ids.add(b["tool_use_id"])
+                elif t == "tool_result":
+                    tid = b.get("tool_use_id")
+                    if tid:
+                        res_ids.add(tid)
+                    results.append((tid, _block_text(b)))
+
+    def _ok(tid, names):
+        nm = use_name.get(tid)
+        return nm is None or nm in names  # unknown (pruned) → conservative credit
+
+    for tid, rtext in results:
+        if not rtext:
+            continue
+        if _ok(tid, _LAUNCH_TOOLS["wf"]):
+            for m in _WF_LAUNCH_RE.findall(rtext):
+                launched_wf.add(m.strip().lower())
+        if _ok(tid, _LAUNCH_TOOLS["agent"]):
+            for m in _AGENT_LAUNCH_RE.findall(rtext):
+                launched_agent.add(m.strip().lower())
+        if _ok(tid, _LAUNCH_TOOLS["bg"]):
+            for m in _BG_LAUNCH_RE.findall(rtext):
+                launched_bg.add(m.strip().lower())
     wf = launched_wf - completed
     bg = launched_bg - completed
     agent = launched_agent - completed

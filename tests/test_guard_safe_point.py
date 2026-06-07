@@ -100,6 +100,44 @@ class TestDetectInFlight(unittest.TestCase):
             {"type": "tool_use", "name": "Bash", "input": {}}]}})]  # no id
         self.assertTrue(detect_in_flight(msgs)["open_call"])
 
+    def test_workflow_marker_quoted_in_bash_result_is_not_inflight(self):
+        # Type-correlation (validated against a live workflow run): a Workflow
+        # launch-marker STRING echoed/grepped inside a Bash tool_result is NOT a
+        # real launch — its paired tool_use is Bash, not Workflow — so it must not
+        # fabricate a phantom in-flight workflow that wedges the gate.
+        from cozempic.guard import detect_in_flight
+        msgs = [
+            _m({"message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "b1", "name": "Bash", "input": {}}]}}),
+            _m({"message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "b1",
+                 "content": "Workflow launched in background. Task ID: quoted_xyz"}]}}),
+        ]
+        self.assertFalse(detect_in_flight(msgs)["workflow"], "quoted marker must not count")
+
+    def test_real_workflow_result_is_inflight(self):
+        # The paired tool_use IS a Workflow → the marker is a real launch.
+        from cozempic.guard import detect_in_flight
+        msgs = [
+            _m({"message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "w1", "name": "Workflow", "input": {}}]}}),
+            _m({"message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "w1",
+                 "content": "Workflow launched in background. Task ID: w03jq5cm6\nRun ID: wf_x"}]}}),
+        ]
+        d = detect_in_flight(msgs)
+        self.assertTrue(d["workflow"])
+        self.assertIn("w03jq5cm6", d["ids"])
+
+    def test_pruned_tooluse_launch_credited_conservatively(self):
+        # If the launch's tool_use was pruned away (only the result remains), credit
+        # it — never MISS a real launch (the catastrophic direction).
+        from cozempic.guard import detect_in_flight
+        msgs = [_m({"message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "gone",
+             "content": "Workflow launched in background. Task ID: orphan1"}]}})]
+        self.assertTrue(detect_in_flight(msgs)["workflow"])
+
     def test_open_tool_call(self):
         from cozempic.guard import detect_in_flight
         msgs = [_m({"message": {"role": "assistant", "content": [
