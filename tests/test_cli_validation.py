@@ -274,12 +274,23 @@ class TestStartGuardNanInfValidation:
     RED at base: NaN/inf bypass `<= 0` (IEEE 754 semantics), no ConfigError raised.
     These are bug-capture tests — must FAIL against the unmodified source.
 
-    start_guard: validation fires before session I/O; no mocking needed for nan/inf
-    (the raise happens at the top of the validation block, before find_current_session).
-    start_guard_daemon: validation fires before Popen, but we mock _cleanup_legacy_pid
-    and subprocess.Popen anyway — per isolate-subprocess-tests-by-design, never rely on
-    environmental accident (nonexistent cwd) for isolation.
+    Isolation (per isolate-subprocess-tests-by-design memory):
+      start_guard:        validation fires before any I/O (before find_current_session).
+                          A tempdir is still created and cleaned up in teardown to
+                          defend against future code reorderings.
+      start_guard_daemon: ALL I/O primitives between function entry and Popen are mocked:
+                            _cleanup_legacy_pid, _reload_sentinel_active,
+                            _is_guard_running_for_session, subprocess.Popen.
+                          Teardown removes the tempdir unconditionally.
     """
+
+    def setup_method(self):
+        import tempfile
+        self._tmpdir = tempfile.mkdtemp(prefix="_cozempic_guard_nan_test_")
+
+    def teardown_method(self):
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
 
     # pytest-style: contextmanager mimic (same pattern as TestStartGuardOrderingValidation)
     from contextlib import contextmanager
@@ -300,7 +311,7 @@ class TestStartGuardNanInfValidation:
         from cozempic.guard import start_guard
         from cozempic._validation import ConfigError
         with self.assertRaisesLike(ConfigError, "finite"):
-            start_guard(threshold_mb=float("nan"), cwd="/tmp/_cozempic_guard_nan_test")
+            start_guard(threshold_mb=float("nan"), cwd=self._tmpdir)
 
     def test_start_guard_threshold_mb_inf_raises_config_error(self):
         """start_guard(threshold_mb=float('inf')) must raise ConfigError with 'finite'.
@@ -309,38 +320,48 @@ class TestStartGuardNanInfValidation:
         from cozempic.guard import start_guard
         from cozempic._validation import ConfigError
         with self.assertRaisesLike(ConfigError, "finite"):
-            start_guard(threshold_mb=float("inf"), cwd="/tmp/_cozempic_guard_nan_test")
+            start_guard(threshold_mb=float("inf"), cwd=self._tmpdir)
 
     def test_start_guard_daemon_threshold_mb_nan_raises_config_error(self):
         """start_guard_daemon(threshold_mb=float('nan')) must raise ConfigError before spawn.
         RED at base: nan <= 0 is False, validation silently passes, daemon spawned with nan.
-        Subprocess spawn is mocked per isolate-subprocess-tests-by-design."""
+
+        All I/O primitives between function entry and Popen are mocked:
+          - _cleanup_legacy_pid      (first I/O: legacy pid file cleanup)
+          - _reload_sentinel_active  (sentinel file check)
+          - _is_guard_running_for_session (pid file read)
+          - subprocess.Popen         (daemon spawn — must never be reached)
+        """
         from cozempic.guard import start_guard_daemon
         from cozempic._validation import ConfigError
         with (
             patch("cozempic.guard._cleanup_legacy_pid"),
+            patch("cozempic.guard._reload_sentinel_active", return_value=False),
             patch("cozempic.guard._is_guard_running_for_session", return_value=None),
             patch("cozempic.guard.subprocess.Popen"),
         ):
             with self.assertRaisesLike(ConfigError, "finite"):
                 start_guard_daemon(
-                    threshold_mb=float("nan"), cwd="/tmp/_cozempic_guard_nan_test"
+                    threshold_mb=float("nan"), cwd=self._tmpdir
                 )
 
     def test_start_guard_daemon_threshold_mb_inf_raises_config_error(self):
         """start_guard_daemon(threshold_mb=float('inf')) must raise ConfigError before spawn.
         RED at base: inf <= 0 is False, validation silently passes, daemon spawned with inf.
-        Subprocess spawn is mocked per isolate-subprocess-tests-by-design."""
+
+        All I/O primitives between function entry and Popen are mocked.
+        """
         from cozempic.guard import start_guard_daemon
         from cozempic._validation import ConfigError
         with (
             patch("cozempic.guard._cleanup_legacy_pid"),
+            patch("cozempic.guard._reload_sentinel_active", return_value=False),
             patch("cozempic.guard._is_guard_running_for_session", return_value=None),
             patch("cozempic.guard.subprocess.Popen"),
         ):
             with self.assertRaisesLike(ConfigError, "finite"):
                 start_guard_daemon(
-                    threshold_mb=float("inf"), cwd="/tmp/_cozempic_guard_nan_test"
+                    threshold_mb=float("inf"), cwd=self._tmpdir
                 )
 
 
