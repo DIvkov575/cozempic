@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import platform
 import subprocess
@@ -54,6 +55,8 @@ def _positive_float(val: str) -> float:
         f = float(val)
     except ValueError:
         raise argparse.ArgumentTypeError(f"{val!r} is not a valid number")
+    if math.isnan(f) or math.isinf(f):
+        raise argparse.ArgumentTypeError(f"must be a finite number, got {f}")
     if f <= 0:
         raise argparse.ArgumentTypeError(f"must be positive, got {f}")
     return f
