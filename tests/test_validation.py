@@ -90,23 +90,23 @@ class TestCoercePositiveFloat(unittest.TestCase):
     def test_rejects_nan(self):
         """NaN bypasses `<= 0` check (IEEE 754: NaN comparisons are always False).
         RED at base: coerce_positive_float returns nan silently instead of raising."""
-        with self.assertRaises(ConfigError):
+        with self.assertRaisesRegex(ConfigError, "finite"):
             coerce_positive_float({"mb": float("nan")}, "mb", default=1.0)
 
     def test_rejects_positive_inf(self):
         """Positive infinity bypasses `<= 0` check (inf <= 0 is False).
         RED at base: coerce_positive_float returns inf silently instead of raising."""
-        with self.assertRaises(ConfigError):
+        with self.assertRaisesRegex(ConfigError, "finite"):
             coerce_positive_float({"mb": float("inf")}, "mb", default=1.0)
 
     def test_json_roundtrip_nan_raises(self):
-        """json.loads accepts NaN literals by default (CPython behaviour), so a
-        config.json with {"memory_threshold_mb": NaN} flows a real float('nan')
+        """json.loads accepts NaN literals by default (CPython behaviour — allow_nan=True),
+        so a config.json with {"memory_threshold_mb": NaN} flows a real float('nan')
         into config dicts.  This test documents and guards that real-world vector.
         RED at base: json.loads succeeds, coerce_positive_float returns nan silently."""
         import json
-        d = json.loads('{"x": NaN}')
-        with self.assertRaises(ConfigError):
+        d = json.loads('{"x": NaN}')  # CPython json.loads accepts NaN (allow_nan=True default)
+        with self.assertRaisesRegex(ConfigError, "finite"):
             coerce_positive_float(d, "x", default=1.0)
 
     def test_rejects_negative_inf(self):
