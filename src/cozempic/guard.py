@@ -379,6 +379,15 @@ def start_guard(
     # swapped soft/hard threshold is much worse than a clean upfront error.
     # Argparse already rejects non-positive values, but direct Python callers
     # (guard.start_guard(...)) bypass argparse, so belt-and-braces check.
+    for _name, _v in (
+        ("threshold_mb", threshold_mb),
+        ("soft_threshold_mb", soft_threshold_mb),
+        ("interval", interval),
+        ("threshold_tokens", threshold_tokens),
+        ("soft_threshold_tokens", soft_threshold_tokens),
+    ):
+        if isinstance(_v, float) and (math.isnan(_v) or math.isinf(_v)):
+            raise ConfigError(f"{_name} must be a finite number, got {_v!r}")
     if threshold_mb <= 0:
         raise ConfigError(f"threshold_mb must be positive, got {threshold_mb}")
     if soft_threshold_mb is not None and soft_threshold_mb <= 0:
@@ -2156,6 +2165,15 @@ def start_guard_daemon(
     """
     from ._validation import ConfigError
 
+    for _name, _v in (
+        ("threshold_mb", threshold_mb),
+        ("soft_threshold_mb", soft_threshold_mb),
+        ("interval", interval),
+        ("threshold_tokens", threshold_tokens),
+        ("soft_threshold_tokens", soft_threshold_tokens),
+    ):
+        if isinstance(_v, float) and (math.isnan(_v) or math.isinf(_v)):
+            raise ConfigError(f"{_name} must be a finite number, got {_v!r}")
     if threshold_mb is not None and threshold_mb <= 0:
         raise ConfigError(f"threshold_mb must be positive, got {threshold_mb}")
     if soft_threshold_mb is not None and soft_threshold_mb <= 0:
