@@ -338,8 +338,9 @@ class TestStartGuardNanInfValidation:
         """start_guard(threshold_mb=10**400) must raise ConfigError with 'finite'.
 
         RED at base: isinstance gate skips ints entirely; 10**400 passes the float
-        guard, then int(10**400 * 1024 * 1024) raises a bare OverflowError downstream
-        instead of ConfigError at the validation block. Same class of bug as P0-F
+        guard, then `round(threshold_mb * 0.6, 1)` (the soft-threshold default) does
+        an int*float multiply that raises a bare OverflowError downstream instead of
+        ConfigError at the validation block. Same class of bug as P0-F
         (coerce_positive_float). Fix: widen the gate to isinstance(_v, (int, float))
         so huge ints enter the try/except OverflowError path."""
         from cozempic.guard import start_guard
