@@ -334,6 +334,19 @@ class TestStartGuardNanInfValidation:
         with _assert_raises_like(ConfigError, "finite"):
             start_guard(threshold_mb=float("inf"), cwd=self._tmpdir)
 
+    def test_start_guard_threshold_mb_huge_int_raises_config_error(self):
+        """start_guard(threshold_mb=10**400) must raise ConfigError with 'finite'.
+
+        RED at base: isinstance gate skips ints entirely; 10**400 passes the float
+        guard, then int(10**400 * 1024 * 1024) raises a bare OverflowError downstream
+        instead of ConfigError at the validation block. Same class of bug as P0-F
+        (coerce_positive_float). Fix: widen the gate to isinstance(_v, (int, float))
+        so huge ints enter the try/except OverflowError path."""
+        from cozempic.guard import start_guard
+        from cozempic._validation import ConfigError
+        with _assert_raises_like(ConfigError, "finite"):
+            start_guard(threshold_mb=10**400, cwd=self._tmpdir)
+
     def test_start_guard_daemon_threshold_mb_nan_raises_config_error(self):
         """start_guard_daemon(threshold_mb=float('nan')) must raise ConfigError before spawn.
         RED at base: nan <= 0 is False, validation silently passes; execution reaches
