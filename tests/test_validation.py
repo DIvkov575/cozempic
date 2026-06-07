@@ -85,6 +85,38 @@ class TestCoercePositiveFloat(unittest.TestCase):
         with self.assertRaises(ConfigError):
             coerce_positive_float({"mb": True}, "mb", default=10.0)
 
+    # ── NaN/inf bug-capture tests (RED at base — return nan/inf instead of raising) ──
+
+    def test_rejects_nan(self):
+        """NaN bypasses `<= 0` check (IEEE 754: NaN comparisons are always False).
+        RED at base: coerce_positive_float returns nan silently instead of raising."""
+        with self.assertRaises(ConfigError):
+            coerce_positive_float({"mb": float("nan")}, "mb", default=1.0)
+
+    def test_rejects_positive_inf(self):
+        """Positive infinity bypasses `<= 0` check (inf <= 0 is False).
+        RED at base: coerce_positive_float returns inf silently instead of raising."""
+        with self.assertRaises(ConfigError):
+            coerce_positive_float({"mb": float("inf")}, "mb", default=1.0)
+
+    def test_json_roundtrip_nan_raises(self):
+        """json.loads accepts NaN literals by default (CPython behaviour), so a
+        config.json with {"memory_threshold_mb": NaN} flows a real float('nan')
+        into config dicts.  This test documents and guards that real-world vector.
+        RED at base: json.loads succeeds, coerce_positive_float returns nan silently."""
+        import json
+        d = json.loads('{"x": NaN}')
+        with self.assertRaises(ConfigError):
+            coerce_positive_float(d, "x", default=1.0)
+
+    def test_rejects_negative_inf(self):
+        """Negative infinity is already caught at base via `value <= 0`
+        (-inf <= 0 is True).  Included as a regression guard to ensure the
+        NaN/inf fix does not accidentally un-guard this path.
+        GREEN at base — NOT a RED/bug-capture test."""
+        with self.assertRaises(ConfigError):
+            coerce_positive_float({"mb": float("-inf")}, "mb", default=1.0)
+
 
 class TestParseEnvPositiveInt(unittest.TestCase):
     """Env var helper: warn+fallback (does NOT raise). Used for

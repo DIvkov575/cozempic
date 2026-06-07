@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import io
 import contextlib
 import os
@@ -9,7 +10,59 @@ import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from cozempic.cli import _prescan_argv, build_parser, _digest_session
+from cozempic.cli import _prescan_argv, _positive_float, build_parser, _digest_session
+
+
+class TestPositiveFloatArgparseHelper:
+    """Direct unit tests for cli._positive_float argparse type= helper.
+
+    NaN/inf bypass: float("nan") and float("inf") both pass `f <= 0` (False
+    in IEEE 754), so the validator silently returns nan/inf.
+    RED at base: _positive_float("nan") returns nan instead of raising.
+    RED at base: _positive_float("inf") returns inf instead of raising.
+    These are bug-capture tests — must FAIL against the unmodified source.
+    """
+
+    def test_positive_float_rejects_nan(self):
+        """'nan' → float('nan') → bypasses <= 0 → silently returned.
+        RED at base: no exception raised."""
+        try:
+            result = _positive_float("nan")
+            raise AssertionError(
+                f"Expected ArgumentTypeError but _positive_float returned {result!r}"
+            )
+        except argparse.ArgumentTypeError:
+            pass  # expected
+
+    def test_positive_float_rejects_inf(self):
+        """'inf' → float('inf') → bypasses <= 0 → silently returned.
+        RED at base: no exception raised."""
+        try:
+            result = _positive_float("inf")
+            raise AssertionError(
+                f"Expected ArgumentTypeError but _positive_float returned {result!r}"
+            )
+        except argparse.ArgumentTypeError:
+            pass  # expected
+
+    def test_positive_float_rejects_negative_inf(self):
+        """-inf is already caught by `f <= 0` at base (-inf <= 0 is True).
+        GREEN at base — regression guard, not a RED/bug-capture test."""
+        try:
+            result = _positive_float("-inf")
+            raise AssertionError(
+                f"Expected ArgumentTypeError but _positive_float returned {result!r}"
+            )
+        except argparse.ArgumentTypeError:
+            pass  # expected
+
+    def test_positive_float_accepts_valid(self):
+        """Positive finite float must still be accepted after the fix."""
+        assert _positive_float("50.5") == 50.5
+
+    def test_positive_float_accepts_int_string(self):
+        """'50' (int string) is valid — user may write --threshold 50."""
+        assert _positive_float("50") == 50.0
 
 
 class TestPrescanArgvValidation:
