@@ -507,6 +507,15 @@ def cmd_reload(args):
         print("Use 'cozempic list' to find the session ID.", file=sys.stderr)
         sys.exit(1)
 
+    # User is taking manual control of the reload — clear any armed-reload
+    # sentinel the daemon left so its projected-%/warned state can't go stale and
+    # the next arm starts fresh (1.8.22 E; previously clear_armed was never wired).
+    try:
+        from .guard import clear_armed
+        clear_armed(sess["session_id"], sess.get("path"))
+    except Exception:
+        pass
+
     # Acquire the single-flight reload lock. Fail-fast by default; opt-in
     # queueing with --wait[=SECS]. The lock is held through treatment +
     # watcher spawn; released when this function returns (the watcher
@@ -1067,17 +1076,21 @@ def _build_nudge_message(tier_key: int, pct: float, proj: float | None) -> str:
     pct_disp = int(round(pct * 100))
     if tier_key <= 25:
         return (f"✦ Cozempic: context {pct_disp}%. Optional — `cozempic reload` does a "
-                f"lossless prune+resume at any breakpoint (higher fidelity than autocompact).")
-    reclaim = f"reclaims ~{int(round(proj))}% by pruning bloat" if proj else "prunes bloat"
+                f"prune+resume at any breakpoint (higher fidelity than autocompact).")
+    # Honest framing: cozempic preserves the CONVERSATION (user/assistant turns)
+    # but does trim tool-output detail — so it is "higher fidelity than
+    # autocompact", NOT literally lossless. Never claim "without loss".
+    reclaim = f"reclaims ~{int(round(proj))}% by trimming bloat" if proj else "trims bloat"
     if tier_key <= 55:
         return (f"✦ Cozempic: you're at {pct_disp}% context. A safe reload {reclaim} and "
                 f"resumes automatically (conversation preserved). Your call:\n"
                 f"    • run `cozempic reload` now to control the timing, or\n"
                 f"    • do nothing — the guard auto-reloads at your next idle.")
-    reclaim80 = f"reclaims ~{int(round(proj))}% without loss" if proj else "prunes bloat without losing your conversation"
+    reclaim80 = (f"reclaims ~{int(round(proj))}% by trimming tool-output bloat"
+                 if proj else "trims tool-output bloat")
     return (f"✦ Cozempic: context {pct_disp}% — approaching the autocompact wall. A reload "
-            f"{reclaim80}. Run `cozempic reload` now to pick the moment or wait for the "
-            f"autoreload to kick in.")
+            f"{reclaim80} (conversation preserved). Run `cozempic reload` now to pick the "
+            f"moment or wait for the autoreload to kick in.")
 
 
 def cmd_nudge(args):
@@ -1091,6 +1104,8 @@ def cmd_nudge(args):
     try:
         payload = _json.load(sys.stdin)
     except Exception:
+        return
+    if not isinstance(payload, dict):  # valid JSON but wrong shape (list/int/str)
         return
     transcript = payload.get("transcript_path") or ""
     session = payload.get("session_id") or transcript
@@ -1127,8 +1142,16 @@ def cmd_nudge(args):
         state = _json.loads(state_file.read_text()) if state_file.exists() else {}
     except Exception:
         state = {}
-    sess_state = state.get(session) or {}
-    prev_fired = {int(t) for t in sess_state.get("tiers_fired", [])}
+    if not isinstance(state, dict):  # corrupt/foreign state file → start clean
+        state = {}
+    sess_state = state.get(session)
+    if not isinstance(sess_state, dict):
+        sess_state = {}
+    try:
+        prev_fired = {int(t) for t in sess_state.get("tiers_fired", [])
+                      if str(t).lstrip("-").isdigit()}
+    except Exception:
+        prev_fired = set()
     fired = {t for t in prev_fired if (t / 100.0) <= pct}
     emit = tier_key is not None and tier_key not in fired
     if emit:
@@ -1556,11 +1579,16 @@ def _prescan_argv(argv: list[str]) -> list[str]:
     return cleaned
 
 
+# Commands whose STDOUT is a machine-parsed protocol (not human text): the
+# auto-updater and auto-init must stay silent / off so nothing prepends to it.
+_STDOUT_PROTOCOL_CMDS = frozenset({"nudge"})
+
 _AUTO_INIT_SKIP_CMDS = frozenset({
     "init",          # would loop / shadow user intent
     "completions",   # generates shell completion, no project state needed
     "self-update",   # internal upgrade
     "doctor",        # diagnostic-only; doctor surfaces missing init via its own check
+    "nudge",         # Stop-hook protocol command; never mutate state as a side effect
 })
 
 _GLOBAL_INIT_MARKER = Path.home() / ".cozempic_global_initialized"
@@ -1885,10 +1913,17 @@ def _maybe_auto_init(argv: list[str]) -> None:
 
 def main():
     from .updater import maybe_auto_update, ping_install_if_new
-    ping_install_if_new()
-    maybe_auto_update()
 
     argv = _prescan_argv(sys.argv[1:])
+    # The Stop-hook `nudge` emits a machine-parsed JSON protocol on STDOUT
+    # ({"systemMessage": ...}). The auto-updater prints upgrade chatter to STDOUT,
+    # which would prepend to that JSON and break the hook parser on the ~daily
+    # upgrade tick. Skip the updater (and auto-init) entirely for stdout-protocol
+    # commands — they still run on the user's next interactive invocation.
+    _cmd0 = next((a for a in argv if not a.startswith("-")), None)
+    if _cmd0 not in _STDOUT_PROTOCOL_CMDS:
+        ping_install_if_new()
+        maybe_auto_update()
     _maybe_global_init(argv)
     _maybe_auto_init(argv)
     parser = build_parser()

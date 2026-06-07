@@ -57,6 +57,49 @@ class TestDetectInFlight(unittest.TestCase):
              "content": "Command running in background with ID: bx1t5ptm2"}]}})]
         self.assertTrue(detect_in_flight(msgs)["background"])
 
+    def test_agent_launched_no_completion(self):
+        # The REAL dominant background-subagent path (Agent tool). VERIFIED marker
+        # from production transcripts; the old detector was blind to this → P0.
+        from cozempic.guard import detect_in_flight
+        msgs = [_m({"message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t3",
+             "content": "Async agent launched successfully.\nagentId: aa3bddd46882df8ea "
+                        "(internal ID - do not mention to user. Use SendMessage with to: "
+                        "'aa3bddd46882df8ea' to continue this agent.)\nThe agent is working "
+                        "in the background. You will be notified automatically when it completes."}]}})]
+        d = detect_in_flight(msgs)
+        self.assertTrue(d["agent"], "background Agent subagent must be detected in-flight")
+        self.assertIn("aa3bddd46882df8ea", d["ids"])
+
+    def test_agent_completed_via_task_notification(self):
+        # Same-namespace completion (verified real): agentId == <task-id>.
+        from cozempic.guard import detect_in_flight
+        msgs = [
+            _m({"message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t3",
+                 "content": "Async agent launched successfully.\nagentId: aa3bddd46882df8ea (internal ID)"}]}}),
+            _m({"type": "queue-operation",
+                "content": "<task-notification><task-id>aa3bddd46882df8ea</task-id>"
+                           "<status>completed</status><summary>s</summary></task-notification>"}),
+        ]
+        self.assertFalse(detect_in_flight(msgs)["agent"], "completed Agent must clear")
+
+    def test_completion_vocab_success_clears(self):
+        # A "success"/"done" status (not literally "completed") must still clear.
+        from cozempic.guard import detect_in_flight
+        msgs = [
+            _m({"message": {"role": "user", "content": [
+                {"type": "tool_result", "content": "Async agent launched successfully. agentId: zz9"}]}}),
+            _m({"content": "<task-notification><task-id>zz9</task-id><status>success</status></task-notification>"}),
+        ]
+        self.assertFalse(detect_in_flight(msgs)["agent"])
+
+    def test_unkeyed_tool_use_is_open(self):
+        from cozempic.guard import detect_in_flight
+        msgs = [_m({"message": {"role": "assistant", "content": [
+            {"type": "tool_use", "name": "Bash", "input": {}}]}})]  # no id
+        self.assertTrue(detect_in_flight(msgs)["open_call"])
+
     def test_open_tool_call(self):
         from cozempic.guard import detect_in_flight
         msgs = [_m({"message": {"role": "assistant", "content": [
@@ -111,6 +154,31 @@ class TestSafeToReload(unittest.TestCase):
                        teammates=[TeammateInfo("a2", "n", status="done")])
         safe, _ = safe_to_reload(st, [], None)
         self.assertTrue(safe)
+
+    def test_running_agent_unsafe(self):
+        from cozempic.guard import safe_to_reload
+        from cozempic.team import TeamState
+        msgs = [_m({"message": {"role": "user", "content": [
+            {"type": "tool_result",
+             "content": "Async agent launched successfully. agentId: bg777 (internal ID)"}]}})]
+        safe, reason = safe_to_reload(TeamState(), msgs, None)
+        self.assertFalse(safe)
+        self.assertIn("subagent", reason)
+
+    def test_team_with_completed_subagents_but_running_teammate_is_safe(self):
+        # P0 regression: TeamCreate leaves teammate.status="running" forever (never
+        # transitioned to terminal). The gate must NOT wedge on that — a finished
+        # team (subagents completed, no active tasks) must be allowed to reload,
+        # which is the guard's whole purpose for agent teams.
+        from cozempic.guard import safe_to_reload
+        from cozempic.team import TeamState, SubagentInfo, TeammateInfo
+        st = TeamState(team_name="t",
+                       subagents=[SubagentInfo("a1", "d", status="completed"),
+                                  SubagentInfo("a2", "d", status="completed")],
+                       teammates=[TeammateInfo("a1", "alice", status="running"),
+                                  TeammateInfo("a2", "bob", status="running")])
+        safe, _ = safe_to_reload(st, [], None)
+        self.assertTrue(safe, "finished team must reload despite stuck teammate.status")
 
 
 class TestGuardCycleGate(unittest.TestCase):

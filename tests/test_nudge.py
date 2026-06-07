@@ -91,6 +91,35 @@ class TestNudge(unittest.TestCase):
             cmd_nudge(None)  # must not raise
         self.assertEqual(out.getvalue().strip(), "")
 
+    def test_non_blocking_wrong_shape_stdin(self):
+        # valid JSON but not an object (list/int/str) must not crash — "always
+        # exit 0" contract (the Stop hook swallows stderr, but the contract holds).
+        from cozempic.cli import cmd_nudge
+        for payload in ("[1,2,3]", "42", '"hello"', "null"):
+            out = io.StringIO()
+            with patch("sys.stdin", io.StringIO(payload)), patch("sys.stdout", out), \
+                 patch("pathlib.Path.home", return_value=self.home):
+                cmd_nudge(None)  # must not raise
+            self.assertEqual(out.getvalue().strip(), "", payload)
+
+    def test_non_blocking_malformed_state_file(self):
+        # A corrupt/foreign nudge-state.json must not crash the nudge.
+        from cozempic.cli import cmd_nudge
+        sf = self.home / ".claude" / "cozempic-metrics" / "nudge-state.json"
+        sf.parent.mkdir(parents=True, exist_ok=True)
+        for bad in ('[1,2,3]', '{"s1": "not-a-dict"}', '{"s1": {"tiers_fired": ["x","y"]}}'):
+            sf.write_text(bad)
+            t = _transcript(self.tmp, 560_000)
+            payload = json.dumps({"transcript_path": str(t), "session_id": "s1"})
+            out = io.StringIO()
+            import os
+            e = {k: v for k, v in os.environ.items() if not k.startswith("COZEMPIC_NUDGE")}
+            with patch("sys.stdin", io.StringIO(payload)), patch("sys.stdout", out), \
+                 patch("pathlib.Path.home", return_value=self.home), \
+                 patch.dict(os.environ, e, clear=True):
+                cmd_nudge(None)  # must not raise (and should still fire the 55 nudge)
+            self.assertIn("56%", out.getvalue(), bad)
+
     def test_projected_pct_from_armed_sentinel(self):
         # when the daemon armed with a projected_pct, the 55% message shows it
         from cozempic import guard

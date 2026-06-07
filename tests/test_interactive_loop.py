@@ -42,7 +42,7 @@ def _run_guard(token_estimate: int, env: dict, context_window: int = 200_000):
 
     def _sleep(_):
         sleeps["n"] += 1
-        if sleeps["n"] >= 3:
+        if sleeps["n"] >= 4:  # let 3 full cycles run (sustained-idle needs 2 idle cycles)
             raise _StopLoop()
 
     def _cycle(*a, **k):
@@ -96,26 +96,29 @@ class TestInteractiveLoopWiring(unittest.TestCase):
     OVER_HARD2 = 165_000
     OVER_FORCE = 185_000  # 92.5% → past force line
 
-    def test_interactive_defers_then_reloads_at_idle(self):
+    def test_interactive_defers_then_reloads_at_sustained_idle(self):
+        # cycle1 not-idle (prev=-1) → defer; cycle2 idle but idle_cycles=1<2 →
+        # still defer (one stable cycle could be a mid-turn stall); cycle3
+        # idle_cycles=2 → sustained idle → reload.
         calls = _run_guard(self.OVER_HARD2, {"COZEMPIC_INTERACTIVE": "on"})
-        self.assertEqual(calls, [False, True],
-                         "cycle1 (mid-turn) must defer; cycle2 (idle) must reload")
+        self.assertEqual(calls, [False, False, True],
+                         "interactive reloads only after SUSTAINED idle (2 cycles)")
 
     def test_headless_reloads_immediately(self):
         calls = _run_guard(self.OVER_HARD2, {"COZEMPIC_INTERACTIVE": "off"})
-        self.assertEqual(calls, [True, True],
-                         "headless: reload both cycles (today's behavior, unchanged)")
+        self.assertEqual(calls, [True, True, True],
+                         "headless: reload every cycle (today's behavior, unchanged)")
 
     def test_force_line_reloads_even_mid_turn(self):
         calls = _run_guard(self.OVER_FORCE, {"COZEMPIC_INTERACTIVE": "on"})
-        self.assertEqual(calls, [True, True],
+        self.assertEqual(calls, [True, True, True],
                          "past ~88%: reload even mid-turn (beats the autocompact wall)")
 
-    def test_force_disabled_keeps_deferring_mid_turn(self):
+    def test_force_disabled_keeps_deferring_until_sustained_idle(self):
         calls = _run_guard(self.OVER_FORCE, {"COZEMPIC_INTERACTIVE": "on",
                                              "COZEMPIC_FORCE_RELOAD_PCT": "0"})
-        self.assertEqual(calls, [False, True],
-                         "force disabled: mid-turn always defers, reload only at idle")
+        self.assertEqual(calls, [False, False, True],
+                         "force disabled: defer mid-turn, reload only at sustained idle")
 
 
 if __name__ == "__main__":

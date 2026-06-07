@@ -823,7 +823,10 @@ def start_guard(
                 and current_tokens is not None
                 and current_tokens >= force_threshold_tokens
             )
-            defer_for_turn = interactive_mode and not idle and not force_now
+            # Require SUSTAINED idle (N consecutive stable cycles), not a single
+            # one — a momentary mid-turn stall must not be read as a breakpoint.
+            sustained_idle = idle and idle_cycles >= _idle_reload_cycles()
+            defer_for_turn = interactive_mode and not sustained_idle and not force_now
             eff_auto_reload = auto_reload and not defer_for_turn
             # Whether a HARD tier is active this cycle (gates F's idle back-off).
             hard_active = (
@@ -1084,6 +1087,21 @@ def _idle_backoff_cycles() -> int:
         return n if n > 0 else 0
     except (TypeError, ValueError):
         return 4
+
+
+def _idle_reload_cycles() -> int:
+    """Component E — consecutive stable-transcript cycles required before an
+    interactive reload treats the session as a genuine breakpoint. A single
+    stable cycle is NOT enough: a live turn can stall one poll interval (deep
+    model thinking, rate-limit back-off, a slow buffered tool) without the
+    JSONL growing, and reloading then would interrupt an in-progress turn. Two
+    consecutive idle cycles (~2 intervals) distinguishes a real lull from a
+    momentary stall. Minimum 1."""
+    try:
+        n = int(os.environ.get("COZEMPIC_IDLE_RELOAD_CYCLES", "2"))
+        return n if n >= 1 else 1
+    except (TypeError, ValueError):
+        return 2
 
 
 def _force_reload_pct() -> float:
@@ -1426,7 +1444,12 @@ def guard_prune_cycle(
                 result["live_write_skipped"] = True
                 result["reload_unsafe"] = True
                 result["unsafe_reason"] = _reason
-                result["futile_reload_skipped"] = True  # account to breaker → back off
+                # Deliberately do NOT set futile_reload_skipped: deferring around
+                # genuine in-flight work is NOT a futile prune. _account_hard_prune's
+                # benign-read-only branch (live_write_skipped & not conflict) leaves
+                # the circuit breaker untouched, so a long-running Workflow doesn't
+                # trip the K-exit and quit the guard. The token-% nudge is the
+                # user-facing signal here; the guard keeps checkpointing meanwhile.
                 return result
             # Cross-respawn reload-rate cap: if this session has already reloaded
             # too many times within the window, stop auto-reloading it. A session
@@ -2101,12 +2124,30 @@ def _reload_ledger_max() -> int:
 # plus any open synchronous tool_use with no matching tool_result (a tool/subagent
 # mid-call). Conservative by construction: it flags only on positive
 # launch-without-completion or a genuinely open call, so it does not over-defer.
-_WF_LAUNCH_RE = re.compile(r"Workflow launched in background\. *Task ID: *([A-Za-z0-9_-]+)", re.IGNORECASE)
-_BG_LAUNCH_RE = re.compile(r"running in background with ID: *([A-Za-z0-9_-]+)", re.IGNORECASE)
+# Launch markers — VERIFIED against real Claude Code transcripts (2026-06-07,
+# 195 Agent / 12 Workflow / 0 Task tool_uses across 13 sessions). The dominant
+# real path is the `Agent` tool's "Async agent launched successfully. agentId: X"
+# (background subagent) — the original detector matched only the Workflow/Task-ID
+# phrasing, which is NOT what the harness emits, so a running background subagent
+# was invisible and a reload would SIGKILL it. All three launch ids complete via
+# the SAME-namespace <task-notification><task-id>X</task-id> block, so
+# launched−completed accounting works once each launch phrasing is recognized.
+# Patterns are drift-tolerant (optional "the"/punctuation, Task|Run ID, ID:/=/( ).
+_AGENT_LAUNCH_RE = re.compile(r"Async agent launched successfully\.?\s*agentId:\s*([A-Za-z0-9_-]+)", re.IGNORECASE)
+_WF_LAUNCH_RE = re.compile(r"[Ww]orkflow launched in (?:the )?background[.,]?\s*(?:Task|Run) ID:\s*([A-Za-z0-9_-]+)", re.IGNORECASE)
+_BG_LAUNCH_RE = re.compile(r"running in (?:the )?background(?: with| \()?\s*ID[:=]?\s*([A-Za-z0-9_-]+)", re.IGNORECASE)
 _TN_BLOCK_RE = re.compile(r"<task-notification>(.*?)</task-notification>", re.DOTALL | re.IGNORECASE)
 _TN_ID_RE = re.compile(r"<task-id>([^<]+)</task-id>", re.IGNORECASE)
 _TN_STATUS_RE = re.compile(r"<status>([^<]+)</status>", re.IGNORECASE)
-_INFLIGHT_DONE = {"completed", "failed", "cancelled", "canceled", "stopped", "killed", "error"}
+# Terminal completion vocabulary — broadened so a harness phrasing skew (success/
+# done/finished vs completed) can't pin a finished task "in-flight" forever.
+_INFLIGHT_DONE = {"completed", "complete", "failed", "cancelled", "canceled",
+                  "stopped", "killed", "error", "success", "succeeded", "done",
+                  "ok", "finished", "aborted", "timeout", "timed_out"}
+# Subagent statuses that mean "still executing" → block a reload. Includes
+# "unknown" (conservative: a subagent we can't classify is treated as live).
+_SUBAGENT_ACTIVE = {"running", "unknown", "active", "in_progress", "working",
+                    "queued", "pending", "started", "launched"}
 
 
 def _msg_dict(item) -> dict:
@@ -2145,15 +2186,19 @@ def _msg_text(msg: dict) -> str:
 def detect_in_flight(messages) -> dict:
     """Detect harness-side in-flight work the transcript reload would destroy.
 
-    Returns {workflow: bool, background: bool, open_call: bool, ids: [...]}.
-    workflow/background = launched-but-not-completed background tasks; open_call =
-    a tool_use with no matching tool_result (synchronous mid-call).
+    Returns {workflow, background, agent, open_call: bool, ids: [...]}.
+    workflow/background/agent = launched-but-not-completed background tasks
+    (Workflow tool, run_in_background Bash, and the `Agent` tool respectively);
+    open_call = a tool_use with no matching tool_result (synchronous mid-call).
+    Ids are compared case-insensitively so a casing skew can't strand a launch.
     """
     launched_wf: set[str] = set()
     launched_bg: set[str] = set()
+    launched_agent: set[str] = set()
     completed: set[str] = set()
     use_ids: set[str] = set()
     res_ids: set[str] = set()
+    open_unkeyed = False
     for item in messages or []:
         msg = _msg_dict(item)
         if not msg:
@@ -2161,32 +2206,41 @@ def detect_in_flight(messages) -> dict:
         text = _msg_text(msg)
         if text:
             for m in _WF_LAUNCH_RE.findall(text):
-                launched_wf.add(m.strip())
+                launched_wf.add(m.strip().lower())
             for m in _BG_LAUNCH_RE.findall(text):
-                launched_bg.add(m.strip())
+                launched_bg.add(m.strip().lower())
+            for m in _AGENT_LAUNCH_RE.findall(text):
+                launched_agent.add(m.strip().lower())
             for blk in _TN_BLOCK_RE.findall(text):
                 ids = _TN_ID_RE.findall(blk)
                 sts = _TN_STATUS_RE.findall(blk)
                 if ids and sts and sts[-1].strip().lower() in _INFLIGHT_DONE:
-                    completed.add(ids[0].strip())
+                    completed.add(ids[0].strip().lower())
         inner = (msg.get("message") or {})
         c = inner.get("content")
         if isinstance(c, list):
             for b in c:
                 if not isinstance(b, dict):
                     continue
-                if b.get("type") == "tool_use" and b.get("id"):
-                    use_ids.add(b["id"])
+                if b.get("type") == "tool_use":
+                    if b.get("id"):
+                        use_ids.add(b["id"])
+                    else:
+                        # A tool_use with no id can never be paired to a result —
+                        # fail toward "open" rather than silently treat it closed.
+                        open_unkeyed = True
                 elif b.get("type") == "tool_result" and b.get("tool_use_id"):
                     res_ids.add(b["tool_use_id"])
     wf = launched_wf - completed
     bg = launched_bg - completed
-    open_call = bool(use_ids - res_ids)
+    agent = launched_agent - completed
+    open_call = bool(use_ids - res_ids) or open_unkeyed
     return {
         "workflow": bool(wf),
         "background": bool(bg),
+        "agent": bool(agent),
         "open_call": open_call,
-        "ids": sorted(wf | bg),
+        "ids": sorted(wf | bg | agent),
     }
 
 
@@ -2200,39 +2254,51 @@ def safe_to_reload(team_state, messages, session_path) -> tuple[bool, str]:
     genuinely-quiescent reload (avoids re-creating the inert guard).
     """
     inflight = detect_in_flight(messages)
-    # Tracked team quiescence (uses TeamState; build_team_recovery_receipt would
-    # return verdict!="complete" for the same conditions — this is that gate,
-    # enforced where the receipt never was).
+    # Harness-side in-flight work — the gap cozempic was blind to. These are the
+    # MOST reliable signals (launched−completed via task-notifications, verified
+    # against real transcripts). NEVER reload through them. Checked first so an
+    # active background subagent is caught even if TeamState is empty/stale.
+    if inflight["workflow"]:
+        return (False, "Workflow orchestrating")
+    if inflight["background"]:
+        return (False, "background task in flight")
+    if inflight["agent"]:
+        return (False, "background subagent running")
+    if inflight["open_call"]:
+        return (False, "open tool call (result not yet flushed)")
+    # Tracked team quiescence (TeamState). NOTE: we deliberately do NOT hard-block
+    # on teammate.status — TeamCreate sets it "running" and nothing in the
+    # extractor ever transitions it to terminal, so blocking on it wedged EVERY
+    # team session forever (the guard's primary use case). The reliable liveness
+    # signals are: subagent entries (which ARE updated by task-notification
+    # completions), active todo tasks (TaskUpdate-maintained), and the in-flight
+    # detector above — an actually-working teammate always shows up as one of
+    # those (a running subagent / open Agent call / un-completed Agent launch).
     if team_state is not None and not team_state.is_empty():
         try:
-            if any((s.status or "").lower() in ("running", "unknown") for s in (team_state.subagents or [])):
+            if any((s.status or "").strip().lower() in _SUBAGENT_ACTIVE
+                   for s in (team_state.subagents or [])):
                 return (False, "subagent mid-execution")
-            if any((t.status or "").lower() not in ("done", "completed") for t in (team_state.teammates or [])):
-                return (False, "teammate not quiesced")
             active_tasks, _, _ = team_state._task_groups()
             if active_tasks:
                 return (False, "active task in flight")
         except Exception:
             # Malformed state → be conservative.
             return (False, "team state unreadable")
-    # Harness-side in-flight work (workflows/background/open calls) — the gap
-    # cozempic was blind to. NEVER reload through these.
-    if inflight["workflow"]:
-        return (False, "Workflow orchestrating")
-    if inflight["background"]:
-        return (False, "background task in flight")
-    if inflight["open_call"]:
-        return (False, "open tool call (result not yet flushed)")
     return (True, "quiescent")
 
 
 # ── Armed-reload sentinel (1.8.22 components D+E) ────────────────────────────
 # When the daemon detects a HARD threshold crossed mid-turn it ARMS a reload by
-# writing this sentinel (with the real projected reduction %); the Stop-hook
-# nudge READS it to warn the user ("reload queued, reclaims ~N%") and marks it
-# warned; the daemon EXECUTEs the reload only once warned AND safe AND idle. The
-# user clears it by running `cozempic reload` themselves. Shared by guard (write/
-# execute) and cli `nudge` (read/warn).
+# writing this sentinel (carrying the projected reduction % when known); the
+# Stop-hook nudge READS it to enrich the warning and marks it `warned`. The
+# warning-before-reload guarantee comes from the NUDGE itself, which fires at the
+# turn-end (Stop hook) that crosses the tier — BEFORE the daemon's next idle poll
+# can execute the reload. The execute decision gates on safe_to_reload AND
+# SUSTAINED idle (it does not hard-read `warned`, so a missing/disabled Stop hook
+# can't wedge it; the trade-off is the warning is best-effort, not a hard
+# precondition). `cozempic reload` clears the sentinel (user took control).
+# Shared by guard (write) and cli `nudge` (read/warn).
 def _reload_armed_path(session_id: str | None, session_path: Path | None = None) -> Path:
     raw = (session_id or (session_path.stem if session_path else None) or "session")
     slug = re.sub(r"[^a-z0-9_-]", "_", str(raw).lower())[:12] or "session"
