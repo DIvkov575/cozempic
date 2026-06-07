@@ -278,10 +278,18 @@ class TestStartGuardNanInfValidation:
       start_guard:        validation fires before any I/O (before find_current_session).
                           A tempdir is still created and cleaned up in teardown to
                           defend against future code reorderings.
-      start_guard_daemon: ALL I/O primitives between function entry and Popen are mocked:
-                            _cleanup_legacy_pid, _reload_sentinel_active,
-                            _is_guard_running_for_session, subprocess.Popen.
+      start_guard_daemon: ALL I/O primitives between function entry and Popen are mocked
+                          to prevent any /tmp/cozempic_guard_* file creation at base:
+                            _cleanup_legacy_pid      (legacy pid cleanup)
+                            _reload_sentinel_active  (sentinel file read)
+                            find_current_session     (jsonl directory scan)
+                            _is_guard_running_for_session (pid file read)
+                            _guard_tmp_root          (redirects pid/log path construction)
+                            cozempic.spawn_lock.DaemonSpawnClaim (O_CREAT|O_EXCL on .pid)
+                            subprocess.Popen         (daemon spawn)
                           Teardown removes the tempdir unconditionally.
+                          Acceptance: BEFORE/AFTER ls /tmp/cozempic_guard_* count equal
+                          when daemon tests run against unpatched (base) source.
     """
 
     def setup_method(self):
@@ -324,12 +332,18 @@ class TestStartGuardNanInfValidation:
 
     def test_start_guard_daemon_threshold_mb_nan_raises_config_error(self):
         """start_guard_daemon(threshold_mb=float('nan')) must raise ConfigError before spawn.
-        RED at base: nan <= 0 is False, validation silently passes, daemon spawned with nan.
+        RED at base: nan <= 0 is False, validation silently passes; execution reaches
+        DaemonSpawnClaim which creates /tmp/cozempic_guard_*.pid via O_CREAT|O_EXCL,
+        and open(log_file) creates /tmp/cozempic_guard_*.log — two real /tmp artifacts.
 
-        All I/O primitives between function entry and Popen are mocked:
-          - _cleanup_legacy_pid      (first I/O: legacy pid file cleanup)
-          - _reload_sentinel_active  (sentinel file check)
+        All I/O primitives between function entry and Popen are mocked to guarantee
+        zero /tmp/cozempic_guard_* files even when running against the unpatched source:
+          - _cleanup_legacy_pid      (legacy pid cleanup)
+          - _reload_sentinel_active  (sentinel file read — only fires when session_id set)
+          - find_current_session     (jsonl directory scan — fires when no session_id)
           - _is_guard_running_for_session (pid file read)
+          - _guard_tmp_root          (redirects pid/log path construction to self._tmpdir)
+          - cozempic.spawn_lock.DaemonSpawnClaim (O_CREAT|O_EXCL on .pid — the leak source)
           - subprocess.Popen         (daemon spawn — must never be reached)
         """
         from cozempic.guard import start_guard_daemon
@@ -337,7 +351,10 @@ class TestStartGuardNanInfValidation:
         with (
             patch("cozempic.guard._cleanup_legacy_pid"),
             patch("cozempic.guard._reload_sentinel_active", return_value=False),
+            patch("cozempic.guard.find_current_session", return_value=None),
             patch("cozempic.guard._is_guard_running_for_session", return_value=None),
+            patch("cozempic.guard._guard_tmp_root", return_value=Path(self._tmpdir)),
+            patch("cozempic.spawn_lock.DaemonSpawnClaim"),
             patch("cozempic.guard.subprocess.Popen"),
         ):
             with self.assertRaisesLike(ConfigError, "finite"):
@@ -347,16 +364,19 @@ class TestStartGuardNanInfValidation:
 
     def test_start_guard_daemon_threshold_mb_inf_raises_config_error(self):
         """start_guard_daemon(threshold_mb=float('inf')) must raise ConfigError before spawn.
-        RED at base: inf <= 0 is False, validation silently passes, daemon spawned with inf.
+        RED at base: inf <= 0 is False; same leak pattern as nan (two /tmp artifacts).
 
-        All I/O primitives between function entry and Popen are mocked.
+        All I/O primitives mocked — see test_start_guard_daemon_threshold_mb_nan for details.
         """
         from cozempic.guard import start_guard_daemon
         from cozempic._validation import ConfigError
         with (
             patch("cozempic.guard._cleanup_legacy_pid"),
             patch("cozempic.guard._reload_sentinel_active", return_value=False),
+            patch("cozempic.guard.find_current_session", return_value=None),
             patch("cozempic.guard._is_guard_running_for_session", return_value=None),
+            patch("cozempic.guard._guard_tmp_root", return_value=Path(self._tmpdir)),
+            patch("cozempic.spawn_lock.DaemonSpawnClaim"),
             patch("cozempic.guard.subprocess.Popen"),
         ):
             with self.assertRaisesLike(ConfigError, "finite"):
