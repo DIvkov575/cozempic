@@ -2985,3 +2985,89 @@ class TestGetMemdirUnderscoreProject(unittest.TestCase):
             "Slug with double-dash is not being matched."
         )
         self.assertEqual(result, mem_dir)
+
+
+class TestMemdirCreateFirstRun(unittest.TestCase):
+    """1.8.22: on a brand-new project Claude Code creates memory/ lazily, so the
+    first SessionStart sync found nothing. sync_to_memdir now CREATES memory/ under
+    an existing project dir (proving the slug is right) but never fabricates the
+    project dir (slug-mismatch safety)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.config = self.tmp / "cc"
+        self.cwd = "/test/newproj"
+        self.slug = "-" + self.cwd.lstrip("/").replace("/", "-")
+        self.proj = self.config / "projects" / self.slug
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_create_false_is_noncreating(self):
+        self.proj.mkdir(parents=True)  # project dir exists, memory/ absent
+        with patch.dict("os.environ", {"CLAUDE_CONFIG_DIR": str(self.config)}):
+            self.assertIsNone(_get_memdir(self.cwd))                 # default: no create
+            self.assertFalse((self.proj / "memory").exists())
+
+    def test_create_true_makes_memdir_under_existing_project(self):
+        self.proj.mkdir(parents=True)
+        with patch.dict("os.environ", {"CLAUDE_CONFIG_DIR": str(self.config)}):
+            md = _get_memdir(self.cwd, create=True)
+        self.assertIsNotNone(md)
+        self.assertTrue(md.exists() and md.name == "memory")
+
+    def test_create_true_does_not_fabricate_project_dir(self):
+        # project dir does NOT exist → must not create anything under a guessed slug
+        with patch.dict("os.environ", {"CLAUDE_CONFIG_DIR": str(self.config)}):
+            self.assertIsNone(_get_memdir(self.cwd, create=True))
+        self.assertFalse(self.proj.exists())
+
+    def test_sync_creates_memdir_and_writes_on_first_run(self):
+        self.proj.mkdir(parents=True)  # project exists (transcript), memory/ does not
+        store = DigestStore(project=self.cwd)
+        store.strategy_rules.append(DigestRule(
+            id="R001", rule="Always run tests before commit", priority="hard",
+            scope="general", source_reliability=1.0, type_prior=0.8,
+            occurrence_count=5, status="active",
+        ))
+        with patch.dict("os.environ", {"CLAUDE_CONFIG_DIR": str(self.config)}):
+            n = sync_to_memdir(store, cwd=self.cwd)
+        self.assertGreater(n, 0)
+        self.assertTrue((self.proj / "memory" / "cozempic_digest.md").exists())
+
+
+class TestDigestInjectMessage(unittest.TestCase):
+    """1.8.22: the `inject` CLI message must distinguish a genuinely-missing memory
+    dir from 'no active rules to sync' — the old code printed 'Could not find Claude
+    Code memory directory' for both (overloaded → misleading on first run)."""
+
+    def _run(self, memdir, synced):
+        from unittest.mock import MagicMock as _MM
+        from types import SimpleNamespace
+        import io
+        from cozempic.cli import cmd_digest
+        store = _MM()
+        store.is_empty.return_value = False
+        buf = io.StringIO()
+        with patch("cozempic.digest.load_digest_store", return_value=store), \
+             patch("cozempic.digest.sync_to_memdir", return_value=synced), \
+             patch("cozempic.digest._get_memdir", return_value=memdir), \
+             patch("cozempic.digest.save_digest_store"), \
+             patch("sys.stdout", buf):
+            cmd_digest(SimpleNamespace(digest_action="inject", cwd="/x"))
+        return buf.getvalue()
+
+    def test_dir_missing_says_not_found_yet(self):
+        out = self._run(None, 0)
+        self.assertIn("not found yet", out)
+        self.assertNotIn("No active rules", out)
+
+    def test_dir_exists_no_active_rules(self):
+        out = self._run(Path("/x/memory"), 0)
+        self.assertIn("No active rules", out)
+        self.assertNotIn("Could not find", out)
+
+    def test_synced_count(self):
+        out = self._run(Path("/x/memory"), 3)
+        self.assertIn("Synced 3", out)

@@ -57,8 +57,68 @@ def _mark_checked() -> None:
         pass
 
 
+def _install_method() -> str:
+    """Best-effort detection of HOW cozempic was installed, so we pick an upgrade
+    mechanism that actually works. Homebrew kegs and `uv tool` installs cannot be
+    upgraded by pip — the running binary never moves — which is why a brew/uvx
+    install silently stays behind on the pip-based auto-updater.
+
+    Returns one of: "brew", "uv-tool", "pipx", "pip".
+    """
+    try:
+        path = str(Path(__file__).resolve()).replace("\\", "/").lower()
+    except Exception:
+        path = ""
+    if "/cellar/cozempic/" in path:          # Homebrew keg (any prefix)
+        return "brew"
+    if "/uv/tools/cozempic/" in path:        # `uv tool install cozempic`
+        return "uv-tool"
+    if "/pipx/venvs/cozempic/" in path:      # `pipx install cozempic`
+        return "pipx"
+    return "pip"
+
+
+def _upgrade_hint(method: str | None = None) -> str:
+    """The correct manual upgrade command for the detected install method."""
+    return {
+        "brew": "brew upgrade cozempic",
+        "uv-tool": "uv tool upgrade cozempic",
+        "pipx": "pipx upgrade cozempic",
+    }.get(method or _install_method(), "pip install --upgrade cozempic")
+
+
 def _do_upgrade(latest: str) -> bool:
-    """Try to upgrade cozempic. Tries uv first (fast, common), then pip."""
+    """Upgrade cozempic using the mechanism that matches the install method.
+
+    brew is intentionally NOT auto-run (it needs a tap refresh and can be slow /
+    interactive — wrong to fire from a SessionStart hook); the caller surfaces an
+    accurate `brew upgrade cozempic` hint instead. uv-tool/pipx get their proper
+    upgrade command. pip/uv-pip envs use the in-place install chain.
+    """
+    method = _install_method()
+    if method == "brew":
+        return False  # can't safely auto-upgrade a keg; caller prints the hint
+    if method == "uv-tool":
+        if shutil.which("uv"):
+            try:
+                r = subprocess.run(["uv", "tool", "upgrade", "cozempic"],
+                                   capture_output=True, timeout=120)
+                if r.returncode == 0:
+                    return True
+            except Exception:
+                pass
+        return False
+    if method == "pipx":
+        if shutil.which("pipx"):
+            try:
+                r = subprocess.run(["pipx", "upgrade", "cozempic"],
+                                   capture_output=True, timeout=120)
+                if r.returncode == 0:
+                    return True
+            except Exception:
+                pass
+        return False
+    # method == "pip": in-place install into the managed env.
     # Try uv pip install first (works in uv-managed environments)
     if shutil.which("uv"):
         try:
@@ -91,19 +151,6 @@ def _do_upgrade(latest: str) -> bool:
             result = subprocess.run(
                 ["pip", "install", f"cozempic=={latest}",
                  "--quiet", "--disable-pip-version-check"],
-                capture_output=True,
-                timeout=60,
-            )
-            if result.returncode == 0:
-                return True
-        except Exception:
-            pass
-
-    # Try pipx upgrade (for pipx-installed users)
-    if shutil.which("pipx"):
-        try:
-            result = subprocess.run(
-                ["pipx", "upgrade", "cozempic"],
                 capture_output=True,
                 timeout=60,
             )
@@ -167,6 +214,14 @@ def maybe_auto_update(force: bool = False, silent: bool = False) -> None:
     if _version_tuple(latest) <= _version_tuple(__version__):
         return
 
+    method = _install_method()
+    # Homebrew kegs can't be auto-upgraded in place — don't claim we're "updating".
+    if method == "brew":
+        if not silent:
+            print(f"  Cozempic: v{latest} available — run: {_upgrade_hint('brew')} "
+                  f"(Homebrew installs don't auto-update).", flush=True)
+        return
+
     if not silent:
         print(f"  Cozempic: updating {__version__} → {latest}...", flush=True)
     if _do_upgrade(latest):
@@ -183,4 +238,4 @@ def maybe_auto_update(force: bool = False, silent: bool = False) -> None:
             print(f"  Cozempic: updated to v{latest} — active on next run (this process still v{__version__}).", flush=True)
     else:
         if not silent:
-            print(f"  Cozempic: auto-update failed. Run: pip install --upgrade cozempic", flush=True)
+            print(f"  Cozempic: auto-update failed. Run: {_upgrade_hint(method)}", flush=True)

@@ -1405,13 +1405,20 @@ def cmd_digest(args):
         if store.is_empty():
             print("No rules to inject.")
             return
-        from .digest import sync_to_memdir
+        from .digest import sync_to_memdir, _get_memdir
         synced = sync_to_memdir(store, cwd=cwd)
         if synced > 0:
             save_digest_store(store)
             print(f"Synced {synced} active rules to Claude Code memory.")
+        elif _get_memdir(cwd) is None:
+            # Distinguish a genuinely-missing dir from "nothing to sync": on a brand-
+            # new project the memory dir may not exist yet (Claude Code creates it),
+            # so this self-resolves on a later turn — not an error.
+            print("Claude Code memory directory not found yet — will sync once it exists.")
         else:
-            print("Could not find Claude Code memory directory.")
+            # Dir exists; there just aren't any ACTIVE rules to write (rules activate
+            # after 2 occurrences). The previous code mislabeled this as "dir not found".
+            print("No active rules to sync yet.")
 
 
 # ─── Parser ───────────────────────────────────────────────────────────────────

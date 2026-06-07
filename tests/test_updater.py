@@ -123,3 +123,80 @@ class TestMaybeAutoUpdate(unittest.TestCase):
                 from cozempic.updater import maybe_auto_update
                 maybe_auto_update()
                 mock_upgrade.assert_not_called()
+
+
+class TestInstallMethodDetection(unittest.TestCase):
+    """1.8.22: auto-update must pick a mechanism that matches the install method —
+    pip can't upgrade a Homebrew keg or a `uv tool` install (the binary on PATH
+    never moves), which is why brew/uvx users silently stayed behind."""
+
+    def _method_for(self, path):
+        from cozempic import updater
+        with patch.object(updater, "__file__", path):
+            return updater._install_method()
+
+    def test_detects_brew_keg(self):
+        self.assertEqual(self._method_for(
+            "/opt/homebrew/Cellar/cozempic/1.8.22/libexec/lib/python3.12/site-packages/cozempic/updater.py"),
+            "brew")
+
+    def test_detects_uv_tool(self):
+        self.assertEqual(self._method_for(
+            "/Users/x/.local/share/uv/tools/cozempic/lib/python3.12/site-packages/cozempic/updater.py"),
+            "uv-tool")
+
+    def test_detects_pipx(self):
+        self.assertEqual(self._method_for(
+            "/Users/x/.local/pipx/venvs/cozempic/lib/python3.12/site-packages/cozempic/updater.py"),
+            "pipx")
+
+    def test_defaults_to_pip(self):
+        self.assertEqual(self._method_for(
+            "/Users/x/proj/.venv/lib/python3.12/site-packages/cozempic/updater.py"),
+            "pip")
+
+
+class TestDoUpgradeDispatch(unittest.TestCase):
+    def test_brew_never_autoruns(self):
+        from cozempic import updater
+        with patch.object(updater, "_install_method", return_value="brew"), \
+             patch("cozempic.updater.subprocess.run") as run:
+            self.assertFalse(updater._do_upgrade("9.9.9"))
+            run.assert_not_called()
+
+    def test_uv_tool_runs_uv_tool_upgrade(self):
+        from cozempic import updater
+        with patch.object(updater, "_install_method", return_value="uv-tool"), \
+             patch("cozempic.updater.shutil.which", return_value="/usr/bin/uv"), \
+             patch("cozempic.updater.subprocess.run",
+                   return_value=MagicMock(returncode=0)) as run:
+            self.assertTrue(updater._do_upgrade("9.9.9"))
+            self.assertEqual(run.call_args[0][0], ["uv", "tool", "upgrade", "cozempic"])
+
+    def test_pip_uses_install_chain(self):
+        from cozempic import updater
+        with patch.object(updater, "_install_method", return_value="pip"), \
+             patch("cozempic.updater.shutil.which", return_value=None), \
+             patch("cozempic.updater.subprocess.run",
+                   return_value=MagicMock(returncode=0)) as run:
+            self.assertTrue(updater._do_upgrade("9.9.9"))
+            # first attempt is `pip install cozempic==…` via sys.executable
+            self.assertIn("install", run.call_args[0][0])
+
+
+class TestMaybeAutoUpdateBrew(unittest.TestCase):
+    def test_brew_prints_hint_and_does_not_attempt(self):
+        import io
+        from cozempic import updater
+        buf = io.StringIO()
+        with patch("sys.stdout", buf), \
+             patch("cozempic.updater._should_check", return_value=True), \
+             patch("cozempic.updater._mark_checked"), \
+             patch("cozempic.updater._get_latest_version", return_value="99.0.0"), \
+             patch.object(updater, "_install_method", return_value="brew"), \
+             patch("cozempic.updater._do_upgrade") as up:
+            updater.maybe_auto_update()
+            up.assert_not_called()
+        out = buf.getvalue()
+        self.assertIn("brew upgrade cozempic", out)
+        self.assertNotIn("updating", out.lower())
