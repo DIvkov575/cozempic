@@ -778,7 +778,12 @@ def start_guard(
                     for s in state.subagents
                 )
 
-            # ── Phase 4: HARD2 (80%) — aggressive + reload (ALWAYS, even with agents) ──
+            # ── Phase 4: HARD2 (80%) — aggressive + reload, GATED by the
+            #    safe-point check. NEVER force-terminates through in-flight work
+            #    (running Workflow / subagent / open call): the safe_to_reload gate
+            #    inside guard_prune_cycle defers those to a read-only checkpoint and
+            #    lets the autocompact wall be the lesser evil. (Was: "reload ALWAYS,
+            #    even with agents" — that was the catastrophic data-loss bug.) ──
             hard2_tokens_hit = (
                 hard2_threshold_tokens is not None
                 and current_tokens is not None
@@ -787,10 +792,8 @@ def start_guard(
             if hard2_tokens_hit:
                 prune_count += 1
                 reason = f"{current_tokens:,} tokens >= {hard2_threshold_tokens:,} (80%)"
-                print(f"  [{_now()}] EMERGENCY THRESHOLD (80%): {reason}")
-                if agents_active:
-                    print(f"  WARNING: Agents are active but compaction is imminent — reload required.")
-                print(f"  Aggressive prune + reload (cycle #{prune_count})...")
+                print(f"  [{_now()}] HARD2 THRESHOLD (80%): {reason}")
+                print(f"  Aggressive prune + reload (cycle #{prune_count}) — gated by safe-point check...")
 
                 result = guard_prune_cycle(
                     session_path=session_path,
@@ -814,7 +817,9 @@ def start_guard(
                     print(f"  Reload triggered. Guard exiting.")
                     break
 
-                if result.get("live_write_skipped"):
+                if result.get("reload_unsafe"):
+                    pass  # safe-point gate already printed "Reload DEFERRED — <reason>"
+                elif result.get("live_write_skipped"):
                     print(f"  Read-only — live session not rewritten (#106).")
                 elif result.get("futile_reload_skipped"):
                     pass  # futile prune — nothing persisted (live file untouched)
@@ -879,7 +884,9 @@ def start_guard(
                     print(f"  Reload triggered. Guard exiting.")
                     break
 
-                if result.get("live_write_skipped"):
+                if result.get("reload_unsafe"):
+                    pass  # safe-point gate already printed "Reload DEFERRED — <reason>"
+                elif result.get("live_write_skipped"):
                     print(f"  Read-only — live session not rewritten (#106).")
                 elif result.get("futile_reload_skipped"):
                     pass  # futile prune — nothing persisted (live file untouched)
@@ -1242,6 +1249,29 @@ def guard_prune_cycle(
     if auto_reload:
         reload_pid = claude_pid if claude_pid is not None else find_claude_pid()
         if reload_pid:
+            # ── SAFE-POINT GATE (1.8.22) — validate BEFORE terminate ──────────
+            # NEVER SIGKILL the process while in-flight work would be destroyed:
+            # a running Workflow-tool orchestration, a background subagent, an
+            # open tool call, or an active agent team. That state is harness-side
+            # / not-yet-flushed and a transcript resume cannot recover it. Unsafe
+            # ⇒ read-only checkpoint + defer (the autocompact wall is the lesser
+            # evil — it keeps the live process + workflow alive; a terminate kills
+            # them). Applies to ALL tiers incl. HARD2 (replaces the old "reload
+            # ALWAYS, even with agents" behavior — the catastrophic bug).
+            _safe, _reason = safe_to_reload(team_state, messages, session_path)
+            if not _safe:
+                print(
+                    f"  [{_now()}] Reload DEFERRED — {_reason}. NOT terminating "
+                    f"Claude (would destroy in-flight work); read-only checkpoint "
+                    f"kept. Will reload once the session is at a safe point.",
+                    file=sys.stderr,
+                )
+                result["saved_mb"] = 0.0
+                result["live_write_skipped"] = True
+                result["reload_unsafe"] = True
+                result["unsafe_reason"] = _reason
+                result["futile_reload_skipped"] = True  # account to breaker → back off
+                return result
             # Cross-respawn reload-rate cap: if this session has already reloaded
             # too many times within the window, stop auto-reloading it. A session
             # that re-bloats to threshold immediately after each prune would
@@ -1901,6 +1931,143 @@ def _reload_ledger_max() -> int:
         return max(1, int(os.environ.get("COZEMPIC_RELOAD_MAX", "3")))
     except Exception:
         return 3
+
+
+# ── In-flight work detector (1.8.22 safe-point gate, component A) ─────────────
+# A guard reload SIGKILLs the Claude process and resumes from the pruned
+# transcript. Harness-side state that is NOT in the transcript — a running
+# Workflow-tool orchestration, a background subagent — is destroyed with no
+# recovery. cozempic could not see these before. This detects them from the
+# transcript via launch/completion markers (both DO appear in the JSONL):
+#   - Workflow launch:  "Workflow launched in background. Task ID: <id>"
+#   - background launch: "running in background with ID: <id>"
+#   - completion:        <task-notification>...<task-id><id></task-id>...<status>completed|failed</status>
+# plus any open synchronous tool_use with no matching tool_result (a tool/subagent
+# mid-call). Conservative by construction: it flags only on positive
+# launch-without-completion or a genuinely open call, so it does not over-defer.
+_WF_LAUNCH_RE = re.compile(r"Workflow launched in background\. *Task ID: *([A-Za-z0-9_-]+)", re.IGNORECASE)
+_BG_LAUNCH_RE = re.compile(r"running in background with ID: *([A-Za-z0-9_-]+)", re.IGNORECASE)
+_TN_BLOCK_RE = re.compile(r"<task-notification>(.*?)</task-notification>", re.DOTALL | re.IGNORECASE)
+_TN_ID_RE = re.compile(r"<task-id>([^<]+)</task-id>", re.IGNORECASE)
+_TN_STATUS_RE = re.compile(r"<status>([^<]+)</status>", re.IGNORECASE)
+_INFLIGHT_DONE = {"completed", "failed", "cancelled", "canceled", "stopped", "killed", "error"}
+
+
+def _msg_dict(item) -> dict:
+    """Accept either a (idx, dict, size) tuple or a raw message dict."""
+    if isinstance(item, tuple):
+        return item[1] if len(item) > 1 and isinstance(item[1], dict) else {}
+    return item if isinstance(item, dict) else {}
+
+
+def _msg_text(msg: dict) -> str:
+    """Collect all human/tool text from a message for marker scanning."""
+    out = []
+    root = msg.get("content")
+    if isinstance(root, str):
+        out.append(root)
+    inner = (msg.get("message") or {})
+    c = inner.get("content")
+    if isinstance(c, str):
+        out.append(c)
+    elif isinstance(c, list):
+        for b in c:
+            if not isinstance(b, dict):
+                continue
+            if isinstance(b.get("text"), str):
+                out.append(b["text"])
+            rc = b.get("content")
+            if isinstance(rc, str):
+                out.append(rc)
+            elif isinstance(rc, list):
+                for sub in rc:
+                    if isinstance(sub, dict) and isinstance(sub.get("text"), str):
+                        out.append(sub["text"])
+    return "\n".join(out)
+
+
+def detect_in_flight(messages) -> dict:
+    """Detect harness-side in-flight work the transcript reload would destroy.
+
+    Returns {workflow: bool, background: bool, open_call: bool, ids: [...]}.
+    workflow/background = launched-but-not-completed background tasks; open_call =
+    a tool_use with no matching tool_result (synchronous mid-call).
+    """
+    launched_wf: set[str] = set()
+    launched_bg: set[str] = set()
+    completed: set[str] = set()
+    use_ids: set[str] = set()
+    res_ids: set[str] = set()
+    for item in messages or []:
+        msg = _msg_dict(item)
+        if not msg:
+            continue
+        text = _msg_text(msg)
+        if text:
+            for m in _WF_LAUNCH_RE.findall(text):
+                launched_wf.add(m.strip())
+            for m in _BG_LAUNCH_RE.findall(text):
+                launched_bg.add(m.strip())
+            for blk in _TN_BLOCK_RE.findall(text):
+                ids = _TN_ID_RE.findall(blk)
+                sts = _TN_STATUS_RE.findall(blk)
+                if ids and sts and sts[-1].strip().lower() in _INFLIGHT_DONE:
+                    completed.add(ids[0].strip())
+        inner = (msg.get("message") or {})
+        c = inner.get("content")
+        if isinstance(c, list):
+            for b in c:
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "tool_use" and b.get("id"):
+                    use_ids.add(b["id"])
+                elif b.get("type") == "tool_result" and b.get("tool_use_id"):
+                    res_ids.add(b["tool_use_id"])
+    wf = launched_wf - completed
+    bg = launched_bg - completed
+    open_call = bool(use_ids - res_ids)
+    return {
+        "workflow": bool(wf),
+        "background": bool(bg),
+        "open_call": open_call,
+        "ids": sorted(wf | bg),
+    }
+
+
+def safe_to_reload(team_state, messages, session_path) -> tuple[bool, str]:
+    """Validate-BEFORE-terminate safe-point gate (1.8.22 component B).
+
+    A reload terminates Claude and resumes from the pruned transcript. It is only
+    safe when nothing in-flight would be destroyed. Returns (safe, reason).
+    Conservative: any positive in-flight signal ⇒ unsafe ⇒ caller defers
+    (read-only checkpoint + warn), never force-terminates. Never blocks a
+    genuinely-quiescent reload (avoids re-creating the inert guard).
+    """
+    inflight = detect_in_flight(messages)
+    # Tracked team quiescence (uses TeamState; build_team_recovery_receipt would
+    # return verdict!="complete" for the same conditions — this is that gate,
+    # enforced where the receipt never was).
+    if team_state is not None and not team_state.is_empty():
+        try:
+            if any((s.status or "").lower() in ("running", "unknown") for s in (team_state.subagents or [])):
+                return (False, "subagent mid-execution")
+            if any((t.status or "").lower() not in ("done", "completed") for t in (team_state.teammates or [])):
+                return (False, "teammate not quiesced")
+            active_tasks, _, _ = team_state._task_groups()
+            if active_tasks:
+                return (False, "active task in flight")
+        except Exception:
+            # Malformed state → be conservative.
+            return (False, "team state unreadable")
+    # Harness-side in-flight work (workflows/background/open calls) — the gap
+    # cozempic was blind to. NEVER reload through these.
+    if inflight["workflow"]:
+        return (False, "Workflow orchestrating")
+    if inflight["background"]:
+        return (False, "background task in flight")
+    if inflight["open_call"]:
+        return (False, "open tool call (result not yet flushed)")
+    return (True, "quiescent")
 
 
 def _reload_ledger_path(session_id: str | None, session_path: Path) -> Path:
