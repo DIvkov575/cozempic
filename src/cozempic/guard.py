@@ -351,7 +351,11 @@ def _validate_finite_thresholds(
     'must be a finite number' when any float param is nan or inf.
 
     Int params (e.g. threshold_tokens=10_000) are naturally skipped via the
-    isinstance(..., float) check — they cannot be nan/inf.
+    isinstance(..., float) check — they cannot be nan/inf, and math.isfinite
+    on a huge int (e.g. 10**400) would raise OverflowError.  The try/except
+    below mirrors coerce_positive_float's P0-F guard for class-of-bug parity;
+    in practice the isinstance gate makes it unreachable, but defensive code
+    should not rely on call-site discipline.
     """
     from ._validation import ConfigError
 
@@ -362,7 +366,13 @@ def _validate_finite_thresholds(
         ("threshold_tokens", threshold_tokens),
         ("soft_threshold_tokens", soft_threshold_tokens),
     ):
-        if isinstance(_v, float) and not math.isfinite(_v):
+        if not isinstance(_v, float):
+            continue
+        try:
+            _nonfinite = not math.isfinite(_v)
+        except OverflowError:
+            _nonfinite = True  # int too large to convert to float — treat as non-finite
+        if _nonfinite:
             raise ConfigError(f"{_name} must be a finite number, got {_v!r}")
 
 

@@ -213,10 +213,38 @@ class TestGuardArgparseValidation:
         self._assert_argparse_rejects(["remind", "--interval", "-5"])
 
 
+def _assert_raises_like(exc_type, substr):
+    """Context manager: assert exc_type is raised and substr appears in str(e).
+
+    Module-level helper shared by TestStartGuardOrderingValidation,
+    TestStartGuardNanInfValidation, and TestReloadSelfDaemonNanInfValidation.
+    """
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _ctx():
+        try:
+            yield
+        except exc_type as e:
+            assert substr in str(e), f"expected {substr!r} in {e!r}"
+            return
+        raise AssertionError(f"expected {exc_type.__name__}, nothing raised")
+
+    return _ctx()
+
+
 class TestStartGuardOrderingValidation:
     """After argparse, soft thresholds may be resolved from defaults
     (60% of threshold). The soft < hard invariant must hold at that point
     too — checked inside start_guard, not just at argparse."""
+
+    def setup_method(self):
+        import tempfile
+        self._tmpdir = tempfile.mkdtemp(prefix="_cozempic_ordering_test_")
+
+    def teardown_method(self):
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
 
     def _call_start_guard(self, **kwargs):
         from cozempic.guard import start_guard
@@ -224,43 +252,31 @@ class TestStartGuardOrderingValidation:
 
     def test_soft_mb_equal_hard_mb_rejected(self):
         from cozempic._validation import ConfigError
-        with self.assertRaisesLike(ConfigError, "strictly less"):
+        with _assert_raises_like(ConfigError, "strictly less"):
             self._call_start_guard(
                 threshold_mb=50.0,
                 soft_threshold_mb=50.0,
-                cwd="/tmp/_cozempic_test_nonexistent_session",
+                cwd=self._tmpdir,
             )
 
     def test_soft_mb_greater_than_hard_mb_rejected(self):
         from cozempic._validation import ConfigError
-        with self.assertRaisesLike(ConfigError, "strictly less"):
+        with _assert_raises_like(ConfigError, "strictly less"):
             self._call_start_guard(
                 threshold_mb=50.0,
                 soft_threshold_mb=100.0,
-                cwd="/tmp/_cozempic_test_nonexistent_session",
+                cwd=self._tmpdir,
             )
 
     def test_soft_tokens_greater_than_threshold_tokens_rejected(self):
         from cozempic._validation import ConfigError
-        with self.assertRaisesLike(ConfigError, "strictly less"):
+        with _assert_raises_like(ConfigError, "strictly less"):
             self._call_start_guard(
                 threshold_mb=50.0,
                 threshold_tokens=10_000,
                 soft_threshold_tokens=20_000,
-                cwd="/tmp/_cozempic_test_nonexistent_session",
+                cwd=self._tmpdir,
             )
-
-    # pytest-style: contextmanager mimic
-    from contextlib import contextmanager
-
-    @contextmanager
-    def assertRaisesLike(self, exc_type, substr):
-        try:
-            yield
-        except exc_type as e:
-            assert substr in str(e), f"expected {substr!r} in {e!r}"
-            return
-        raise AssertionError(f"expected {exc_type.__name__}, nothing raised")
 
 
 class TestStartGuardNanInfValidation:
@@ -300,25 +316,13 @@ class TestStartGuardNanInfValidation:
         import shutil
         shutil.rmtree(self._tmpdir, ignore_errors=True)
 
-    # pytest-style: contextmanager mimic (same pattern as TestStartGuardOrderingValidation)
-    from contextlib import contextmanager
-
-    @contextmanager
-    def assertRaisesLike(self, exc_type, substr):
-        try:
-            yield
-        except exc_type as e:
-            assert substr in str(e), f"expected {substr!r} in {e!r}"
-            return
-        raise AssertionError(f"expected {exc_type.__name__}, nothing raised")
-
     def test_start_guard_threshold_mb_nan_raises_config_error(self):
         """start_guard(threshold_mb=float('nan')) must raise ConfigError with 'finite'.
         RED at base: nan <= 0 is False, validation bypassed; ValueError raised downstream
         at int(nan * 1024 * 1024) instead of ConfigError at the validation block."""
         from cozempic.guard import start_guard
         from cozempic._validation import ConfigError
-        with self.assertRaisesLike(ConfigError, "finite"):
+        with _assert_raises_like(ConfigError, "finite"):
             start_guard(threshold_mb=float("nan"), cwd=self._tmpdir)
 
     def test_start_guard_threshold_mb_inf_raises_config_error(self):
@@ -327,7 +331,7 @@ class TestStartGuardNanInfValidation:
         instead of ConfigError at the validation block."""
         from cozempic.guard import start_guard
         from cozempic._validation import ConfigError
-        with self.assertRaisesLike(ConfigError, "finite"):
+        with _assert_raises_like(ConfigError, "finite"):
             start_guard(threshold_mb=float("inf"), cwd=self._tmpdir)
 
     def test_start_guard_daemon_threshold_mb_nan_raises_config_error(self):
@@ -357,7 +361,7 @@ class TestStartGuardNanInfValidation:
             patch("cozempic.spawn_lock.DaemonSpawnClaim"),
             patch("cozempic.guard.subprocess.Popen"),
         ):
-            with self.assertRaisesLike(ConfigError, "finite"):
+            with _assert_raises_like(ConfigError, "finite"):
                 start_guard_daemon(
                     threshold_mb=float("nan"), cwd=self._tmpdir
                 )
@@ -379,7 +383,7 @@ class TestStartGuardNanInfValidation:
             patch("cozempic.spawn_lock.DaemonSpawnClaim"),
             patch("cozempic.guard.subprocess.Popen"),
         ):
-            with self.assertRaisesLike(ConfigError, "finite"):
+            with _assert_raises_like(ConfigError, "finite"):
                 start_guard_daemon(
                     threshold_mb=float("inf"), cwd=self._tmpdir
                 )
@@ -394,25 +398,12 @@ class TestReloadSelfDaemonNanInfValidation:
     ConfigError (from start_guard_daemon's validator), leaving the session
     completely unprotected.
 
-    RED at base: reload_self_daemon calls os.kill before raising — daemon is
-    killed even though the new config is invalid. These tests must FAIL at
-    base and PASS after _validate_finite_thresholds() is called at the top
-    of reload_self_daemon.
+    Regression guard: _validate_finite_thresholds() is called at the top of
+    reload_self_daemon before any I/O, so a NaN/inf threshold_mb raises
+    ConfigError before os.kill is reached — the live daemon is never orphaned.
 
     All I/O between entry and the kill is mocked per isolate-subprocess-tests-by-design.
     """
-
-    # pytest-style: contextmanager mimic
-    from contextlib import contextmanager
-
-    @contextmanager
-    def assertRaisesLike(self, exc_type, substr):
-        try:
-            yield
-        except exc_type as e:
-            assert substr in str(e), f"expected {substr!r} in {e!r}"
-            return
-        raise AssertionError(f"expected {exc_type.__name__}, nothing raised")
 
     def _make_mocks(self):
         """Return a context manager that mocks all I/O in reload_self_daemon
@@ -449,13 +440,12 @@ class TestReloadSelfDaemonNanInfValidation:
     def test_reload_self_daemon_threshold_mb_nan_raises_before_kill(self):
         """reload_self_daemon(threshold_mb=nan) must raise ConfigError BEFORE os.kill.
 
-        RED at base: no finite check exists at entry; os.kill fires on the live
-        daemon (99999), THEN start_guard_daemon raises ConfigError — session orphaned.
-        After fix: _validate_finite_thresholds fires first, os.kill is never called."""
+        Regression guard: _validate_finite_thresholds() fires at entry, ConfigError
+        is raised before os.kill — the live daemon (99999) is never orphaned."""
         from cozempic.guard import reload_self_daemon
         from cozempic._validation import ConfigError
         with self._make_mocks() as mock_kill:
-            with self.assertRaisesLike(ConfigError, "finite"):
+            with _assert_raises_like(ConfigError, "finite"):
                 reload_self_daemon(
                     threshold_mb=float("nan"),
                     session_id="00000000-0000-0000-0000-000000000001",
@@ -467,11 +457,12 @@ class TestReloadSelfDaemonNanInfValidation:
     def test_reload_self_daemon_threshold_mb_inf_raises_before_kill(self):
         """reload_self_daemon(threshold_mb=inf) must raise ConfigError BEFORE os.kill.
 
-        RED at base: inf <= 0 is False; same orphan-daemon failure mode as nan."""
+        Regression guard: same orphan-daemon scenario with inf — ConfigError
+        fires before os.kill, daemon survives."""
         from cozempic.guard import reload_self_daemon
         from cozempic._validation import ConfigError
         with self._make_mocks() as mock_kill:
-            with self.assertRaisesLike(ConfigError, "finite"):
+            with _assert_raises_like(ConfigError, "finite"):
                 reload_self_daemon(
                     threshold_mb=float("inf"),
                     session_id="00000000-0000-0000-0000-000000000001",
