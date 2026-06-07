@@ -344,6 +344,102 @@ class TestStartGuardNanInfValidation:
                 )
 
 
+class TestReloadSelfDaemonNanInfValidation:
+    """NaN/inf bypass in reload_self_daemon — the critical third entry point (P0-D).
+
+    reload_self_daemon SIGTERMs/SIGKILLs the old daemon THEN calls
+    start_guard_daemon. Without a finite check BEFORE the kill, passing
+    threshold_mb=float('nan') kills the live daemon and then raises
+    ConfigError (from start_guard_daemon's validator), leaving the session
+    completely unprotected.
+
+    RED at base: reload_self_daemon calls os.kill before raising — daemon is
+    killed even though the new config is invalid. These tests must FAIL at
+    base and PASS after _validate_finite_thresholds() is called at the top
+    of reload_self_daemon.
+
+    All I/O between entry and the kill is mocked per isolate-subprocess-tests-by-design.
+    """
+
+    # pytest-style: contextmanager mimic
+    from contextlib import contextmanager
+
+    @contextmanager
+    def assertRaisesLike(self, exc_type, substr):
+        try:
+            yield
+        except exc_type as e:
+            assert substr in str(e), f"expected {substr!r} in {e!r}"
+            return
+        raise AssertionError(f"expected {exc_type.__name__}, nothing raised")
+
+    def _make_mocks(self):
+        """Return a context manager that mocks all I/O in reload_self_daemon
+        between the function entry and the os.kill call (inclusive).
+
+        Mocked:
+          - _is_guard_running_for_session → 99999 (fake PID — daemon appears running)
+          - _is_cozempic_guard_process     → True  (PID identity verified)
+          - os.kill                         → recorded, must NOT be called on nan/inf
+          - _wait_for_exit                  → True  (clean exit on SIGTERM)
+          - _pid_file_points_to             → False (CAS: leave pid file alone)
+          - _pid_file_for_session           → MagicMock (avoid real filesystem)
+          - start_guard_daemon              → {"started": True, "pid": 88888}
+        """
+        import contextlib
+        from unittest.mock import MagicMock, patch, call
+
+        @contextlib.contextmanager
+        def ctx():
+            with (
+                patch("cozempic.guard._is_guard_running_for_session", return_value=99999),
+                patch("cozempic.guard._is_cozempic_guard_process", return_value=True),
+                patch("cozempic.guard.os.kill") as mock_kill,
+                patch("cozempic.guard._wait_for_exit", return_value=True),
+                patch("cozempic.guard._pid_file_points_to", return_value=False),
+                patch("cozempic.guard._pid_file_for_session", return_value=MagicMock()),
+                patch("cozempic.guard.start_guard_daemon",
+                      return_value={"started": True, "pid": 88888, "log_file": "/tmp/x.log"}),
+            ):
+                yield mock_kill
+
+        return ctx()
+
+    def test_reload_self_daemon_threshold_mb_nan_raises_before_kill(self):
+        """reload_self_daemon(threshold_mb=nan) must raise ConfigError BEFORE os.kill.
+
+        RED at base: no finite check exists at entry; os.kill fires on the live
+        daemon (99999), THEN start_guard_daemon raises ConfigError — session orphaned.
+        After fix: _validate_finite_thresholds fires first, os.kill is never called."""
+        from cozempic.guard import reload_self_daemon
+        from cozempic._validation import ConfigError
+        with self._make_mocks() as mock_kill:
+            with self.assertRaisesLike(ConfigError, "finite"):
+                reload_self_daemon(
+                    threshold_mb=float("nan"),
+                    session_id="00000000-0000-0000-0000-000000000001",
+                )
+        assert not mock_kill.called, (
+            "os.kill was called before ConfigError — daemon was killed with an invalid config"
+        )
+
+    def test_reload_self_daemon_threshold_mb_inf_raises_before_kill(self):
+        """reload_self_daemon(threshold_mb=inf) must raise ConfigError BEFORE os.kill.
+
+        RED at base: inf <= 0 is False; same orphan-daemon failure mode as nan."""
+        from cozempic.guard import reload_self_daemon
+        from cozempic._validation import ConfigError
+        with self._make_mocks() as mock_kill:
+            with self.assertRaisesLike(ConfigError, "finite"):
+                reload_self_daemon(
+                    threshold_mb=float("inf"),
+                    session_id="00000000-0000-0000-0000-000000000001",
+                )
+        assert not mock_kill.called, (
+            "os.kill was called before ConfigError — daemon was killed with an invalid config"
+        )
+
+
 class TestReloadSessionFlag:
     """Reload must accept --session as an escape hatch when auto-detect fails."""
 
