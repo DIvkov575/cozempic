@@ -436,6 +436,11 @@ def extract_team_state(messages: list[Message]) -> TeamState:
     state = TeamState()
     seen_teammates: dict[str, TeammateInfo] = {}
     seen_subagents: dict[str, SubagentInfo] = {}
+    # Latest line index of a SendMessage to each teammate — used so a completion
+    # notification in the (later) second pass does NOT clobber a re-activation
+    # that chronologically followed it (the two-pass extractor would otherwise
+    # discard event ordering and mark a still-working teammate "completed").
+    last_send_line: dict[str, int] = {}
     seen_tasks: dict[str, TaskInfo] = {}
 
     # Track tool_use_id -> tool_name for matching results to calls
@@ -567,6 +572,7 @@ def extract_team_state(messages: list[Message]) -> TeamState:
                     target = inp.get("to", inp.get("agentId", ""))
                     if target and target in seen_teammates:
                         seen_teammates[target].status = "running"
+                        last_send_line[target] = line_idx
 
             # ── Tool result blocks ───────────────────────────────────
             elif block_type == "tool_result":
@@ -641,7 +647,11 @@ def extract_team_state(messages: list[Message]) -> TeamState:
             # "running" forever (nothing transitioned it), so the safe-point reload
             # gate could never recognize a finished team as quiesced — every
             # agent-team session (the guard's primary use case) would never reload.
-            if task_id in seen_teammates:
+            if task_id in seen_teammates and line_idx >= last_send_line.get(task_id, -1):
+                # Only mark terminal if this completion is the teammate's LATEST
+                # event. A SendMessage after this notification means the teammate
+                # was re-activated (working phase 2) → keep it 'running' so the
+                # safe-point gate still blocks a reload (don't destroy live work).
                 seen_teammates[task_id].status = status
 
             state.message_count += 1

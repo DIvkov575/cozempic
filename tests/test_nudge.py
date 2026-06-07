@@ -61,7 +61,7 @@ class TestNudge(unittest.TestCase):
         self.assertIsNotNone(m)
         self.assertIn("56%", m)
         self.assertIn("cozempic reload", m)
-        self.assertIn("your next idle", m.lower())
+        self.assertIn("pause between turns", m.lower())
 
     def test_80_tier_urgent_no_emergency_word(self):
         m = self._run(820_000, "s80")  # 82%
@@ -79,6 +79,19 @@ class TestNudge(unittest.TestCase):
         self.assertIsNone(self._run(560_000, "sy"))       # latched → silent
         self.assertIsNone(self._run(100_000, "sy"))       # dropped to 10% (< all tiers) → silent, clears latch
         self.assertIsNotNone(self._run(560_000, "sy"))    # re-cross 55 → re-fires
+
+    def test_hysteresis_no_refire_on_small_dip(self):
+        # 56%→54%→56% must fire the 55 nudge only ONCE (dip stays within the
+        # hysteresis band, so the tier doesn't re-arm).
+        self.assertIsNotNone(self._run(560_000, "hy"))  # 56% fires 55
+        self.assertIsNone(self._run(540_000, "hy"))      # 54% — within band, silent
+        self.assertIsNone(self._run(560_000, "hy"))      # back to 56% — still latched
+
+    def test_jump_then_dip_no_stale_lower_tier(self):
+        # Firing 55 latches 25 too; a later dip to the 25 band must NOT fire a
+        # stale 25% FYI (context went down, not up).
+        self.assertIsNotNone(self._run(560_000, "jd"))  # 56% fires 55 (+latches 25)
+        self.assertIsNone(self._run(300_000, "jd"))      # 30% — 25 already latched, silent
 
     def test_off_env_silences(self):
         self.assertIsNone(self._run(560_000, "soff", env={"COZEMPIC_NUDGE_OFF": "1"}))

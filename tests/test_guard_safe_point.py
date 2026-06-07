@@ -190,6 +190,40 @@ class TestSafeToReload(unittest.TestCase):
         self.assertFalse(safe)
         self.assertIn("teammate", reason)
 
+    def test_offvocab_subagent_status_blocks(self):
+        # DENYLIST: an unrecognized non-terminal status (hyphen variant, "busy",
+        # "executing"...) must fail SAFE (block), not fail-open and destroy work.
+        from cozempic.guard import safe_to_reload
+        from cozempic.team import TeamState, SubagentInfo
+        for st_val in ("in-progress", "busy", "executing", "processing", "waiting", "weird"):
+            ts = TeamState(team_name="t", subagents=[SubagentInfo("a1", "d", status=st_val)])
+            safe, _ = safe_to_reload(ts, [], None)
+            self.assertFalse(safe, f"off-vocab subagent status {st_val!r} must block")
+
+    def test_reactivated_teammate_after_completion_unsafe(self):
+        # P0 ordering: a completion followed by a NEW SendMessage (re-activation)
+        # must leave the teammate active, not "completed" — else a working teammate
+        # is destroyed. Drives extract_team_state end-to-end (two-pass).
+        from cozempic.team import extract_team_state
+        from cozempic.guard import safe_to_reload
+        msgs = [
+            (0, {"message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "u1", "name": "TeamCreate",
+                 "input": {"team_name": "t", "teammates": [{"agent_id": "alice", "name": "Alice"}]}}]}}, 100),
+            (1, {"message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "u2", "name": "SendMessage", "input": {"to": "alice", "body": "phase1"}}]}}, 100),
+            (2, {"type": "queue-operation",
+                 "content": "<task-notification><task-id>alice</task-id><status>completed</status>"
+                            "<summary>p1 done</summary><result>r</result></task-notification>"}, 100),
+            (3, {"message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "u3", "name": "SendMessage", "input": {"to": "alice", "body": "phase2"}}]}}, 100),
+        ]
+        st = extract_team_state(msgs)
+        mate = next(t for t in st.teammates if t.agent_id == "alice")
+        self.assertEqual(mate.status, "running", "re-activated teammate must stay active")
+        safe, reason = safe_to_reload(st, [], None)
+        self.assertFalse(safe, "must NOT reload through a re-activated working teammate")
+
     def test_extract_propagates_completion_to_teammate(self):
         # The root-cause fix: a task-notification completion must transition the
         # matching TEAMMATE (not just the subagent) to terminal.

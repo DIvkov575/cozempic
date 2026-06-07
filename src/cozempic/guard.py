@@ -814,7 +814,7 @@ def start_guard(
             # Interactive sessions never reload mid-turn — they wait for an idle
             # breakpoint (the Stop-hook nudge has already warned the user at the
             # turn that crossed the tier). Once past the force line (~88%) a
-            # lossless reload still beats hitting the autocompact wall, so we
+            # higher-fidelity reload still beats hitting the autocompact wall, so we
             # allow it even mid-turn; the safe_to_reload gate inside
             # guard_prune_cycle keeps protecting any in-flight Workflow/subagent
             # even then. Headless sessions are unchanged (reload immediately).
@@ -1106,7 +1106,7 @@ def _idle_reload_cycles() -> int:
 
 def _force_reload_pct() -> float:
     """Component E — context fraction past which an interactive reload fires even
-    mid-turn (a lossless reload still beats the autocompact wall; the
+    mid-turn (a higher-fidelity reload still beats the autocompact wall; the
     safe_to_reload gate inside the cycle keeps protecting in-flight work even
     here). Default 0.88; set <=0 or >1 to disable the mid-turn force entirely."""
     try:
@@ -2144,15 +2144,18 @@ _TN_STATUS_RE = re.compile(r"<status>([^<]+)</status>", re.IGNORECASE)
 _INFLIGHT_DONE = {"completed", "complete", "failed", "cancelled", "canceled",
                   "stopped", "killed", "error", "success", "succeeded", "done",
                   "ok", "finished", "aborted", "timeout", "timed_out"}
-# Subagent statuses that mean "still executing" → block a reload. Includes
-# "unknown" (conservative: a subagent we can't classify is treated as live).
-_SUBAGENT_ACTIVE = {"running", "unknown", "active", "in_progress", "working",
-                    "queued", "pending", "started", "launched"}
-# Teammate statuses that mean "actively working" → block a reload. Narrower than
-# _SUBAGENT_ACTIVE: it EXCLUDES "unknown" and config-only states so a benign/idle
-# membership marker can't wedge the gate forever (teammate status is propagated
-# from completions but, unlike subagents, may legitimately sit at "unknown").
-_TEAMMATE_ACTIVE = {"running", "active", "in_progress", "working", "sending"}
+# Terminal (finished) statuses. The safe-point gate is a DENYLIST: anything NOT
+# terminal is treated as still-executing → block the reload. This fails SAFE on
+# unrecognized/off-vocabulary working statuses (e.g. the hyphen variant
+# "in-progress", or "busy"/"waiting"/"executing") which an active-allowlist would
+# have let through and destroyed.
+_STATUS_TERMINAL = {"completed", "complete", "done", "failed", "cancelled",
+                    "canceled", "stopped", "killed", "aborted", "error",
+                    "success", "succeeded", "finished", "timeout", "timed_out"}
+# Benign teammate membership markers that are NOT "actively working" and must not
+# wedge the gate (a teammate legitimately sits in these between tasks). Kept
+# minimal/conservative — anything not here AND not terminal blocks.
+_TEAMMATE_BENIGN = {"", "config", "idle", "unknown"}
 
 
 def _msg_dict(item) -> dict:
@@ -2281,19 +2284,22 @@ def safe_to_reload(team_state, messages, session_path) -> tuple[bool, str]:
     # those (a running subagent / open Agent call / un-completed Agent launch).
     if team_state is not None and not team_state.is_empty():
         try:
-            if any((s.status or "").strip().lower() in _SUBAGENT_ACTIVE
+            # Subagent block — DENYLIST: any non-terminal status is treated as
+            # still-executing (subagent entries are reliably updated to a terminal
+            # status by task-notification completions, so a finished one clears).
+            if any((s.status or "").strip().lower() not in _STATUS_TERMINAL
                    for s in (team_state.subagents or [])):
                 return (False, "subagent mid-execution")
-            # Teammate block: ONLY genuinely-active states (not the old "anything
-            # not done" allowlist, which wedged forever because nothing cleared
-            # 'running'). extract_team_state now propagates task-notification
-            # completions to teammates, so a finished team reads terminal here. A
-            # teammate that is actively working (and has no subagent entry yet,
-            # in the SendMessage→completion window) is caught HERE, closing the
-            # destroy-active-teammate gap; if its completion never arrives it stays
-            # 'running' and we keep deferring — safe, and PreCompact/PostCompact
-            # re-injects the team checkpoint if the autocompact wall is hit.
-            if any((t.status or "").strip().lower() in _TEAMMATE_ACTIVE
+            # Teammate block — DENYLIST too, but with a small benign-marker exempt
+            # set so an idle/config membership row can't wedge the gate. A teammate
+            # actively working (and with no subagent entry yet, in the
+            # SendMessage→completion window) reads "running" → caught HERE, closing
+            # the destroy-active-teammate gap. extract_team_state propagates
+            # completions to teammates (chronology-aware), so a finished team reads
+            # terminal; if a completion never arrives the teammate stays non-benign
+            # and we keep deferring — safe (PreCompact/PostCompact re-injects the
+            # checkpoint at the wall).
+            if any((t.status or "").strip().lower() not in (_STATUS_TERMINAL | _TEAMMATE_BENIGN)
                    for t in (team_state.teammates or [])):
                 return (False, "teammate mid-execution")
             active_tasks, _, _ = team_state._task_groups()

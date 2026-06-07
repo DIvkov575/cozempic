@@ -1068,6 +1068,9 @@ def cmd_self_update(args):
 
 
 _NUDGE_DEFAULT_TIERS = (0.25, 0.55, 0.80)
+# A fired tier re-arms only after context drops this far below it (hysteresis), so
+# jitter/oscillation around a tier boundary can't re-fire the nudge repeatedly.
+_NUDGE_REARM_HYSTERESIS = 0.07
 
 
 def _build_nudge_message(tier_key: int, pct: float, proj: float | None) -> str:
@@ -1080,12 +1083,13 @@ def _build_nudge_message(tier_key: int, pct: float, proj: float | None) -> str:
     # Honest framing: cozempic preserves the CONVERSATION (user/assistant turns)
     # but does trim tool-output detail — so it is "higher fidelity than
     # autocompact", NOT literally lossless. Never claim "without loss".
-    reclaim = f"reclaims ~{int(round(proj))}% by trimming bloat" if proj else "trims bloat"
+    reclaim = (f"reclaims ~{int(round(proj))}% by trimming tool-output bloat"
+               if proj else "trims tool-output bloat")
     if tier_key <= 55:
         return (f"✦ Cozempic: you're at {pct_disp}% context. A safe reload {reclaim} and "
                 f"resumes automatically (conversation preserved). Your call:\n"
                 f"    • run `cozempic reload` now to control the timing, or\n"
-                f"    • do nothing — the guard auto-reloads at your next idle.")
+                f"    • do nothing — the guard auto-reloads once you pause between turns.")
     reclaim80 = (f"reclaims ~{int(round(proj))}% by trimming tool-output bloat"
                  if proj else "trims tool-output bloat")
     return (f"✦ Cozempic: context {pct_disp}% — approaching the autocompact wall. A reload "
@@ -1152,10 +1156,16 @@ def cmd_nudge(args):
                       if str(t).lstrip("-").isdigit()}
     except Exception:
         prev_fired = set()
-    fired = {t for t in prev_fired if (t / 100.0) <= pct}
+    # Re-arm with HYSTERESIS: keep a tier latched until context drops a clear band
+    # below it, so oscillating right around a tier (e.g. 54%↔56%) does NOT re-fire
+    # the nudge each time. A tier re-arms only once pct falls below (tier − band).
+    fired = {t for t in prev_fired if pct >= (t / 100.0) - _NUDGE_REARM_HYSTERESIS}
     emit = tier_key is not None and tier_key not in fired
     if emit:
-        fired.add(tier_key)
+        # Latch this tier AND every lower tier — crossing a higher tier means the
+        # lower ones were already passed, so a later dip to a lower tier must not
+        # fire its now-stale FYI (e.g. 56%→54% should stay silent, not emit 25%).
+        fired |= {int(round(t * 100)) for t in tiers if t <= crossed}
 
     def _persist():
         sess_state["tiers_fired"] = sorted(fired)
