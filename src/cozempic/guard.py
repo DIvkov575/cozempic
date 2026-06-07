@@ -2151,7 +2151,8 @@ _INFLIGHT_DONE = {"completed", "complete", "failed", "cancelled", "canceled",
 # have let through and destroyed.
 _STATUS_TERMINAL = {"completed", "complete", "done", "failed", "cancelled",
                     "canceled", "stopped", "killed", "aborted", "error",
-                    "success", "succeeded", "finished", "timeout", "timed_out"}
+                    "success", "succeeded", "finished", "timeout", "timed_out",
+                    "ok"}  # kept in sync with _INFLIGHT_DONE (same "finished" concept)
 # Benign teammate membership markers that are NOT "actively working" and must not
 # wedge the gate (a teammate legitimately sits in these between tasks). Kept
 # minimal/conservative — anything not here AND not terminal blocks.
