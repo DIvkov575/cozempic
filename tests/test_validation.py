@@ -117,6 +117,20 @@ class TestCoercePositiveFloat(unittest.TestCase):
         with self.assertRaises(ConfigError):
             coerce_positive_float({"mb": float("-inf")}, "mb", default=1.0)
 
+    def test_rejects_huge_int_overflow(self):
+        """10**400 is a valid Python int but cannot be converted to float.
+
+        math.isnan(10**400) raises OverflowError ('int too large to convert to
+        float') rather than returning True/False.  Without an OverflowError
+        catch, the exception propagates as a bare OverflowError instead of a
+        ConfigError — wrong exception type, wrong message.
+
+        RED at base: math.isnan(10**400) raises OverflowError (uncaught);
+        the function does NOT raise ConfigError with 'finite'.
+        """
+        with self.assertRaisesRegex(ConfigError, "finite"):
+            coerce_positive_float({"mb": 10**400}, "mb", default=1.0)
+
 
 class TestParseEnvPositiveInt(unittest.TestCase):
     """Env var helper: warn+fallback (does NOT raise). Used for

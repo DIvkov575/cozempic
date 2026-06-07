@@ -121,7 +121,12 @@ def coerce_positive_float(config: dict, key: str, default: float) -> float:
         raise ConfigError(
             f"config[{key!r}] must be a number, got {type(value).__name__} {value!r}"
         )
-    if math.isnan(value) or math.isinf(value):
+    try:
+        _nonfinite = math.isnan(value) or math.isinf(value)
+    except OverflowError:
+        # int too large to convert to float (e.g. 10**400) — treat as non-finite
+        _nonfinite = True
+    if _nonfinite:
         raise ConfigError(
             f"config[{key!r}] must be a finite number, got {value!r}"
         )
