@@ -362,7 +362,7 @@ def _validate_finite_thresholds(
         ("threshold_tokens", threshold_tokens),
         ("soft_threshold_tokens", soft_threshold_tokens),
     ):
-        if isinstance(_v, float) and (math.isnan(_v) or math.isinf(_v)):
+        if isinstance(_v, float) and not math.isfinite(_v):
             raise ConfigError(f"{_name} must be a finite number, got {_v!r}")
 
 
