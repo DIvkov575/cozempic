@@ -429,12 +429,17 @@ def record_session(
     session_id: str,
     cwd: str,
     context_window: int | None = None,
+    nudge_tiers: "list | tuple | None" = None,
 ) -> None:
     """Record or refresh a session's cwd and context window in the sidecar store.
 
     Called from the guard daemon at startup and on each checkpoint so the map
     stays current across long-running sessions. Capped at _SIDECAR_MAX_ENTRIES
     (oldest last_seen_at evicted first) to prevent unbounded growth.
+
+    ``nudge_tiers`` records the guard's RESOLVED reload-tier fractions (soft/hard1/
+    hard2 as fractions of the window) so the Stop-hook nudge fires at the points
+    the guard actually reloads — even when the user raised the reload threshold.
     """
     if not session_id or not cwd:
         return
@@ -453,6 +458,10 @@ def record_session(
                 context_window if context_window is not None
                 else existing.get("context_window")
             ),
+            "nudge_tiers": (
+                [round(float(t), 4) for t in nudge_tiers] if nudge_tiers
+                else existing.get("nudge_tiers")
+            ),
             "created_at": existing.get("created_at", now),
             "last_seen_at": now,
         }
@@ -460,6 +469,21 @@ def record_session(
             by_age = sorted(data, key=lambda k: data[k].get("last_seen_at", ""), reverse=True)
             data = {k: data[k] for k in by_age[:_SIDECAR_MAX_ENTRIES]}
         _save_sidecar(data)
+
+
+def get_session_nudge_tiers(session_id: str) -> "list | None":
+    """Return the guard's recorded reload-tier fractions for a session, or None."""
+    if not session_id:
+        return None
+    rec = _load_sidecar().get(session_id)
+    tiers = rec.get("nudge_tiers") if rec else None
+    if isinstance(tiers, (list, tuple)) and tiers:
+        try:
+            vals = sorted(float(t) for t in tiers if 0.0 < float(t) <= 1.0)
+            return vals or None
+        except (TypeError, ValueError):
+            return None
+    return None
 
 
 def get_session_cwd(session_id: str) -> str | None:

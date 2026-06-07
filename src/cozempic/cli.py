@@ -1073,28 +1073,33 @@ _NUDGE_DEFAULT_TIERS = (0.25, 0.55, 0.80)
 _NUDGE_REARM_HYSTERESIS = 0.07
 
 
-def _build_nudge_message(tier_key: int, pct: float, proj: float | None) -> str:
-    """Locked 1.8.22 nudge copy. `proj` = real projected reduction % from the
-    daemon's armed sentinel (omitted if unavailable)."""
+def _build_nudge_message(tier_key: int, pct: float, proj: float | None,
+                         inflight: bool = False) -> str:
+    """Locked nudge copy. `proj` = projected reduction % from the daemon's armed
+    sentinel (omitted if 0/unavailable). `inflight` = harness work (agents/tools)
+    is running, so the guard reloads once it finishes — don't promise an idle
+    reload then."""
     pct_disp = int(round(pct * 100))
     if tier_key <= 25:
         return (f"✦ Cozempic: context {pct_disp}%. Optional — `cozempic reload` does a "
-                f"prune+resume at any breakpoint (higher fidelity than autocompact).")
-    # Honest framing: cozempic preserves the CONVERSATION (user/assistant turns)
-    # but does trim tool-output detail — so it is "higher fidelity than
-    # autocompact", NOT literally lossless. Never claim "without loss".
-    reclaim = (f"reclaims ~{int(round(proj))}% by trimming tool-output bloat"
-               if proj else "trims tool-output bloat")
+                f"lossless prune+resume at any breakpoint (higher fidelity than autocompact).")
+    reclaim = f"reclaims ~{int(round(proj))}% by pruning bloat" if proj else "prunes bloat"
+    # When agents/tools are in flight, the safe-point gate holds the reload until
+    # they finish, so don't tell the user it happens the moment they pause.
+    when = ("the guard auto-reloads once your current agents/tools finish"
+            if inflight else "the guard auto-reloads once you pause between turns")
     if tier_key <= 55:
         return (f"✦ Cozempic: you're at {pct_disp}% context. A safe reload {reclaim} and "
                 f"resumes automatically (conversation preserved). Your call:\n"
                 f"    • run `cozempic reload` now to control the timing, or\n"
-                f"    • do nothing — the guard auto-reloads once you pause between turns.")
-    reclaim80 = (f"reclaims ~{int(round(proj))}% by trimming tool-output bloat"
-                 if proj else "trims tool-output bloat")
+                f"    • do nothing — {when}.")
+    reclaim80 = (f"reclaims ~{int(round(proj))}% without loss" if proj
+                 else "prunes bloat without losing your conversation")
+    tail = ("Run `cozempic reload` now to pick the moment, or it reloads once your "
+            "agents/tools finish." if inflight else
+            "Run `cozempic reload` now to pick the moment or wait for the autoreload to kick in.")
     return (f"✦ Cozempic: context {pct_disp}% — approaching the autocompact wall. A reload "
-            f"{reclaim80} (conversation preserved). Run `cozempic reload` now to pick the "
-            f"moment or wait for the autoreload to kick in.")
+            f"{reclaim80}. {tail}")
 
 
 def cmd_nudge(args):
@@ -1129,13 +1134,24 @@ def cmd_nudge(args):
     if tokens <= 0 or window <= 0:
         return
     pct = tokens / window
+    # Tiers: prefer the guard's RESOLVED reload-tier fractions (so the nudge fires
+    # where the guard actually reloads — tracks a raised --threshold and keeps the
+    # FYI aligned with the real SOFT tier); fall back to the defaults. An explicit
+    # COZEMPIC_NUDGE_PCTS override always wins.
     tiers = _NUDGE_DEFAULT_TIERS
+    try:
+        from .session import get_session_nudge_tiers
+        _gt = get_session_nudge_tiers(payload.get("session_id") or "")
+        if _gt:
+            tiers = tuple(_gt)
+    except Exception:
+        pass
     raw = os.environ.get("COZEMPIC_NUDGE_PCTS")
     if raw:
         try:
-            tiers = tuple(sorted(float(x) for x in raw.split(",") if x.strip()))
+            tiers = tuple(sorted(float(x) for x in raw.split(",") if x.strip())) or tiers
         except Exception:
-            tiers = _NUDGE_DEFAULT_TIERS
+            pass
     crossed = max((t for t in tiers if pct >= t), default=None)
     tier_key = int(round(crossed * 100)) if crossed is not None else None
     # Once-per-tier latch with re-arm: drop tiers we've fallen BELOW (so they
@@ -1189,17 +1205,32 @@ def cmd_nudge(args):
             proj = float(armed["projected_pct"])
     except Exception:
         pass
-    msg = _build_nudge_message(tier_key, pct, proj)
+    # If harness work (Workflow / background subagent / open tool call) is in
+    # flight, the safe-point gate holds the reload until it finishes — so the copy
+    # must not promise an idle reload.
+    inflight = False
+    try:
+        from .guard import detect_in_flight
+        d = detect_in_flight(messages)
+        inflight = bool(d.get("workflow") or d.get("background")
+                        or d.get("agent") or d.get("open_call"))
+    except Exception:
+        pass
+    msg = _build_nudge_message(tier_key, pct, proj, inflight=inflight)
     # First-nudge-only opt-out hint.
     if not sess_state.get("hint_shown"):
         msg += "  ·  silence: COZEMPIC_NUDGE_OFF=1"
         sess_state["hint_shown"] = True
     _persist()  # records the newly-fired tier (and any drop)
-    # Tell the daemon (component E) the user has been warned of a queued reload.
-    try:
-        mark_armed_warned(session, Path(transcript))
-    except Exception:
-        pass
+    # Only the actionable reload tiers (anything above the lowest/SOFT FYI tier)
+    # constitute the WARNING the daemon's warned-before-reload gate waits for.
+    # mark_armed_warned upserts the sentinel so the warning isn't lost to an
+    # arm/nudge race (the nudge can fire before the daemon's next poll arms).
+    if crossed is not None and crossed > min(tiers):
+        try:
+            mark_armed_warned(session, Path(transcript))
+        except Exception:
+            pass
     _json.dump({"systemMessage": msg}, sys.stdout)
 
 

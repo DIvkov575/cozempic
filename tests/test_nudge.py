@@ -133,6 +133,42 @@ class TestNudge(unittest.TestCase):
                 cmd_nudge(None)  # must not raise (and should still fire the 55 nudge)
             self.assertIn("56%", out.getvalue(), bad)
 
+    def test_tiers_from_sidecar(self):
+        # The guard records its resolved reload-tier fractions; the nudge fires at
+        # THOSE points (so a raised threshold moves the nudges), not the defaults.
+        from cozempic.session import record_session
+        with patch("pathlib.Path.home", return_value=self.home), \
+             patch.dict(os.environ, {k: v for k, v in os.environ.items()
+                                     if k != "CLAUDE_CONFIG_DIR"}, clear=True):
+            record_session("sc1", "/tmp/x", 1_000_000, nudge_tiers=[0.40, 0.70, 0.90])
+        # 30% < custom SOFT 40% → silent (default 25% tier would have fired)
+        self.assertIsNone(self._run(300_000, "sc1"))
+        # 42% >= custom SOFT 40% → fires
+        self.assertIsNotNone(self._run(420_000, "sc1"))
+
+    def test_inflight_softens_copy(self):
+        # When a background Agent is in flight, the 55% copy must NOT promise an
+        # idle reload — it says the reload waits for agents/tools to finish.
+        from cozempic.cli import cmd_nudge
+        p = self.tmp / "t.jsonl"
+        assist = {"type": "assistant", "message": {"role": "assistant",
+                  "model": "claude-sonnet-4-6", "content": [{"type": "text", "text": "x"}],
+                  "usage": {"input_tokens": 560_000, "cache_creation_input_tokens": 0,
+                            "cache_read_input_tokens": 0, "output_tokens": 0}}}
+        agent = {"type": "user", "message": {"role": "user", "content": [
+                 {"type": "tool_result",
+                  "content": "Async agent launched successfully. agentId: zz1 (internal ID)"}]}}
+        p.write_text(json.dumps(assist) + "\n" + json.dumps(agent) + "\n")
+        out = io.StringIO()
+        e = {k: v for k, v in os.environ.items() if not k.startswith("COZEMPIC_NUDGE")}
+        with patch("sys.stdin", io.StringIO(json.dumps({"transcript_path": str(p), "session_id": "if1"}))), \
+             patch("sys.stdout", out), patch("pathlib.Path.home", return_value=self.home), \
+             patch.dict(os.environ, e, clear=True):
+            cmd_nudge(None)
+        m = json.loads(out.getvalue())["systemMessage"]
+        self.assertIn("agents/tools finish", m)
+        self.assertNotIn("pause between turns", m)
+
     def test_projected_pct_from_armed_sentinel(self):
         # when the daemon armed with a projected_pct, the 55% message shows it
         from cozempic import guard

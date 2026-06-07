@@ -447,9 +447,18 @@ def start_guard(
             soft_threshold_tokens = int(threshold_tokens * 0.45)
 
     # Persist cwd + context_window to the sidecar so reload and guard resume
-    # can resolve the project directory without relying on slug reversal.
+    # can resolve the project directory without relying on slug reversal. Also
+    # record the RESOLVED reload-tier fractions so the Stop-hook nudge fires at
+    # the points this guard actually reloads (tracks a raised --threshold).
     from .session import record_session
-    record_session(sess["session_id"], cwd or os.getcwd(), context_window)
+    _nudge_tiers = None
+    if context_window:
+        _nudge_tiers = [
+            round(t / context_window, 4) for t in
+            (soft_threshold_tokens, threshold_tokens, hard2_threshold_tokens)
+            if t
+        ] or None
+    record_session(sess["session_id"], cwd or os.getcwd(), context_window, nudge_tiers=_nudge_tiers)
 
     # Clean up stale reload watchers from previous versions
     _cleanup_stale_watchers()
@@ -826,7 +835,29 @@ def start_guard(
             # Require SUSTAINED idle (N consecutive stable cycles), not a single
             # one — a momentary mid-turn stall must not be read as a breakpoint.
             sustained_idle = idle and idle_cycles >= _idle_reload_cycles()
-            defer_for_turn = interactive_mode and not sustained_idle and not force_now
+            # E (warned-before-reload): an interactive reload needs BOTH a sustained
+            # idle breakpoint AND the user warned (the nudge upserts sentinel.warned
+            # at the turn that crossed the tier), with a grace fallback so a
+            # missing/disabled nudge can't wedge it. Force (88%) + headless bypass.
+            defer_for_turn = False
+            if interactive_mode and not force_now:
+                if not sustained_idle:
+                    defer_for_turn = True                      # mid-turn: never reload
+                else:
+                    _grace = _reload_warn_grace()
+                    _armed = read_armed(sess["session_id"], session_path)
+                    _warned = bool(_armed and _armed.get("warned"))
+                    _at = (_armed or {}).get("armed_at")
+                    _grace_ok = _grace <= 0 or (bool(_armed) and _at is not None
+                                                and (time.time() - _at) >= _grace)
+                    if _warned or _grace_ok:
+                        defer_for_turn = False                 # warned/waited → reload
+                    else:
+                        if not _armed:                          # arm so the nudge can warn
+                            _arm_tier = 80 if (hard2_threshold_tokens and current_tokens
+                                               and current_tokens >= hard2_threshold_tokens) else 55
+                            write_armed(sess["session_id"], session_path, _arm_tier, 0.0)
+                        defer_for_turn = True                   # hold until warned/grace
             eff_auto_reload = auto_reload and not defer_for_turn
             # Whether a HARD tier is active this cycle (gates F's idle back-off).
             hard_active = (
@@ -856,8 +887,10 @@ def start_guard(
                 if defer_for_turn:
                     _force_note = (f" (or force at {int(force_pct * 100)}%)"
                                    if force_threshold_tokens else "")
-                    print(f"  Interactive turn in progress — armed; will reload at "
-                          f"the next idle breakpoint{_force_note}. Read-only checkpoint now.")
+                    _why = ("waiting for the warning to reach you" if sustained_idle
+                            else "interactive turn in progress")
+                    print(f"  Armed — {_why}; will reload at the next safe breakpoint"
+                          f"{_force_note}. Read-only checkpoint now.")
                 result = guard_prune_cycle(
                     session_path=session_path,
                     rx_name="aggressive",
@@ -871,11 +904,13 @@ def start_guard(
                     # (#106) — go read-only instead of falsely reporting a prune
                     # that never persisted.
                     read_only_live=not eff_auto_reload,
+                    project=defer_for_turn,  # compute the real reclaim % for the nudge
                 )
                 if defer_for_turn:
                     _arm_nudge_from_result(sess["session_id"], session_path, 80, result)
 
                 if result.get("reloading"):
+                    clear_armed(sess["session_id"], session_path)  # consumed
                     from .helpers import get_savings_line
                     savings = get_savings_line()
                     if savings:
@@ -928,8 +963,10 @@ def start_guard(
                 else:
                     print(f"  [{_now()}] HARD THRESHOLD (55%): {reason}")
                     if defer_for_turn:
-                        print(f"  Interactive turn in progress — armed; will reload at "
-                              f"the next idle breakpoint. Read-only checkpoint now.")
+                        _why = ("waiting for the warning to reach you" if sustained_idle
+                                else "interactive turn in progress")
+                        print(f"  Armed — {_why}; will reload at the next safe "
+                              f"breakpoint. Read-only checkpoint now.")
                     else:
                         print(f"  Standard prune + reload (cycle #{prune_count})...")
 
@@ -945,11 +982,13 @@ def start_guard(
                         # (can't safely write a live file without terminating
                         # Claude — #106).
                         read_only_live=not eff_auto_reload,
+                        project=defer_for_turn,  # compute the real reclaim % for the nudge
                     )
                     if defer_for_turn:
                         _arm_nudge_from_result(sess["session_id"], session_path, 55, result)
 
                 if result.get("reloading"):
+                    clear_armed(sess["session_id"], session_path)  # consumed
                     from .helpers import get_savings_line
                     savings = get_savings_line()
                     if savings:
@@ -1025,10 +1064,11 @@ def start_guard(
         # Final checkpoint before exit
         checkpoint_team(session_path=session_path, quiet=True)
         total_prunes = prune_count + soft_prune_count
+        _noop_note = f" ({noop_cycles} idle no-op cycles skipped)" if noop_cycles else ""
         if total_prunes:
-            print(f"\n  Guard stopped. Pruned {total_prunes}x during this session.")
+            print(f"\n  Guard stopped. Pruned {total_prunes}x during this session.{_noop_note}")
         else:
-            print(f"\n  Guard stopped.")
+            print(f"\n  Guard stopped.{_noop_note}")
     finally:
         # Stop reactive watcher on ALL exit paths (KeyboardInterrupt and the
         # four `break` paths inside the main loop: file disappeared,
@@ -1104,6 +1144,17 @@ def _idle_reload_cycles() -> int:
         return 2
 
 
+def _reload_warn_grace() -> float:
+    """Component E — seconds the daemon waits for the nudge to WARN the user before
+    an interactive idle reload proceeds anyway (fallback so a missing/disabled
+    Stop-hook nudge can't wedge reloads forever). Default 120s; <=0 disables the
+    wait (reload as soon as idle)."""
+    try:
+        return float(os.environ.get("COZEMPIC_RELOAD_WARN_GRACE", "120"))
+    except (TypeError, ValueError):
+        return 120.0
+
+
 def _force_reload_pct() -> float:
     """Component E — context fraction past which an interactive reload fires even
     mid-turn (a higher-fidelity reload still beats the autocompact wall; the
@@ -1123,7 +1174,11 @@ def _arm_nudge_from_result(session_id, session_path, tier, result):
     the daemon loop."""
     try:
         orig = result.get("original_tokens") or 0
-        fin = result.get("final_tokens")
+        # Prefer the projected post-prune estimate (computed on the read-only defer
+        # path when project=True); fall back to final_tokens.
+        fin = result.get("projected_final_tokens")
+        if fin is None:
+            fin = result.get("final_tokens")
         proj = 0.0
         if orig and fin is not None and 0 <= fin < orig:
             proj = (orig - fin) / orig * 100.0
@@ -1141,6 +1196,7 @@ def guard_prune_cycle(
     session_id: str | None = None,
     claude_pid: int | None = None,
     read_only_live: bool = False,
+    project: bool = False,
 ) -> dict:
     """Execute a single guard prune cycle.
 
@@ -1218,10 +1274,22 @@ def guard_prune_cycle(
                 checkpoint_path = None
                 if not team_state.is_empty():
                     checkpoint_path = write_team_checkpoint(team_state, session_path.parent)
+                # When arming the nudge (project=True), compute the post-prune token
+                # estimate so the warning can show the REAL reclaim %. The prune was
+                # already computed (pruned_messages) — we just don't WRITE it. Kept
+                # behind the flag so the every-cycle SOFT checkpoint stays cheap.
+                projected_final = None
+                if project:
+                    try:
+                        projected_final = estimate_session_tokens(
+                            pruned_messages, pre_calibrated_ratio=pre_ratio).total
+                    except Exception:
+                        projected_final = None
                 return {
                     "saved_mb": 0.0,
                     "original_tokens": pre_te.total,
                     "final_tokens": pre_te.total,
+                    "projected_final_tokens": projected_final,
                     "team_name": team_state.team_name or None,
                     "team_messages": team_state.message_count,
                     "checkpoint_path": str(checkpoint_path) if checkpoint_path else None,
@@ -2340,24 +2408,36 @@ def read_armed(session_id: str | None, session_path: Path | None = None) -> dict
 
 def write_armed(session_id, session_path, tier: int, projected_pct: float) -> None:
     import json as _json
+    import time as _time
     try:
         p = _reload_armed_path(session_id, session_path)
         existing = read_armed(session_id, session_path) or {}
-        # Preserve a prior warned=True so re-arming the same tier doesn't reset it.
+        # Preserve warned across a re-arm of the SAME tier; preserve the grace
+        # clock (armed_at) so re-arming never resets the warned-before-reload
+        # timeout; keep a known projection if this call has none.
         warned = bool(existing.get("warned")) and existing.get("tier") == tier
-        p.write_text(_json.dumps({"tier": tier, "projected_pct": round(projected_pct, 1), "warned": warned}))
+        armed_at = existing.get("armed_at") or _time.time()
+        proj = round(projected_pct, 1) if projected_pct else existing.get("projected_pct", 0.0)
+        p.write_text(_json.dumps({"tier": tier, "projected_pct": proj,
+                                  "warned": warned, "armed_at": armed_at}))
     except Exception:
         pass
 
 
 def mark_armed_warned(session_id, session_path: Path | None = None) -> None:
+    """Mark the armed reload as warned. UPSERTS — if no sentinel exists yet (the
+    nudge fired before the daemon's poll armed it), create one with warned=True so
+    the warning can't be lost to that race."""
     import json as _json
+    import time as _time
     try:
         p = _reload_armed_path(session_id, session_path)
-        d = read_armed(session_id, session_path)
-        if d is not None:
-            d["warned"] = True
-            p.write_text(_json.dumps(d))
+        d = read_armed(session_id, session_path) or {}
+        d["warned"] = True
+        d.setdefault("armed_at", _time.time())
+        d.setdefault("tier", 0)
+        d.setdefault("projected_pct", 0.0)
+        p.write_text(_json.dumps(d))
     except Exception:
         pass
 

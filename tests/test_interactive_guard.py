@@ -141,6 +141,42 @@ class TestArmNudgeFromResult(unittest.TestCase):
             armed = guard.read_armed("sess-arm-3", None)
         self.assertEqual(armed["projected_pct"], 0.0)
 
+    def test_arm_prefers_projected_final_tokens(self):
+        # The real projected reduction comes from the read-only project=True path.
+        from cozempic import guard
+        with patch("cozempic.guard._guard_tmp_root", return_value=self.scratch):
+            guard._arm_nudge_from_result(
+                "sess-arm-4", None, 55,
+                {"original_tokens": 100_000, "final_tokens": 100_000,  # read-only: equal
+                 "projected_final_tokens": 60_000},                    # the real estimate
+            )
+            armed = guard.read_armed("sess-arm-4", None)
+        self.assertAlmostEqual(armed["projected_pct"], 40.0, places=1)
+
+    def test_write_armed_sets_and_preserves_armed_at(self):
+        from cozempic import guard
+        with patch("cozempic.guard._guard_tmp_root", return_value=self.scratch):
+            guard.write_armed("sess-at", None, 55, 30.0)
+            a1 = guard.read_armed("sess-at", None)
+            self.assertIn("armed_at", a1)
+            guard.mark_armed_warned("sess-at", None)
+            guard.write_armed("sess-at", None, 55, 0.0)  # re-arm same tier, no proj
+            a2 = guard.read_armed("sess-at", None)
+        self.assertEqual(a1["armed_at"], a2["armed_at"], "grace clock preserved on re-arm")
+        self.assertTrue(a2["warned"], "warned preserved on same-tier re-arm")
+        self.assertEqual(a2["projected_pct"], 30.0, "projection preserved when re-arm has none")
+
+    def test_mark_armed_warned_upserts(self):
+        # The nudge can warn before the daemon arms — mark must CREATE the sentinel.
+        from cozempic import guard
+        with patch("cozempic.guard._guard_tmp_root", return_value=self.scratch):
+            self.assertIsNone(guard.read_armed("sess-up", None))
+            guard.mark_armed_warned("sess-up", None)
+            armed = guard.read_armed("sess-up", None)
+        self.assertIsNotNone(armed)
+        self.assertTrue(armed["warned"])
+        self.assertIn("armed_at", armed)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -54,6 +54,9 @@ def _run_guard(token_estimate: int, env: dict, context_window: int = 200_000):
 
     import os
     e = {kk: vv for kk, vv in os.environ.items() if not kk.startswith("COZEMPIC")}
+    # Disable the warned-before-reload grace wait so these tests exercise the
+    # idle-reload wiring directly (the warned-gate has its own dedicated tests).
+    e.setdefault("COZEMPIC_RELOAD_WARN_GRACE", "0")
     e.update(env)
 
     with contextlib.ExitStack() as s:
@@ -119,6 +122,15 @@ class TestInteractiveLoopWiring(unittest.TestCase):
                                              "COZEMPIC_FORCE_RELOAD_PCT": "0"})
         self.assertEqual(calls, [False, False, True],
                          "force disabled: defer mid-turn, reload only at sustained idle")
+
+    def test_warned_gate_holds_idle_reload_until_warned(self):
+        # grace high + never warned (no nudge fires in this harness) → even at
+        # sustained idle the reload is HELD (armed, waiting for the warning), so
+        # the user is never reloaded without first being warned.
+        calls = _run_guard(self.OVER_HARD2, {"COZEMPIC_INTERACTIVE": "on",
+                                             "COZEMPIC_RELOAD_WARN_GRACE": "9999"})
+        self.assertEqual(calls, [False, False, False],
+                         "interactive idle reload must wait for the warning")
 
 
 if __name__ == "__main__":
