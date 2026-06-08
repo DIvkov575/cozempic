@@ -76,14 +76,19 @@ validation + a floor (don't over-prune below a safe ratio). Refuse to prune an a
 in-flight session. Metadata-singleton protection. Team state survives compaction
 (checkpoint + PostCompact re-inject). *Motivating PRs: #114, #102, #22, #110.*
 
-### L8 — Reload safety (the 1.8.x guard line)  ·  standing tests: `tests/test_guard_safe_point.py`, `tests/test_interactive_*`
+### L8 — Reload safety (the 1.8.x guard line)  ·  standing tests: `tests/test_guard_safe_point.py`, `tests/test_interactive_*`, `tests/test_guard_team_agent_spawn.py`
 A reload SIGKILLs + resumes, so: NEVER reload through in-flight work (running Workflow
 / background `Agent` subagent / agent team / open tool call) — defer instead.
 Interactive: warn-before-reload, reload only at a sustained idle breakpoint, force only
 near the wall. Armed-sentinel lifecycle: cleared on **every** reload path
 (`_terminate_and_resume` choke point), atomic writes, no stale `warned` survives a
 reload. Markers must be matched to the REAL harness output (verify against live
-transcripts, not fixtures). *Motivating: the 1.8.19–1.8.23 guard line.*
+transcripts, not fixtures).
+Agent-spawn team visibility: `extract_team_state` must see teammates created via the
+`Agent` tool (not just `TeamCreate`). `safe_to_reload` must block when any teammate is
+non-benign/non-terminal, and must NOT be wedged by a stale cross-session TeamState
+(session anti-wedge). Standing test: `tests/test_guard_team_agent_spawn.py`.
+*Motivating: the 1.8.19–1.8.23 guard line; F1 fix (v1.8.24).*
 
 ### L9 — Error handling & hook protocol
 Hook commands NEVER block and ALWAYS exit 0 (a crash must not break the session); no
