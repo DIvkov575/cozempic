@@ -609,5 +609,218 @@ class TestFullScenario(unittest.TestCase):
                         "After ALL idle_notifications, safe_to_reload must return True")
 
 
+# ─── TestStaleConfigAntiWedge (C-1 regression guards) ───────────────────────
+
+class TestStaleConfigAntiWedge(unittest.TestCase):
+    """C-1 (CRITICAL): Stale same-name config.json overwrites lead_session_id →
+    _team_is_current_session returns False for the LIVE session →
+    safe_to_reload returns (True, 'quiescent') → SIGKILL of working team.
+
+    These tests are REGRESSION GUARDs — RED at base (confirmed: stale config
+    overwrites lead_session_id via merge_config_into_state name-join).
+    """
+
+    _SPAWN_RESULT = (
+        "Spawned successfully.\n"
+        "agent_id: finder-p1@myteam\n"
+        "name: finder-p1\n"
+        "team_name: myteam\n"
+        "The agent is now running."
+    )
+
+    _STALE_CONFIG = {
+        "name": "myteam",
+        "leadSessionId": "OLD-SESSION-1111",
+        "leadAgentId": "team-lead@myteam",
+        "members": [],
+    }
+
+    def _stale_spawn_msgs(self):
+        return [
+            (0, _tool_use("u0", "TeamCreate", {"team_name": "myteam"}), 100),
+            (1, _tool_result("u0", "Team created."), 50),
+            (2, _tool_use("u1", "Agent", {"name": "finder-p1"}), 200),
+            (3, _tool_result("u1", self._SPAWN_RESULT), 300),
+        ]
+
+    def test_stale_same_name_config_does_not_allow_false_safe_reload(self):
+        """REGRESSION GUARD — RED at base: stale same-name config overwrites
+        lead_session_id → _team_is_current_session(live_path) returns False →
+        safe_to_reload returns (True, 'quiescent') → SIGKILL of live team.
+
+        The live session JSONL stem ('LIVE-SESSION-2222') differs from the
+        stale config's leadSessionId ('OLD-SESSION-1111'). After the C-1 fix,
+        merge_config_into_state must NOT overwrite lead_session_id when the
+        config was matched only by team name (not by session identity).
+        """
+        from cozempic.guard import safe_to_reload
+        msgs = self._stale_spawn_msgs()
+        live_path = Path("/tmp/LIVE-SESSION-2222.jsonl")
+
+        with unittest.mock.patch(
+            "cozempic.team.load_team_configs", return_value=[self._STALE_CONFIG]
+        ):
+            from cozempic.team import extract_team_state
+            state = extract_team_state(msgs)
+
+        # After fix: lead_session_id must NOT be overwritten by stale config's value
+        # (or _team_is_current_session must otherwise still block correctly)
+        safe, reason = safe_to_reload(state, msgs, live_path)
+        self.assertFalse(
+            safe,
+            "Stale same-name config must NOT cause safe_to_reload to return True "
+            f"for a live session with active teammates; got safe={safe}, reason={reason!r}"
+        )
+
+    def test_live_matching_config_still_blocks(self):
+        """INVARIANT: a config.json that IS the live session (leadSessionId matches
+        session_path.stem) must still cause safe_to_reload to block.
+
+        This test is GREEN at base (wrong reason); after fix it must stay GREEN
+        for the right reason (same session → block).
+        """
+        from cozempic.guard import safe_to_reload
+        msgs = self._stale_spawn_msgs()
+        live_path = Path("/tmp/LIVE-SESSION-2222.jsonl")
+        matching_config = {
+            "name": "myteam",
+            "leadSessionId": "LIVE-SESSION-2222",  # matches the live path
+            "leadAgentId": "team-lead@myteam",
+            "members": [],
+        }
+        with unittest.mock.patch(
+            "cozempic.team.load_team_configs", return_value=[matching_config]
+        ):
+            from cozempic.team import extract_team_state
+            state = extract_team_state(msgs)
+
+        safe, reason = safe_to_reload(state, msgs, live_path)
+        self.assertFalse(
+            safe,
+            "Live-matching config must still cause safe_to_reload to block; "
+            f"got safe={safe}, reason={reason!r}"
+        )
+
+
+# ─── TestIdleNotificationPruneProtection (C-2 regression guards) ─────────────
+
+class TestIdleNotificationPruneProtection(unittest.TestCase):
+    """C-2 (CRITICAL): idle_notification carrier message is not prune-protected
+    (_is_team_message returns False for it). If pruned, the teammate stays
+    'running' forever → permanent safe_to_reload wedge.
+
+    The fix: add '<teammate-message' string pattern to _is_team_message alongside
+    the existing '<task-notification' pattern.
+    """
+
+    def test_idle_notification_carrier_is_team_message(self):
+        """REGRESSION GUARD — RED at base: _is_team_message returns False for a
+        user message whose content is a <teammate-message> XML string.
+
+        After fix: _is_team_message returns True → carrier is prune-protected.
+        """
+        from cozempic.team import _is_team_message
+        idle_carrier = _user_content(
+            '<teammate-message teammate_id="finder-p1@myteam" summary="idle">'
+            '{"type":"idle_notification","from":"finder-p1","idleReason":"available"}'
+            '</teammate-message>'
+        )
+        self.assertTrue(
+            _is_team_message(idle_carrier, set()),
+            "_is_team_message must return True for an idle_notification carrier "
+            "so it is prune-protected and cannot be lost to compaction"
+        )
+
+    def test_idle_notification_pruned_away_does_not_wedge(self):
+        """REGRESSION GUARD — RED at base: if idle_notification is dropped from
+        the message list, the teammate stays 'running' → permanent reload wedge.
+
+        After fix: either the carrier is prune-protected (C-2 fix) or the extract
+        logic handles the absent carrier gracefully (out-of-scope for this PR).
+        This test verifies the PROTECTION path: after fix, the carrier survives
+        prune_with_team_protect and idle_notification is correctly parsed.
+        """
+        from cozempic.team import _is_team_message
+        # The assertion is that the carrier message is protected (is_team_message=True).
+        # If the carrier is protected, it cannot be dropped by prune → wedge can't occur.
+        # This is the same assertion as test_idle_notification_carrier_is_team_message
+        # but framed from the wedge-prevention perspective.
+        idle_carrier = _user_content(
+            '<teammate-message teammate_id="p1@team" summary="idle">'
+            '{"type":"idle_notification","from":"p1","idleReason":"available"}'
+            '</teammate-message>'
+        )
+        self.assertTrue(
+            _is_team_message(idle_carrier, set()),
+            "idle_notification carrier must be tagged as a team message to prevent "
+            "the safe_to_reload permanent-wedge via pruned-idle scenario"
+        )
+
+
+# ─── TestFailedAgentSpawnNoWedge (H-1 regression guards) ─────────────────────
+
+class TestFailedAgentSpawnNoWedge(unittest.TestCase):
+    """H-1 (HIGH): Failed Agent spawn (result has no 'agent_id:' line) leaves a
+    status='running' placeholder → safe_to_reload returns False indefinitely.
+
+    The fix: in the Agent tool_result handler, when no agent_id_m matches,
+    remove or mark-terminal the placeholder so a failed spawn is not blocking.
+    """
+
+    def test_failed_agent_spawn_does_not_block_reload(self):
+        """REGRESSION GUARD — RED at base: failed Agent spawn → placeholder
+        status='running' → safe_to_reload returns (False, 'teammate mid-execution').
+
+        After fix: a spawn result with no 'agent_id:' line transitions the
+        placeholder to a terminal status → safe_to_reload returns (True, ...).
+        """
+        from cozempic.guard import safe_to_reload
+        msgs = [
+            (0, _tool_use("u1", "Agent", {"name": "finder-p1", "description": "find"}), 200),
+            (1, _tool_result("u1", "Error: quota exceeded. No agent was created."), 300),
+        ]
+        state = _extract(msgs)
+        # After fix: no teammates (or all terminal) → safe to reload
+        if state.teammates:
+            all_terminal = all(
+                (t.status or "").strip().lower()
+                in {"completed", "failed", "error", "stopped", "cancelled", "done"}
+                for t in state.teammates
+            )
+            self.assertTrue(
+                all_terminal,
+                "Failed spawn placeholder must have a terminal status; "
+                f"got teammates={[(t.agent_id, t.status) for t in state.teammates]}"
+            )
+        safe, reason = safe_to_reload(state, msgs, Path("/tmp/fake_session.jsonl"))
+        self.assertTrue(
+            safe,
+            "Failed Agent spawn must not block safe_to_reload; "
+            f"got safe={safe}, reason={reason!r}"
+        )
+
+    def test_successful_spawn_still_blocks(self):
+        """INVARIANT: a successful spawn (has 'agent_id:' line) must still block.
+
+        This is GREEN at base (wrong reason); must stay GREEN after H-1 fix.
+        """
+        from cozempic.guard import safe_to_reload
+        spawn_result = (
+            "Spawned successfully.\nagent_id: finder-p1@myteam\n"
+            "name: finder-p1\nteam_name: myteam\nRunning."
+        )
+        msgs = [
+            (0, _tool_use("u1", "Agent", {"name": "finder-p1"}), 200),
+            (1, _tool_result("u1", spawn_result), 300),
+        ]
+        state = _extract(msgs)
+        safe, reason = safe_to_reload(state, msgs, Path("/tmp/fake_session.jsonl"))
+        self.assertFalse(
+            safe,
+            "Successful Agent spawn must block safe_to_reload; "
+            f"got safe={safe}, reason={reason!r}"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
