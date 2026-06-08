@@ -92,6 +92,27 @@ with zero real-fixture coverage is unverified; (3) **deny-by-default**: if the
 transcript shows any coordination signal the parser can't resolve, the gate must
 BLOCK, never SIGKILL. A matcher should fail toward "block", not "reload".
 
+**BUT the deny-by-default net is itself a dual-failure surface — adversarially hunt
+BOTH directions (1.8.24 fleet):** a net that's too LOOSE over-blocks. If the net keys
+on bare substrings against *arbitrary message text* (`agent_id:` anywhere, the word
+`idle_notification` in prose), it fires on a teamless session that merely read code
+(`agent_id = UUIDField()`), pasted a log line, or discussed the protocol — including
+cozempic's OWN source/dogfood sessions. Then the guard goes INERT (never reloads →
+context bloats → native compaction destroys the team state — the exact failure it
+exists to prevent). Over-block is not a "safe default"; it is shipping-blocking.
+Defenses: (4) **correlate, don't trust bare text** — a spawn marker counts only inside
+a tool_result whose *paired tool_use* is a spawn tool (Agent/Task/TeamCreate/
+SpawnTeammate), exactly as `detect_in_flight` does; a marker in a Read/Grep/Bash result
+must never count. (5) **require structure, not substrings** — match the harness's
+actual `<teammate-message ... teammate_id="...">` carrier on its genuine delivery
+surface (root/queue-operation content), never the bare token in a user's typed message.
+(6) **scope state transitions** — a TeamDelete clears only members it can POSITIVELY
+attribute to the deleted team; on ambiguity, leave them (a recoverable wedge) rather
+than clear-all (an unrecoverable SIGKILL of another live team). Run a paired fleet:
+one agent hunts false-negatives (live work the gate calls quiescent), one hunts
+over-blocks (quiescent/teamless sessions the gate wedges) — and re-run BOTH on the
+*fix*, since a fix that tightens one direction can open the other.
+
 ### L8 — Reload safety (the 1.8.x guard line)  ·  standing tests: `tests/test_guard_safe_point.py`, `tests/test_interactive_*`, `tests/test_guard_team_agent_spawn.py`, `tests/test_reload_gate_contract.py`
 A reload SIGKILLs + resumes, so: NEVER reload through in-flight work (running Workflow
 / background `Agent` subagent / agent team / open tool call) — defer instead.
