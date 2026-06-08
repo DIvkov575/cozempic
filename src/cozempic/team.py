@@ -391,11 +391,11 @@ def _is_team_message(msg_dict: dict, pending_task_ids: set[str] | None = None) -
 
     Handles these JSONL message types:
     - type='assistant': Tool use calls (Task, TaskCreate, etc.)
-    - type='user': Nested content with task-notification XML
+    - type='user': Nested content with task-notification or teammate-message XML
     - type='queue-operation': Root-level content with task-notification XML
     - Tool results matching known Task tool_use IDs (via pending_task_ids)
 
-    Detection is schema-first: tool_use block names and task-notification XML.
+    Detection is schema-first: tool_use block names and team XML patterns.
     TEAM_KEYWORDS is NOT used here — it is for enrichment (extract_team_state)
     only, to avoid false positives on messages that merely mention team concepts.
     """
@@ -429,8 +429,12 @@ def _is_team_message(msg_dict: dict, pending_task_ids: set[str] | None = None) -
                     return True
 
     elif isinstance(content, str):
-        # task-notification XML in user messages (agent results) — definitive signal
-        if "<task-notification>" in content:
+        # task-notification XML in user messages (agent results) — definitive signal.
+        # teammate-message XML (idle_notification, etc.) — also team-coordination:
+        # this carrier MUST be prune-protected so that idle transitions are not lost
+        # (a pruned idle_notification leaves the teammate permanently "running" →
+        # permanent safe_to_reload wedge — C-2 fix, 2026-06-08).
+        if "<task-notification>" in content or "<teammate-message" in content:
             return True
 
     return False
@@ -736,6 +740,16 @@ def extract_team_state(messages: list[Message]) -> TeamState:
                             )
                             if bare and bare != real_agent_id:
                                 _name_to_agent_id[bare] = real_agent_id
+                    else:
+                        # No agent_id: in result → spawn failed or was rejected.
+                        # A tool_result with no parseable agentId is a completed-
+                        # with-no-agent event (quota error, harness rejection, etc.),
+                        # NOT an in-flight spawn. Drop/mark-terminal the placeholder
+                        # so the safe_to_reload gate is not permanently wedged.
+                        # H-1 fix (2026-06-08).
+                        placeholder = tool_use_id_to_subagent.get(tool_use_id, "")
+                        if placeholder and placeholder in seen_teammates:
+                            seen_teammates[placeholder].status = "failed"
                     # Parse team_name from result if not yet set
                     team_m = _AGENT_SPAWN_TEAM_RE.search(result_text)
                     if team_m and not state.team_name:
@@ -882,42 +896,65 @@ def merge_config_into_state(state: TeamState, configs: list[dict] | None = None)
             state.config_source = "jsonl"
         return state
 
-    # Match by team name if we have one from JSONL
+    # Match configs in two phases: strong joins first (session-identity-anchored),
+    # then name-only as a weaker fallback.
+    #
+    # Why two phases (C-1 fix, 2026-06-08):
+    #   A name-only match is unreliable for session-identity fields: team names are
+    #   frequently reused across sessions (same project, same team composition). A
+    #   stale config.json with the same name but an OLD leadSessionId would overwrite
+    #   state.lead_session_id, causing _team_is_current_session to return False for
+    #   the LIVE session → safe_to_reload returns (True, "quiescent") → SIGKILL of
+    #   a working live team (F1 reborn via the anti-wedge path).
+    #
+    #   Strong joins (session ID / agent ID / member ID intersection) are anchored
+    #   on identity that is guaranteed unique per session. Only a strong match
+    #   authorises overwriting lead_session_id; a name-only match may carry member
+    #   details (model, cwd) but must NOT overwrite session-identity fields.
     matched_config = None
+    _name_only_match = False  # True when matched by team name alone (weak join)
+
+    # Phase 1: strong joins — leadSessionId > leadAgentId > member ID intersection
+    known_agent_ids = (
+        {s.agent_id for s in state.subagents}
+        | {t.agent_id for t in state.teammates}
+    )
     for cfg in configs:
-        if state.team_name and cfg.get("name") == state.team_name:
+        if state.lead_session_id and cfg.get("leadSessionId") == state.lead_session_id:
             matched_config = cfg
             break
+        if state.lead_agent_id and cfg.get("leadAgentId") == state.lead_agent_id:
+            matched_config = cfg
+            break
+        if known_agent_ids:
+            cfg_member_ids = {m.get("agentId", "") for m in cfg.get("members", [])}
+            if known_agent_ids & cfg_member_ids:
+                matched_config = cfg
+                break
 
     if matched_config is None:
-        # Attempt strong joins: leadSessionId → leadAgentId → member ID intersection
-        known_agent_ids = (
-            {s.agent_id for s in state.subagents}
-            | {t.agent_id for t in state.teammates}
-        )
+        # Phase 2: name-only fallback — weaker; must not overwrite session-identity fields
         for cfg in configs:
-            if state.lead_session_id and cfg.get("leadSessionId") == state.lead_session_id:
+            if state.team_name and cfg.get("name") == state.team_name:
                 matched_config = cfg
+                _name_only_match = True
                 break
-            if state.lead_agent_id and cfg.get("leadAgentId") == state.lead_agent_id:
-                matched_config = cfg
-                break
-            if known_agent_ids:
-                cfg_member_ids = {m.get("agentId", "") for m in cfg.get("members", [])}
-                if known_agent_ids & cfg_member_ids:
-                    matched_config = cfg
-                    break
 
     if matched_config is None:
-        # No strong join — skip merge to avoid importing wrong team config
+        # No match on any join — skip merge
         if not state.config_source:
             state.config_source = "jsonl"
         return state
 
-    # Merge authoritative fields
+    # Merge authoritative fields.
+    # lead_session_id is session-identity — only overwrite from a strong join.
+    # A name-only match may carry a STALE leadSessionId from a prior session that
+    # happened to use the same team name; importing it would corrupt the anti-wedge
+    # gate in safe_to_reload (_team_is_current_session). C-1 fix (2026-06-08).
     state.team_name = matched_config.get("name", state.team_name)
     state.lead_agent_id = matched_config.get("leadAgentId", state.lead_agent_id)
-    state.lead_session_id = matched_config.get("leadSessionId", state.lead_session_id)
+    if not _name_only_match:
+        state.lead_session_id = matched_config.get("leadSessionId", state.lead_session_id)
     state.config_source = "both" if state.message_count > 0 else "config.json"
 
     # Merge member details
