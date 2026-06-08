@@ -1127,7 +1127,7 @@ def _idle_backoff_cycles() -> int:
     """Component F — cycles of a stable transcript before poll back-off kicks in."""
     try:
         n = int(os.environ.get("COZEMPIC_IDLE_BACKOFF_CYCLES", "4"))
-        return n if n > 0 else 0
+        return min(n, 10_000) if n > 0 else 0  # cap absurd values
     except (TypeError, ValueError):
         return 4
 
@@ -1142,7 +1142,9 @@ def _idle_reload_cycles() -> int:
     momentary stall. Minimum 1."""
     try:
         n = int(os.environ.get("COZEMPIC_IDLE_RELOAD_CYCLES", "2"))
-        return n if n >= 1 else 1
+        # Cap an absurd value (e.g. 10**400) so `idle_cycles >= n` can't be made
+        # permanently unreachable (which would silently disable idle reloads).
+        return min(n, 10_000) if n >= 1 else 1
     except (TypeError, ValueError):
         return 2
 
@@ -1153,7 +1155,12 @@ def _reload_warn_grace() -> float:
     Stop-hook nudge can't wedge reloads forever). Default 120s; <=0 disables the
     wait (reload as soon as idle)."""
     try:
-        return float(os.environ.get("COZEMPIC_RELOAD_WARN_GRACE", "120"))
+        v = float(os.environ.get("COZEMPIC_RELOAD_WARN_GRACE", "120"))
+        # Reject NaN/inf: a non-finite grace makes `elapsed >= grace` always False,
+        # which permanently DISABLES this fallback (the exact gate-disable bug class
+        # as the CLI/config thresholds — IEEE-754: every NaN/inf comparison fails),
+        # silently wedging the interactive idle reload. Mirror _read_min_prune_ratio.
+        return v if math.isfinite(v) else 120.0
     except (TypeError, ValueError):
         return 120.0
 

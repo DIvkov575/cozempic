@@ -44,6 +44,8 @@ def _positive_int(val: str) -> int:
         raise argparse.ArgumentTypeError(f"{val!r} is not a valid integer")
     if n <= 0:
         raise argparse.ArgumentTypeError(f"must be positive, got {n}")
+    if n > 10**12:  # reject an absurd value (e.g. 10**400) that overflows downstream math
+        raise argparse.ArgumentTypeError(f"is unreasonably large, got {n}")
     return n
 
 
@@ -1149,7 +1151,11 @@ def cmd_nudge(args):
     raw = os.environ.get("COZEMPIC_NUDGE_PCTS")
     if raw:
         try:
-            tiers = tuple(sorted(float(x) for x in raw.split(",") if x.strip())) or tiers
+            # Keep only finite fractions in (0, 1]; a NaN/inf tier silently disables
+            # the nudge (pct >= nan/inf is always False → it never fires).
+            _t = tuple(sorted(v for x in raw.split(",") if x.strip()
+                              and math.isfinite(v := float(x)) and 0 < v <= 1))
+            tiers = _t or tiers
         except Exception:
             pass
     crossed = max((t for t in tiers if pct >= t), default=None)
