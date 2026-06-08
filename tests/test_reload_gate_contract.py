@@ -178,9 +178,18 @@ if __name__ == "__main__":
     unittest.main()
 
 
+def _user(text):
+    return {"type": "user", "message": {"role": "user", "content": text}}
+
+
 class TestReloadGateHardening1824(unittest.TestCase):
     """1.8.24 hardening on top of #117 — the over-block reducers + fail-safes that
-    keep FINISHED teams reloading while LIVE/ambiguous ones block."""
+    keep FINISHED/teamless sessions reloading while LIVE/ambiguous ones block.
+
+    The two P0s these pin (fleet, 2026-06-09): the deny-by-default net must NOT
+    fire on a marker-shaped string in a Read/Grep/log result (`agent_id:` in code)
+    nor on prose merely *discussing* the protocol — those over-blocked teamless
+    sessions and turned the guard inert (the exact failure cozempic prevents)."""
 
     def setUp(self):
         import tempfile
@@ -195,22 +204,39 @@ class TestReloadGateHardening1824(unittest.TestCase):
         m = load_messages(p)
         return safe_to_reload(extract_team_state(m), m, p)
 
-    def test_camelcase_agentid_blocks(self):
-        # camelCase agentId (the shipped 1.8.22 convention) must parse → block.
-        safe, _ = self._gate([
+    def test_camelcase_agentid_parses_identity_and_blocks(self):
+        # Pins the regex: the camelCase id must be PARSED to the real agent_id (a
+        # snake-only matcher leaves the placeholder tool_use_id "u1"), AND the live
+        # team must block.
+        p = _write(self.tmp, [
             _tu("u1", "Agent", {"description": "spin"}),
             _tr("u1", "Spawned successfully. agentId: alice@squad"),
             _idle_lead()])
-        self.assertFalse(safe, "camelCase agentId must be recognized → block")
+        m = load_messages(p)
+        ts = extract_team_state(m)
+        ids = [t.agent_id for t in ts.teammates]
+        self.assertIn("alice@squad", ids, f"camelCase agentId must parse; got {ids}")
+        self.assertFalse(safe_to_reload(ts, m, p)[0], "live camelCase team must block")
 
     def test_teamdelete_lets_team_reload(self):
-        # A disbanded team (TeamDelete) must NOT wedge — members go terminal.
+        # A disbanded team (TeamDelete) must NOT wedge — its members go terminal.
         safe, _ = self._gate([
             _tu("u1", "Agent", {"description": "spin"}),
             _tr("u1", "Spawned successfully. agent_id: alice@squad"),
             _tu("u2", "TeamDelete", {"team_name": "squad"}),
             _tr("u2", "All agents terminated."), _idle_lead()])
         self.assertTrue(safe, "disbanded team must be allowed to reload (no wedge)")
+
+    def test_teamdelete_scoped_leaves_other_team_blocking(self):
+        # Deleting team A must NOT clear a LIVE team B (TeamDelete is team-scoped).
+        safe, reason = self._gate([
+            _tu("a1", "Agent", {"description": "spin alice"}),
+            _tr("a1", "Spawned successfully. agent_id: alice@teamA"),
+            _tu("b1", "Agent", {"description": "spin bob"}),
+            _tr("b1", "Spawned successfully. agent_id: bob@teamB"),
+            _tu("d1", "TeamDelete", {"team_name": "teamA"}),
+            _tr("d1", "teamA disbanded"), _idle_lead()])
+        self.assertFalse(safe, f"deleting teamA must leave live teamB blocking; got {reason!r}")
 
     def test_unparseable_successful_spawn_fails_safe(self):
         # A spawn result with no parseable id AND no failure word → keep running → block.
@@ -227,12 +253,54 @@ class TestReloadGateHardening1824(unittest.TestCase):
         self.assertTrue(safe, "an affirmatively-failed spawn must not block forever")
 
     def test_net_does_not_overblock_finished_idle_team(self):
-        # A team whose teammate sent an idle_notification is finished → reloads
-        # (the deny-by-default net must not over-block a parsed, idle roster).
+        # A teammate that sent an idle_notification (and nothing after) is finished →
+        # reloads (the net must not over-block a parsed, idle roster).
         safe, _ = self._gate([
             _tu("u1", "Agent", {"description": "spin"}),
             _tr("u1", "Spawned successfully. agent_id: alice@squad"),
-            {"type": "user", "message": {"role": "user", "content":
-                '<teammate-message teammate_id="alice@squad">{"type":"idle_notification"}</teammate-message>'}},
+            _user('<teammate-message teammate_id="alice@squad">{"type":"idle_notification"}</teammate-message>'),
             _idle_lead()])
         self.assertTrue(safe, "a finished (idle) team must reload, not over-block")
+
+    def test_idle_then_reengage_blocks(self):
+        # idle → then a NON-idle teammate-message = the teammate resumed → block.
+        safe, reason = self._gate([
+            _tu("u1", "Agent", {"description": "spin"}),
+            _tr("u1", "Spawned successfully. agent_id: alice@squad"),
+            _user('<teammate-message teammate_id="alice@squad" summary="idle">{"type":"idle_notification"}</teammate-message>'),
+            _user('<teammate-message teammate_id="alice@squad" summary="progress">Resuming — analyzing the remaining 12 files.</teammate-message>'),
+            _idle_lead()])
+        self.assertFalse(safe, f"idle→re-engage must block (teammate alive); got reload: {reason!r}")
+
+    # ── P0 regressions: the net must NOT fire on arbitrary text ──────────────
+    def test_agentid_in_code_result_reloads(self):
+        # `agent_id:` / `agent_id =` in a Grep/Read result is CODE, not a spawn —
+        # a teamless session that read such a line must still reload (P0).
+        safe, reason = self._gate([
+            _tu("g1", "Grep", {"pattern": "agent_id"}),
+            _tr("g1", "models.py:10:    agent_id = models.UUIDField()\n"
+                      "config.yaml:3:agent_id: 5\n.env:1:AGENT_ID=xyz"),
+            _idle_lead("Done searching.")])
+        self.assertTrue(safe, f"teamless agent_id: in a Grep result must reload; blocked: {reason!r}")
+
+    def test_protocol_discussion_in_prose_reloads(self):
+        # A user merely DISCUSSING the protocol (no structural teammate-message tag)
+        # must reload — the net keys on structure, not bare substrings (P0).
+        safe, reason = self._gate([
+            _user('The harness emits {"type":"idle_notification"} and a '
+                  '<teammate-message> tag. Does the net over-block on these substrings?'),
+            _idle_lead("Good question.")])
+        self.assertTrue(safe, f"prose discussing the protocol must reload; blocked: {reason!r}")
+
+    def test_net_correlates_spawn_marker_to_paired_tool(self):
+        # Directly pin the correlation: the SAME marker text counts only when its
+        # paired tool_use is a spawn tool — a Read result must not, an Agent result must.
+        from cozempic.guard import _unresolved_team_coordination
+        read_m = load_messages(_write(self.tmp, [
+            _tu("r1", "Read", {"file_path": "x.py"}), _tr("r1", "agent_id: alice@squad")]))
+        self.assertFalse(_unresolved_team_coordination(read_m, None),
+                         "marker in a Read result must NOT count as coordination")
+        agent_m = load_messages(_write(self.tmp, [
+            _tu("a1", "Agent", {"description": "x"}), _tr("a1", "agent_id: alice@squad")]))
+        self.assertTrue(_unresolved_team_coordination(agent_m, None),
+                        "marker in an Agent-tool result MUST count as coordination")

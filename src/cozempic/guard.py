@@ -2426,21 +2426,41 @@ def detect_in_flight(messages) -> dict:
 
 
 # Team-MEMBER coordination tool names (exclude the shared-list Task* + read-only
-# TeamStatus/Get/List). Their presence with an EMPTY roster = a parse gap.
+# TeamStatus/Get/List). A tool_use with one of THESE names is unambiguous team
+# coordination (it is a tool NAME, not free text), so its presence with an empty
+# roster = a parse gap → block.
 _TEAM_COORD_TOOLS = {"TeamCreate", "SpawnTeammate", "SendMessage", "TeamMessage"}
-# Agent/team spawn markers in tool_result text — snake AND camelCase id, both spawn
-# phrasings, and the 1.8.22 background launch. Loose ON PURPOSE: this only ever makes
-# the gate MORE conservative (block), never less.
+# Tools a spawn marker must be PAIRED with (via tool_use_id) to count — exactly the
+# correlation detect_in_flight uses. A marker-shaped string in a Read/Grep/Bash/cat
+# result (source code, YAML, .env, structured logs that contain `agent_id:` etc.)
+# must NEVER count, or the gate over-blocks teamless sessions and the guard goes
+# inert (fleet P0, 2026-06-09).
+_TEAM_SPAWN_TOOLS = {"Agent", "Task", "TeamCreate", "SpawnTeammate"}
+# Agent/team spawn markers — snake AND camelCase id, both spawn phrasings, and the
+# 1.8.22 background launch. Only ever consulted inside a paired-spawn-tool result.
 _TEAM_SPAWN_MARKER_RE = re.compile(
     r"agent_?id\s*[:=]|Spawned successfully|Async agent launched", re.IGNORECASE)
+# The STRUCTURAL teammate-message carrier the harness emits (and extract_team_state
+# parses) — `<teammate-message ... teammate_id="...">`. Matched as a tag, NOT as a
+# bare "teammate-message"/"idle_notification" substring, so prose merely *discussing*
+# the protocol (or cozempic's own source/docs) does not trip it (fleet P0).
+_TEAMMATE_MSG_MARKER_RE = re.compile(
+    r'<teammate-message\s[^>]*teammate_id\s*=\s*"', re.IGNORECASE)
 
 
 def _unresolved_team_coordination(messages, team_state) -> bool:
     """Deny-by-default net (1.8.24, lens L0). True when the transcript shows team
-    coordination we could NOT resolve to a roster (empty roster + a coordination
-    tool_use, a spawn marker, or a <teammate-message>). Fires ONLY on an empty
-    roster, so a normally-parsed live OR finished team is unaffected — only the
-    can't-parse-it case (drifted/unknown marker shape) errs to block."""
+    coordination we could NOT resolve to a roster, so the gate blocks instead of
+    SIGKILLing a team whose markers drifted. Fires ONLY on an empty roster (a
+    normally-parsed live OR finished team is unaffected) and ONLY on signals that
+    cannot be fabricated by arbitrary message text:
+      * a `_TEAM_COORD_TOOLS` tool_use (an unambiguous tool NAME), or
+      * a spawn marker inside a tool_result whose PAIRED tool_use is a spawn tool
+        (correlated like detect_in_flight — a marker in a Read/Grep/log result does
+        NOT count), or
+      * a STRUCTURAL `<teammate-message teammate_id="...">` carrier (not a bare
+        substring — prose discussing the protocol does not count).
+    """
     # getattr-with-default (not direct attribute access): teammates/subagents are
     # default_factory dataclass fields — present on instances but NOT on the class,
     # so a MagicMock(spec=TeamState) raises AttributeError on direct access. getattr
@@ -2448,19 +2468,34 @@ def _unresolved_team_coordination(messages, team_state) -> bool:
     if team_state is not None and (
             getattr(team_state, "teammates", None) or getattr(team_state, "subagents", None)):
         return False  # roster parsed → the explicit teammate/subagent checks govern
+    use_name: dict = {}        # tool_use_id -> tool name
+    results: list = []         # (tool_use_id|None, text) per tool_result
     for item in messages or []:
         msg = _msg_dict(item)
+        # Structural teammate-message carrier on a genuine delivery surface only.
+        if _TEAMMATE_MSG_MARKER_RE.search(_completion_text(msg)):
+            return True
         c = (msg.get("message") or {}).get("content")
         if isinstance(c, list):
             for b in c:
                 if not isinstance(b, dict):
                     continue
-                if b.get("type") == "tool_use" and b.get("name") in _TEAM_COORD_TOOLS:
-                    return True
-                if b.get("type") == "tool_result" and _TEAM_SPAWN_MARKER_RE.search(_block_text(b)):
-                    return True
-        txt = _completion_text(msg)
-        if "teammate-message" in txt or "idle_notification" in txt:
+                t = b.get("type")
+                if t == "tool_use":
+                    if b.get("name") in _TEAM_COORD_TOOLS:
+                        return True
+                    if b.get("id"):
+                        use_name[b["id"]] = (b.get("name") or "")
+                elif t == "tool_result":
+                    results.append((b.get("tool_use_id"), _block_text(b)))
+    # Spawn marker — credited ONLY when its paired tool_use is a spawn tool we can
+    # SEE. A pruned/unknown tool_use is NOT credited here (that would re-open the
+    # teamless-session over-block); the roster + detect_in_flight remain the primary
+    # signals, so this net staying conservative-but-not-paranoid is the right trade.
+    for tid, rtext in results:
+        nm = use_name.get(tid)
+        if (nm is not None and nm.strip() in _TEAM_SPAWN_TOOLS
+                and rtext and _TEAM_SPAWN_MARKER_RE.search(rtext)):
             return True
     return False
 

@@ -664,11 +664,20 @@ def extract_team_state(messages: list[Message]) -> TeamState:
                     if tool_use_id:
                         tool_use_id_to_subagent[tool_use_id] = placeholder
 
-                # TeamDelete — the lead disbanded the team; every member is done.
+                # TeamDelete — the lead disbanded a team; its members are done.
                 # Without this a torn-down team's teammates stay "running" forever →
                 # safe_to_reload wedges (never reloads). (1.8.24, fleet F1.)
+                # SCOPE to the named team when teammate agentIds carry an `@team`
+                # suffix, so disbanding team A never marks a LIVE team B's members
+                # terminal → SIGKILL (fleet P2, 2026-06-09). Fall back to clearing
+                # all only when no member matches the suffix (single-team / unsuffixed
+                # rosters), preserving the anti-wedge.
                 elif name == "TeamDelete":
-                    for _tm in seen_teammates.values():
+                    _del_team = (inp.get("team_name") or inp.get("name") or "").strip()
+                    _suffix = "@" + _del_team
+                    _scoped = [tm for tm in seen_teammates.values()
+                               if _del_team and (tm.agent_id or "").endswith(_suffix)]
+                    for _tm in (_scoped or list(seen_teammates.values())):
                         _tm.status = "completed"
 
                 # TaskCreate (shared todo list)
@@ -842,14 +851,25 @@ def extract_team_state(messages: list[Message]) -> TeamState:
         for tm_match in _TEAMMATE_MSG_RE.finditer(content):
             tm_id = tm_match.group(1).strip()
             tm_body = tm_match.group(2)
-            if not _IDLE_NOTIFICATION_RE.search(tm_body):
-                continue
             resolved = _name_to_agent_id.get(tm_id, tm_id)
-            if resolved in seen_teammates:
+            if resolved not in seen_teammates:
+                continue
+            if _IDLE_NOTIFICATION_RE.search(tm_body):
                 # Chronology guard: SendMessage after this line re-activates
                 # the teammate — don't clobber "running" back to "idle".
                 if line_idx >= last_send_line.get(resolved, -1):
                     seen_teammates[resolved].status = "idle"
+            else:
+                # A NON-idle teammate-message means the teammate just SPOKE — it is
+                # alive and working. Re-activate it from a benign (idle/unknown)
+                # status back to "running" so a teammate that idled then RESUMED is
+                # not SIGKILLed (fleet F: idle→re-engage false-negative, 2026-06-09).
+                # Messages are processed in line order, so a later terminal
+                # task-notification still wins; and we never clobber an already
+                # TERMINAL status here, so a finished teammate cannot be wedged.
+                cur = (seen_teammates[resolved].status or "").strip().lower()
+                if cur in ("idle", "unknown", ""):
+                    seen_teammates[resolved].status = "running"
 
     state.teammates = list(seen_teammates.values())
     state.subagents = list(seen_subagents.values())
