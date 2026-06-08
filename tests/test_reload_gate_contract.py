@@ -176,3 +176,63 @@ class TestRealHarnessFixtures(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestReloadGateHardening1824(unittest.TestCase):
+    """1.8.24 hardening on top of #117 — the over-block reducers + fail-safes that
+    keep FINISHED teams reloading while LIVE/ambiguous ones block."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = Path(tempfile.mkdtemp(prefix="cozempic_h1824_"))
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _gate(self, rows):
+        p = _write(self.tmp, rows)
+        m = load_messages(p)
+        return safe_to_reload(extract_team_state(m), m, p)
+
+    def test_camelcase_agentid_blocks(self):
+        # camelCase agentId (the shipped 1.8.22 convention) must parse → block.
+        safe, _ = self._gate([
+            _tu("u1", "Agent", {"description": "spin"}),
+            _tr("u1", "Spawned successfully. agentId: alice@squad"),
+            _idle_lead()])
+        self.assertFalse(safe, "camelCase agentId must be recognized → block")
+
+    def test_teamdelete_lets_team_reload(self):
+        # A disbanded team (TeamDelete) must NOT wedge — members go terminal.
+        safe, _ = self._gate([
+            _tu("u1", "Agent", {"description": "spin"}),
+            _tr("u1", "Spawned successfully. agent_id: alice@squad"),
+            _tu("u2", "TeamDelete", {"team_name": "squad"}),
+            _tr("u2", "All agents terminated."), _idle_lead()])
+        self.assertTrue(safe, "disbanded team must be allowed to reload (no wedge)")
+
+    def test_unparseable_successful_spawn_fails_safe(self):
+        # A spawn result with no parseable id AND no failure word → keep running → block.
+        safe, _ = self._gate([
+            _tu("u1", "Agent", {"description": "spin"}),
+            _tr("u1", "Agent ready: finder-p1@team"), _idle_lead()])
+        self.assertFalse(safe, "unparseable-but-successful spawn must fail toward block")
+
+    def test_affirmative_failed_spawn_reloads(self):
+        # A spawn that affirmatively FAILED (quota/error) is terminal → reloads.
+        safe, _ = self._gate([
+            _tu("u1", "Agent", {"description": "spin"}),
+            _tr("u1", "Error: agent quota exceeded, spawn rejected."), _idle_lead()])
+        self.assertTrue(safe, "an affirmatively-failed spawn must not block forever")
+
+    def test_net_does_not_overblock_finished_idle_team(self):
+        # A team whose teammate sent an idle_notification is finished → reloads
+        # (the deny-by-default net must not over-block a parsed, idle roster).
+        safe, _ = self._gate([
+            _tu("u1", "Agent", {"description": "spin"}),
+            _tr("u1", "Spawned successfully. agent_id: alice@squad"),
+            {"type": "user", "message": {"role": "user", "content":
+                '<teammate-message teammate_id="alice@squad">{"type":"idle_notification"}</teammate-message>'}},
+            _idle_lead()])
+        self.assertTrue(safe, "a finished (idle) team must reload, not over-block")

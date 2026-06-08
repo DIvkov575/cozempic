@@ -2425,6 +2425,46 @@ def detect_in_flight(messages) -> dict:
     }
 
 
+# Team-MEMBER coordination tool names (exclude the shared-list Task* + read-only
+# TeamStatus/Get/List). Their presence with an EMPTY roster = a parse gap.
+_TEAM_COORD_TOOLS = {"TeamCreate", "SpawnTeammate", "SendMessage", "TeamMessage"}
+# Agent/team spawn markers in tool_result text — snake AND camelCase id, both spawn
+# phrasings, and the 1.8.22 background launch. Loose ON PURPOSE: this only ever makes
+# the gate MORE conservative (block), never less.
+_TEAM_SPAWN_MARKER_RE = re.compile(
+    r"agent_?id\s*[:=]|Spawned successfully|Async agent launched", re.IGNORECASE)
+
+
+def _unresolved_team_coordination(messages, team_state) -> bool:
+    """Deny-by-default net (1.8.24, lens L0). True when the transcript shows team
+    coordination we could NOT resolve to a roster (empty roster + a coordination
+    tool_use, a spawn marker, or a <teammate-message>). Fires ONLY on an empty
+    roster, so a normally-parsed live OR finished team is unaffected — only the
+    can't-parse-it case (drifted/unknown marker shape) errs to block."""
+    # getattr-with-default (not direct attribute access): teammates/subagents are
+    # default_factory dataclass fields — present on instances but NOT on the class,
+    # so a MagicMock(spec=TeamState) raises AttributeError on direct access. getattr
+    # swallows that and reads the real lists on a real TeamState.
+    if team_state is not None and (
+            getattr(team_state, "teammates", None) or getattr(team_state, "subagents", None)):
+        return False  # roster parsed → the explicit teammate/subagent checks govern
+    for item in messages or []:
+        msg = _msg_dict(item)
+        c = (msg.get("message") or {}).get("content")
+        if isinstance(c, list):
+            for b in c:
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "tool_use" and b.get("name") in _TEAM_COORD_TOOLS:
+                    return True
+                if b.get("type") == "tool_result" and _TEAM_SPAWN_MARKER_RE.search(_block_text(b)):
+                    return True
+        txt = _completion_text(msg)
+        if "teammate-message" in txt or "idle_notification" in txt:
+            return True
+    return False
+
+
 def safe_to_reload(team_state, messages, session_path) -> tuple[bool, str]:
     """Validate-BEFORE-terminate safe-point gate (1.8.22 component B).
 
@@ -2493,6 +2533,14 @@ def safe_to_reload(team_state, messages, session_path) -> tuple[bool, str]:
         except Exception:
             # Malformed state → be conservative.
             return (False, "team state unreadable")
+    # Deny-by-default net (1.8.24): if the transcript shows team/agent coordination
+    # we could NOT resolve to a roster (an unrecognized or drifted marker shape —
+    # the class behind the 1.8.22 Agent-marker + #117 team blindness), BLOCK rather
+    # than SIGKILL. Fires only when the roster is empty yet coordination is present,
+    # so a normally-parsed live/finished team is unaffected; only the can't-parse-it
+    # case errs to safe. A reload gate must fail toward "block", never "SIGKILL".
+    if _unresolved_team_coordination(messages, team_state):
+        return (False, "unresolved team coordination (unparsed — failing safe)")
     return (True, "quiescent")
 
 

@@ -365,8 +365,10 @@ _AGENT_PROGRESS_RE = re.compile(
 # Verified from production transcripts 2026-06-08 (transcript 371f5917, line 196).
 # If the harness changes this format the regex will gracefully miss (fallback:
 # placeholder key retained; only terminal transitions are affected).
+# Accept snake `agent_id:` AND camelCase `agentId:` (the SHIPPED 1.8.22 background
+# marker uses camelCase, so a team spawn very plausibly does too) + `=` separator.
 _AGENT_SPAWN_ID_RE = re.compile(
-    r"agent_id:\s*([A-Za-z0-9@._-]+)",
+    r"agent_?id\s*[:=]\s*([A-Za-z0-9@._-]+)",
     re.IGNORECASE,
 )
 _AGENT_SPAWN_TEAM_RE = re.compile(
@@ -662,6 +664,13 @@ def extract_team_state(messages: list[Message]) -> TeamState:
                     if tool_use_id:
                         tool_use_id_to_subagent[tool_use_id] = placeholder
 
+                # TeamDelete — the lead disbanded the team; every member is done.
+                # Without this a torn-down team's teammates stay "running" forever →
+                # safe_to_reload wedges (never reloads). (1.8.24, fleet F1.)
+                elif name == "TeamDelete":
+                    for _tm in seen_teammates.values():
+                        _tm.status = "completed"
+
                 # TaskCreate (shared todo list)
                 elif name == "TaskCreate":
                     task_id = inp.get("taskId", inp.get("id", str(len(seen_tasks))))
@@ -754,15 +763,20 @@ def extract_team_state(messages: list[Message]) -> TeamState:
                             if bare and bare != real_agent_id:
                                 _name_to_agent_id[bare] = real_agent_id
                     else:
-                        # No agent_id: in result → spawn failed or was rejected.
-                        # A tool_result with no parseable agentId is a completed-
-                        # with-no-agent event (quota error, harness rejection, etc.),
-                        # NOT an in-flight spawn. Drop/mark-terminal the placeholder
-                        # so the safe_to_reload gate is not permanently wedged.
-                        # H-1 fix (2026-06-08).
+                        # No agentId parsed. Mark terminal "failed" ONLY if the result
+                        # AFFIRMATIVELY signals failure (quota/error/rejected) — else
+                        # the spawn likely SUCCEEDED with an off-pattern result string,
+                        # so keep the placeholder "running" (block). Fail toward block,
+                        # never toward SIGKILL on a parse miss (1.8.24 fail-safe; the
+                        # earlier H-1 marked every parse miss "failed" → false-safe).
                         placeholder = tool_use_id_to_subagent.get(tool_use_id, "")
                         if placeholder and placeholder in seen_teammates:
-                            seen_teammates[placeholder].status = "failed"
+                            _low = result_text.lower()
+                            if any(k in _low for k in (
+                                    "error", "fail", "quota", "rejected", "denied",
+                                    "could not", "unable", "cancel", "timeout")):
+                                seen_teammates[placeholder].status = "failed"
+                            # else: keep "running" — unparseable success defers (safe)
                     # Parse team_name from result if not yet set
                     team_m = _AGENT_SPAWN_TEAM_RE.search(result_text)
                     if team_m and not state.team_name:
