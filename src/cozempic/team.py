@@ -386,6 +386,25 @@ _IDLE_NOTIFICATION_RE = re.compile(
 )
 
 
+def _extract_block_text(block: dict) -> str:
+    """Return the text payload of a tool-result block.
+
+    Handles both string content and the list-of-sub-blocks form
+    (``[{"type": "text", "text": "..."}]``).  Callers use this to avoid
+    duplicating the same isinstance chain for result_text extraction.
+    """
+    content = block.get("content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            sub.get("text", "")
+            for sub in content
+            if isinstance(sub, dict) and sub.get("type") == "text"
+        )
+    return ""
+
+
 def _is_team_message(msg_dict: dict, pending_task_ids: set[str] | None = None) -> bool:
     """Check if a message is related to agent team coordination.
 
@@ -683,15 +702,7 @@ def extract_team_state(messages: list[Message]) -> TeamState:
                 # Task tool result = subagent finished, capture result
                 if tool_name == "Task" or tool_use_id in tool_use_id_to_subagent:
                     subagent_key = tool_use_id_to_subagent.get(tool_use_id, "")
-                    result_text = ""
-
-                    result_content = block.get("content", "")
-                    if isinstance(result_content, str):
-                        result_text = result_content
-                    elif isinstance(result_content, list):
-                        for sub in result_content:
-                            if isinstance(sub, dict) and sub.get("type") == "text":
-                                result_text += sub.get("text", "")
+                    result_text = _extract_block_text(block)
 
                     if subagent_key and subagent_key in seen_subagents:
                         seen_subagents[subagent_key].status = "completed"
@@ -709,14 +720,7 @@ def extract_team_state(messages: list[Message]) -> TeamState:
                 # Format: "Spawned successfully.\nagent_id: NAME@TEAM\n..."
                 # (verified from production transcripts 2026-06-08).
                 if tool_name == "Agent":
-                    result_text = ""
-                    rc = block.get("content", "")
-                    if isinstance(rc, str):
-                        result_text = rc
-                    elif isinstance(rc, list):
-                        for sub in rc:
-                            if isinstance(sub, dict) and sub.get("type") == "text":
-                                result_text += sub.get("text", "")
+                    result_text = _extract_block_text(block)
 
                     agent_id_m = _AGENT_SPAWN_ID_RE.search(result_text)
                     if agent_id_m:

@@ -731,31 +731,6 @@ class TestIdleNotificationPruneProtection(unittest.TestCase):
             "so it is prune-protected and cannot be lost to compaction"
         )
 
-    def test_idle_notification_pruned_away_does_not_wedge(self):
-        """REGRESSION GUARD — RED at base: if idle_notification is dropped from
-        the message list, the teammate stays 'running' → permanent reload wedge.
-
-        After fix: either the carrier is prune-protected (C-2 fix) or the extract
-        logic handles the absent carrier gracefully (out-of-scope for this PR).
-        This test verifies the PROTECTION path: after fix, the carrier survives
-        prune_with_team_protect and idle_notification is correctly parsed.
-        """
-        from cozempic.team import _is_team_message
-        # The assertion is that the carrier message is protected (is_team_message=True).
-        # If the carrier is protected, it cannot be dropped by prune → wedge can't occur.
-        # This is the same assertion as test_idle_notification_carrier_is_team_message
-        # but framed from the wedge-prevention perspective.
-        idle_carrier = _user_content(
-            '<teammate-message teammate_id="p1@team" summary="idle">'
-            '{"type":"idle_notification","from":"p1","idleReason":"available"}'
-            '</teammate-message>'
-        )
-        self.assertTrue(
-            _is_team_message(idle_carrier, set()),
-            "idle_notification carrier must be tagged as a team message to prevent "
-            "the safe_to_reload permanent-wedge via pruned-idle scenario"
-        )
-
 
 # ─── TestFailedAgentSpawnNoWedge (H-1 regression guards) ─────────────────────
 
