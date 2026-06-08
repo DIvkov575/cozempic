@@ -2425,6 +2425,25 @@ def detect_in_flight(messages) -> dict:
     }
 
 
+def _team_is_current_session(team_state, session_path) -> bool:
+    """True if the TeamState belongs to the session currently being guarded.
+
+    A stale config.json from a prior session can present a non-quiescent
+    team_state (teammates still "running") long after those agents exited.
+    Comparing the state's lead_session_id to the guarded session's stem prevents
+    that stale state from wedging a reload of a completely different session.
+    Conservative: unknown session (None lead_session_id or None session_path)
+    is treated as current-session — we block the reload rather than skip the
+    check.
+    """
+    if not (team_state and team_state.lead_session_id):
+        return True  # unknown → conservative: treat as current
+    if session_path is None:
+        return True  # no path to compare → conservative
+    guarded = Path(session_path).stem
+    return team_state.lead_session_id == guarded
+
+
 def safe_to_reload(team_state, messages, session_path) -> tuple[bool, str]:
     """Validate-BEFORE-terminate safe-point gate (1.8.22 component B).
 
@@ -2472,8 +2491,13 @@ def safe_to_reload(team_state, messages, session_path) -> tuple[bool, str]:
             # terminal; if a completion never arrives the teammate stays non-benign
             # and we keep deferring — safe (PreCompact/PostCompact re-injects the
             # checkpoint at the wall).
-            if any((t.status or "").strip().lower() not in (_STATUS_TERMINAL | _TEAMMATE_BENIGN)
-                   for t in (team_state.teammates or [])):
+            # Session anti-wedge (P0-E): stale config.json from a prior session
+            # must not hold the current session's reload hostage. Only enforce the
+            # teammate check when this TeamState actually belongs to our session.
+            if (_team_is_current_session(team_state, session_path)
+                    and any((t.status or "").strip().lower()
+                            not in (_STATUS_TERMINAL | _TEAMMATE_BENIGN)
+                            for t in (team_state.teammates or []))):
                 return (False, "teammate mid-execution")
             active_tasks, _, _ = team_state._task_groups()
             if active_tasks:
