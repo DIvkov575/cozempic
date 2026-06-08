@@ -267,6 +267,11 @@ After `cozempic init`, these hooks are wired automatically:
 
 ## Changelog
 
+### v1.8.23
+
+- **Hardened numeric input validation** — `NaN`, `infinity`, and non-representable huge integers are now rejected with a clear error at every CLI flag, `COZEMPIC_*` env var, and config field (a `NaN` threshold would otherwise silently disable the gate it controls). Thanks to **[@ynaamane](https://github.com/ynaamane)** (#116), and folded in the matching fix for the interactive-guard reload-grace knob
+- **Standing adversarial QA fleet** — `docs/qa-fleet.md` + a corpus-driven regression test so this whole class can't regress
+
 ### v1.8.22
 
 - **Interactive "prune now?" nudge** — non-blocking heads-up at 25% / 55% / 80% context (once per tier, with hysteresis so it never nags), recommending `cozempic reload`. Brings cozempic's higher-fidelity prune+resume to interactive sessions without surprise reloads. Tunable via `COZEMPIC_NUDGE_PCTS`; silence with `COZEMPIC_NUDGE_OFF=1`
