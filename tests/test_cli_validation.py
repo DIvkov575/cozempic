@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import io
 import contextlib
 import os
@@ -9,7 +10,66 @@ import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from cozempic.cli import _prescan_argv, build_parser, _digest_session
+from cozempic.cli import _prescan_argv, _positive_float, build_parser, _digest_session
+
+
+class TestPositiveFloatArgparseHelper:
+    """Direct unit tests for cli._positive_float argparse type= helper.
+
+    NaN/inf bypass: float("nan") and float("inf") both pass `f <= 0` (False
+    in IEEE 754), so the validator silently returns nan/inf.
+    RED at base: _positive_float("nan") returns nan instead of raising.
+    RED at base: _positive_float("inf") returns inf instead of raising.
+    These are bug-capture tests — must FAIL against the unmodified source.
+    """
+
+    def test_positive_float_rejects_nan(self):
+        """'nan' → float('nan') → bypasses <= 0 → silently returned.
+        RED at base: no exception raised.
+        Also asserts the specific 'finite' discriminating word — ensures the NaN/inf
+        guard fires (not the generic type-guard or positivity check)."""
+        try:
+            result = _positive_float("nan")
+            raise AssertionError(
+                f"Expected ArgumentTypeError but _positive_float returned {result!r}"
+            )
+        except argparse.ArgumentTypeError as e:
+            assert "finite" in str(e), (
+                f"expected 'finite' in error message, got: {e!r}"
+            )
+
+    def test_positive_float_rejects_inf(self):
+        """'inf' → float('inf') → bypasses <= 0 → silently returned.
+        RED at base: no exception raised.
+        Also asserts the specific 'finite' discriminating word."""
+        try:
+            result = _positive_float("inf")
+            raise AssertionError(
+                f"Expected ArgumentTypeError but _positive_float returned {result!r}"
+            )
+        except argparse.ArgumentTypeError as e:
+            assert "finite" in str(e), (
+                f"expected 'finite' in error message, got: {e!r}"
+            )
+
+    def test_positive_float_rejects_negative_inf(self):
+        """-inf is already caught by `f <= 0` at base (-inf <= 0 is True).
+        GREEN at base — regression guard, not a RED/bug-capture test."""
+        try:
+            result = _positive_float("-inf")
+            raise AssertionError(
+                f"Expected ArgumentTypeError but _positive_float returned {result!r}"
+            )
+        except argparse.ArgumentTypeError:
+            pass  # expected
+
+    def test_positive_float_accepts_valid(self):
+        """Positive finite float must still be accepted after the fix."""
+        assert _positive_float("50.5") == 50.5
+
+    def test_positive_float_accepts_int_string(self):
+        """'50' (int string) is valid — user may write --threshold 50."""
+        assert _positive_float("50") == 50.0
 
 
 class TestPrescanArgvValidation:
@@ -153,10 +213,38 @@ class TestGuardArgparseValidation:
         self._assert_argparse_rejects(["remind", "--interval", "-5"])
 
 
+def _assert_raises_like(exc_type, substr):
+    """Context manager: assert exc_type is raised and substr appears in str(e).
+
+    Module-level helper shared by TestStartGuardOrderingValidation,
+    TestStartGuardNanInfValidation, and TestReloadSelfDaemonNanInfValidation.
+    """
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _ctx():
+        try:
+            yield
+        except exc_type as e:
+            assert substr in str(e), f"expected {substr!r} in {e!r}"
+            return
+        raise AssertionError(f"expected {exc_type.__name__}, nothing raised")
+
+    return _ctx()
+
+
 class TestStartGuardOrderingValidation:
     """After argparse, soft thresholds may be resolved from defaults
     (60% of threshold). The soft < hard invariant must hold at that point
     too — checked inside start_guard, not just at argparse."""
+
+    def setup_method(self):
+        import tempfile
+        self._tmpdir = tempfile.mkdtemp(prefix="_cozempic_ordering_test_")
+
+    def teardown_method(self):
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
 
     def _call_start_guard(self, **kwargs):
         from cozempic.guard import start_guard
@@ -164,43 +252,238 @@ class TestStartGuardOrderingValidation:
 
     def test_soft_mb_equal_hard_mb_rejected(self):
         from cozempic._validation import ConfigError
-        with self.assertRaisesLike(ConfigError, "strictly less"):
+        with _assert_raises_like(ConfigError, "strictly less"):
             self._call_start_guard(
                 threshold_mb=50.0,
                 soft_threshold_mb=50.0,
-                cwd="/tmp/_cozempic_test_nonexistent_session",
+                cwd=self._tmpdir,
             )
 
     def test_soft_mb_greater_than_hard_mb_rejected(self):
         from cozempic._validation import ConfigError
-        with self.assertRaisesLike(ConfigError, "strictly less"):
+        with _assert_raises_like(ConfigError, "strictly less"):
             self._call_start_guard(
                 threshold_mb=50.0,
                 soft_threshold_mb=100.0,
-                cwd="/tmp/_cozempic_test_nonexistent_session",
+                cwd=self._tmpdir,
             )
 
     def test_soft_tokens_greater_than_threshold_tokens_rejected(self):
         from cozempic._validation import ConfigError
-        with self.assertRaisesLike(ConfigError, "strictly less"):
+        with _assert_raises_like(ConfigError, "strictly less"):
             self._call_start_guard(
                 threshold_mb=50.0,
                 threshold_tokens=10_000,
                 soft_threshold_tokens=20_000,
-                cwd="/tmp/_cozempic_test_nonexistent_session",
+                cwd=self._tmpdir,
             )
 
-    # pytest-style: contextmanager mimic
-    from contextlib import contextmanager
 
-    @contextmanager
-    def assertRaisesLike(self, exc_type, substr):
-        try:
-            yield
-        except exc_type as e:
-            assert substr in str(e), f"expected {substr!r} in {e!r}"
-            return
-        raise AssertionError(f"expected {exc_type.__name__}, nothing raised")
+class TestStartGuardNanInfValidation:
+    """NaN/inf bypass in guard.py belt-and-braces validators (H-1 fold).
+
+    start_guard and start_guard_daemon both validate thresholds before any
+    subprocess spawn, so direct-Python callers passing NaN/inf are the audience.
+    Argparse (now fixed via P0-B) only covers the CLI string path; these tests
+    cover the direct-Python-caller contract documented in start_guard's docstring.
+
+    RED at base: NaN/inf bypass `<= 0` (IEEE 754 semantics), no ConfigError raised.
+    These are bug-capture tests — must FAIL against the unmodified source.
+
+    Isolation (per isolate-subprocess-tests-by-design memory):
+      start_guard:        validation fires before any I/O (before find_current_session).
+                          A tempdir is still created and cleaned up in teardown to
+                          defend against future code reorderings.
+      start_guard_daemon: ALL I/O primitives between function entry and Popen are mocked
+                          to prevent any /tmp/cozempic_guard_* file creation at base:
+                            _cleanup_legacy_pid      (legacy pid cleanup)
+                            _reload_sentinel_active  (sentinel file read)
+                            find_current_session     (jsonl directory scan)
+                            _is_guard_running_for_session (pid file read)
+                            _guard_tmp_root          (redirects pid/log path construction)
+                            cozempic.spawn_lock.DaemonSpawnClaim (O_CREAT|O_EXCL on .pid)
+                            subprocess.Popen         (daemon spawn)
+                          Teardown removes the tempdir unconditionally.
+                          Acceptance: BEFORE/AFTER ls /tmp/cozempic_guard_* count equal
+                          when daemon tests run against unpatched (base) source.
+    """
+
+    def setup_method(self):
+        import tempfile
+        self._tmpdir = tempfile.mkdtemp(prefix="_cozempic_guard_nan_test_")
+
+    def teardown_method(self):
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_start_guard_threshold_mb_nan_raises_config_error(self):
+        """start_guard(threshold_mb=float('nan')) must raise ConfigError with 'finite'.
+        RED at base: nan <= 0 is False, validation bypassed; ValueError raised downstream
+        at int(nan * 1024 * 1024) instead of ConfigError at the validation block."""
+        from cozempic.guard import start_guard
+        from cozempic._validation import ConfigError
+        with _assert_raises_like(ConfigError, "finite"):
+            start_guard(threshold_mb=float("nan"), cwd=self._tmpdir)
+
+    def test_start_guard_threshold_mb_inf_raises_config_error(self):
+        """start_guard(threshold_mb=float('inf')) must raise ConfigError with 'finite'.
+        RED at base: inf <= 0 is False; OverflowError raised downstream at int(inf)
+        instead of ConfigError at the validation block."""
+        from cozempic.guard import start_guard
+        from cozempic._validation import ConfigError
+        with _assert_raises_like(ConfigError, "finite"):
+            start_guard(threshold_mb=float("inf"), cwd=self._tmpdir)
+
+    def test_start_guard_threshold_mb_huge_int_raises_config_error(self):
+        """start_guard(threshold_mb=10**400) must raise ConfigError with 'finite'.
+
+        RED at base: isinstance gate skips ints entirely; 10**400 passes the float
+        guard, then `round(threshold_mb * 0.6, 1)` (the soft-threshold default) does
+        an int*float multiply that raises a bare OverflowError downstream instead of
+        ConfigError at the validation block. Same class of bug as P0-F
+        (coerce_positive_float). Fix: widen the gate to isinstance(_v, (int, float))
+        so huge ints enter the try/except OverflowError path."""
+        from cozempic.guard import start_guard
+        from cozempic._validation import ConfigError
+        with _assert_raises_like(ConfigError, "finite"):
+            start_guard(threshold_mb=10**400, cwd=self._tmpdir)
+
+    def test_start_guard_daemon_threshold_mb_nan_raises_config_error(self):
+        """start_guard_daemon(threshold_mb=float('nan')) must raise ConfigError before spawn.
+        RED at base: nan <= 0 is False, validation silently passes; execution reaches
+        DaemonSpawnClaim which creates /tmp/cozempic_guard_*.pid via O_CREAT|O_EXCL,
+        and open(log_file) creates /tmp/cozempic_guard_*.log — two real /tmp artifacts.
+
+        All I/O primitives between function entry and Popen are mocked to guarantee
+        zero /tmp/cozempic_guard_* files even when running against the unpatched source:
+          - _cleanup_legacy_pid      (legacy pid cleanup)
+          - _reload_sentinel_active  (sentinel file read — only fires when session_id set)
+          - find_current_session     (jsonl directory scan — fires when no session_id)
+          - _is_guard_running_for_session (pid file read)
+          - _guard_tmp_root          (redirects pid/log path construction to self._tmpdir)
+          - cozempic.spawn_lock.DaemonSpawnClaim (O_CREAT|O_EXCL on .pid — the leak source)
+          - subprocess.Popen         (daemon spawn — must never be reached)
+        """
+        from cozempic.guard import start_guard_daemon
+        from cozempic._validation import ConfigError
+        with (
+            patch("cozempic.guard._cleanup_legacy_pid"),
+            patch("cozempic.guard._reload_sentinel_active", return_value=False),
+            patch("cozempic.guard.find_current_session", return_value=None),
+            patch("cozempic.guard._is_guard_running_for_session", return_value=None),
+            patch("cozempic.guard._guard_tmp_root", return_value=Path(self._tmpdir)),
+            patch("cozempic.spawn_lock.DaemonSpawnClaim"),
+            patch("cozempic.guard.subprocess.Popen"),
+        ):
+            with _assert_raises_like(ConfigError, "finite"):
+                start_guard_daemon(
+                    threshold_mb=float("nan"), cwd=self._tmpdir
+                )
+
+    def test_start_guard_daemon_threshold_mb_inf_raises_config_error(self):
+        """start_guard_daemon(threshold_mb=float('inf')) must raise ConfigError before spawn.
+        RED at base: inf <= 0 is False; same leak pattern as nan (two /tmp artifacts).
+
+        All I/O primitives mocked — see test_start_guard_daemon_threshold_mb_nan for details.
+        """
+        from cozempic.guard import start_guard_daemon
+        from cozempic._validation import ConfigError
+        with (
+            patch("cozempic.guard._cleanup_legacy_pid"),
+            patch("cozempic.guard._reload_sentinel_active", return_value=False),
+            patch("cozempic.guard.find_current_session", return_value=None),
+            patch("cozempic.guard._is_guard_running_for_session", return_value=None),
+            patch("cozempic.guard._guard_tmp_root", return_value=Path(self._tmpdir)),
+            patch("cozempic.spawn_lock.DaemonSpawnClaim"),
+            patch("cozempic.guard.subprocess.Popen"),
+        ):
+            with _assert_raises_like(ConfigError, "finite"):
+                start_guard_daemon(
+                    threshold_mb=float("inf"), cwd=self._tmpdir
+                )
+
+
+class TestReloadSelfDaemonNanInfValidation:
+    """NaN/inf bypass in reload_self_daemon — the critical third entry point (P0-D).
+
+    reload_self_daemon SIGTERMs/SIGKILLs the old daemon THEN calls
+    start_guard_daemon. Without a finite check BEFORE the kill, passing
+    threshold_mb=float('nan') kills the live daemon and then raises
+    ConfigError (from start_guard_daemon's validator), leaving the session
+    completely unprotected.
+
+    Regression guard: _validate_finite_thresholds() is called at the top of
+    reload_self_daemon before any I/O, so a NaN/inf threshold_mb raises
+    ConfigError before os.kill is reached — the live daemon is never orphaned.
+
+    All I/O between entry and the kill is mocked per isolate-subprocess-tests-by-design.
+    """
+
+    def _make_mocks(self):
+        """Return a context manager that mocks all I/O in reload_self_daemon
+        between the function entry and the os.kill call (inclusive).
+
+        Mocked:
+          - _is_guard_running_for_session → 99999 (fake PID — daemon appears running)
+          - _is_cozempic_guard_process     → True  (PID identity verified)
+          - os.kill                         → recorded, must NOT be called on nan/inf
+          - _wait_for_exit                  → True  (clean exit on SIGTERM)
+          - _pid_file_points_to             → False (CAS: leave pid file alone)
+          - _pid_file_for_session           → MagicMock (avoid real filesystem)
+          - start_guard_daemon              → {"started": True, "pid": 88888}
+        """
+        import contextlib
+        from unittest.mock import MagicMock, patch, call
+
+        @contextlib.contextmanager
+        def ctx():
+            with (
+                patch("cozempic.guard._is_guard_running_for_session", return_value=99999),
+                patch("cozempic.guard._is_cozempic_guard_process", return_value=True),
+                patch("cozempic.guard.os.kill") as mock_kill,
+                patch("cozempic.guard._wait_for_exit", return_value=True),
+                patch("cozempic.guard._pid_file_points_to", return_value=False),
+                patch("cozempic.guard._pid_file_for_session", return_value=MagicMock()),
+                patch("cozempic.guard.start_guard_daemon",
+                      return_value={"started": True, "pid": 88888, "log_file": "/tmp/x.log"}),
+            ):
+                yield mock_kill
+
+        return ctx()
+
+    def test_reload_self_daemon_threshold_mb_nan_raises_before_kill(self):
+        """reload_self_daemon(threshold_mb=nan) must raise ConfigError BEFORE os.kill.
+
+        Regression guard: _validate_finite_thresholds() fires at entry, ConfigError
+        is raised before os.kill — the live daemon (99999) is never orphaned."""
+        from cozempic.guard import reload_self_daemon
+        from cozempic._validation import ConfigError
+        with self._make_mocks() as mock_kill:
+            with _assert_raises_like(ConfigError, "finite"):
+                reload_self_daemon(
+                    threshold_mb=float("nan"),
+                    session_id="00000000-0000-0000-0000-000000000001",
+                )
+        assert not mock_kill.called, (
+            "os.kill was called before ConfigError — daemon was killed with an invalid config"
+        )
+
+    def test_reload_self_daemon_threshold_mb_inf_raises_before_kill(self):
+        """reload_self_daemon(threshold_mb=inf) must raise ConfigError BEFORE os.kill.
+
+        Regression guard: same orphan-daemon scenario with inf — ConfigError
+        fires before os.kill, daemon survives."""
+        from cozempic.guard import reload_self_daemon
+        from cozempic._validation import ConfigError
+        with self._make_mocks() as mock_kill:
+            with _assert_raises_like(ConfigError, "finite"):
+                reload_self_daemon(
+                    threshold_mb=float("inf"),
+                    session_id="00000000-0000-0000-0000-000000000001",
+                )
+        assert not mock_kill.called, (
+            "os.kill was called before ConfigError — daemon was killed with an invalid config"
+        )
 
 
 class TestReloadSessionFlag:

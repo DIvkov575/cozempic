@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import platform
 import subprocess
@@ -51,11 +52,13 @@ def _positive_int(val: str) -> int:
 
 def _positive_float(val: str) -> float:
     """argparse type= for strictly-positive floats. Used for --threshold
-    and --soft-threshold (MB thresholds)."""
+    and --soft-threshold (MB thresholds). Rejects NaN and infinity."""
     try:
         f = float(val)
     except ValueError:
         raise argparse.ArgumentTypeError(f"{val!r} is not a valid number")
+    if not math.isfinite(f):
+        raise argparse.ArgumentTypeError(f"must be a finite number, got {f}")
     if f <= 0:
         raise argparse.ArgumentTypeError(f"must be positive, got {f}")
     return f

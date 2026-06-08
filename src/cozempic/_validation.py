@@ -24,6 +24,7 @@ Design goals:
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 from typing import Any
@@ -111,7 +112,7 @@ def coerce_positive_float(config: dict, key: str, default: float) -> float:
     """Return `config[key]` as a strictly-positive float, or `default` if absent.
 
     Accepts int in addition to float (users write `threshold=50`). Rejects
-    bool, str, None, negative, and zero.
+    bool, str, None, negative, zero, NaN, and infinity.
     """
     if key not in config:
         return default
@@ -119,6 +120,15 @@ def coerce_positive_float(config: dict, key: str, default: float) -> float:
     if not _is_strict_number(value):
         raise ConfigError(
             f"config[{key!r}] must be a number, got {type(value).__name__} {value!r}"
+        )
+    try:
+        _nonfinite = not math.isfinite(value)
+    except OverflowError:
+        # int too large to convert to float (e.g. 10**400) — treat as non-finite
+        _nonfinite = True
+    if _nonfinite:
+        raise ConfigError(
+            f"config[{key!r}] must be a finite number, got {value!r}"
         )
     if value <= 0:
         raise ConfigError(
