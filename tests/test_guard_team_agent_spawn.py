@@ -654,8 +654,8 @@ class TestStaleConfigAntiWedge(unittest.TestCase):
 
     def test_stale_same_name_config_does_not_allow_false_safe_reload(self):
         """REGRESSION GUARD — RED at base: stale same-name config overwrites
-        lead_session_id → _team_is_current_session(live_path) returns False →
-        safe_to_reload returns (True, 'quiescent') → SIGKILL of live team.
+        lead_session_id (now guarded by _name_only_match) → safe_to_reload
+        returns (True, 'quiescent') → SIGKILL of live team.
 
         The live session JSONL stem ('LIVE-SESSION-2222') differs from the
         stale config's leadSessionId ('OLD-SESSION-1111'). After the C-1 fix,
@@ -672,8 +672,8 @@ class TestStaleConfigAntiWedge(unittest.TestCase):
             from cozempic.team import extract_team_state
             state = extract_team_state(msgs)
 
-        # After fix: lead_session_id must NOT be overwritten by stale config's value
-        # (or _team_is_current_session must otherwise still block correctly)
+        # After fix: lead_session_id must NOT be overwritten by stale config's value;
+        # safe_to_reload blocks unconditionally on "running" status regardless.
         safe, reason = safe_to_reload(state, msgs, live_path)
         self.assertFalse(
             safe,

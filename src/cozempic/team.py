@@ -914,9 +914,9 @@ def merge_config_into_state(state: TeamState, configs: list[dict] | None = None)
     #   A name-only match is unreliable for session-identity fields: team names are
     #   frequently reused across sessions (same project, same team composition). A
     #   stale config.json with the same name but an OLD leadSessionId would overwrite
-    #   state.lead_session_id, causing _team_is_current_session to return False for
-    #   the LIVE session → safe_to_reload returns (True, "quiescent") → SIGKILL of
-    #   a working live team (F1 reborn via the anti-wedge path).
+    #   state.lead_session_id; because safe_to_reload's teammate block fires on
+    #   status alone (not session ID) this would not cause a missed block, but it
+    #   pollutes the state with a stale identity field (F1 reborn via config path).
     #
     #   Strong joins (session ID / agent ID / member ID intersection) are anchored
     #   on identity that is guaranteed unique per session. Only a strong match
@@ -960,8 +960,8 @@ def merge_config_into_state(state: TeamState, configs: list[dict] | None = None)
     # Merge authoritative fields.
     # lead_session_id is session-identity — only overwrite from a strong join.
     # A name-only match may carry a STALE leadSessionId from a prior session that
-    # happened to use the same team name; importing it would corrupt the anti-wedge
-    # gate in safe_to_reload (_team_is_current_session). C-1 fix (2026-06-08).
+    # happened to use the same team name; importing it would pollute session-identity
+    # fields in TeamState with stale data. C-1 fix (2026-06-08).
     state.team_name = matched_config.get("name", state.team_name)
     state.lead_agent_id = matched_config.get("leadAgentId", state.lead_agent_id)
     if not _name_only_match:
