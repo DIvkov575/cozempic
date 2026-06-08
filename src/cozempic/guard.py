@@ -2447,14 +2447,18 @@ def safe_to_reload(team_state, messages, session_path) -> tuple[bool, str]:
         return (False, "background subagent running")
     if inflight["open_call"]:
         return (False, "open tool call (result not yet flushed)")
-    # Tracked team quiescence (TeamState). NOTE: we deliberately do NOT hard-block
-    # on teammate.status — TeamCreate sets it "running" and nothing in the
-    # extractor ever transitions it to terminal, so blocking on it wedged EVERY
-    # team session forever (the guard's primary use case). The reliable liveness
-    # signals are: subagent entries (which ARE updated by task-notification
-    # completions), active todo tasks (TaskUpdate-maintained), and the in-flight
-    # detector above — an actually-working teammate always shows up as one of
-    # those (a running subagent / open Agent call / un-completed Agent launch).
+    # Tracked team quiescence (TeamState). We DO hard-block on a non-benign
+    # teammate status: an Agent-spawned agent team (the guard's primary use case)
+    # is NOT reliably visible via subagent entries / open calls / un-completed
+    # launches — those markers fire for background subagents, not for `Agent`-tool
+    # teammates — so the teammate roster is the only signal that catches it, and
+    # this block is load-bearing (closing the F1 destroy-active-team gap). The
+    # extractor transitions a teammate to a terminal/idle (benign) status via
+    # task-notification + idle_notification (chronology-aware), and the
+    # idle-notification carrier is prune-protected (_is_team_message), so the
+    # clear signal survives a prune and the block no longer wedges. Subagent
+    # entries, active todo tasks, and the in-flight detector above remain
+    # complementary signals checked alongside it.
     if team_state is not None and not team_state.is_empty():
         try:
             # Subagent block — DENYLIST: any non-terminal status is treated as

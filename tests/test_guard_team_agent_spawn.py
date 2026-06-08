@@ -138,6 +138,23 @@ class TestTeamNameExtraction(unittest.TestCase):
         self.assertEqual(state.team_name, "myteam",
                          "'name' key fallback must still work for backward compat")
 
+    def test_teamcreate_both_keys_prefers_team_name(self):
+        """REGRESSION GUARD (code-review max): when BOTH keys are present
+        (rollout overlap), the authoritative 'team_name' must win over the
+        legacy 'name'. Old priority `inp.get('name', inp.get('team_name'))`
+        picked the stale legacy value → a wrong name-join in merge_config.
+        """
+        msgs = [
+            (0, _tool_use("u1", "TeamCreate", {
+                "name": "stale-legacy-name",
+                "team_name": "real-team",
+                "description": "rollout overlap",
+            }), 100),
+        ]
+        state = _extract(msgs)
+        self.assertEqual(state.team_name, "real-team",
+                         "authoritative 'team_name' must win over legacy 'name'")
+
     def test_teamcreate_team_name_key_with_inline_teammates(self):
         """REGRESSION GUARD — RED at base: team_name="" when key is 'team_name'.
 

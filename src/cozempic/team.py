@@ -623,8 +623,10 @@ def extract_team_state(messages: list[Message]) -> TeamState:
                 elif name == "TeamCreate":
                     # Real TeamCreate tool emits "team_name" key (verified from
                     # production transcripts, 2026-06-08); "name" is the legacy key
-                    # kept as a fallback for backward compat.
-                    state.team_name = inp.get("name", inp.get("team_name", state.team_name))
+                    # kept as a fallback for backward compat. Prefer the real key
+                    # so a transcript carrying BOTH (rollout overlap) uses the
+                    # authoritative "team_name", not the stale legacy "name".
+                    state.team_name = inp.get("team_name") or inp.get("name") or state.team_name
                     for tm in inp.get("teammates", []):
                         agent_id = tm.get("agentId", tm.get("agent_id", ""))
                         tm_name = tm.get("name", agent_id)
@@ -925,11 +927,16 @@ def merge_config_into_state(state: TeamState, configs: list[dict] | None = None)
     matched_config = None
     _name_only_match = False  # True when matched by team name alone (weak join)
 
-    # Phase 1: strong joins — leadSessionId > leadAgentId > member ID intersection
-    known_agent_ids = (
-        {s.agent_id for s in state.subagents}
-        | {t.agent_id for t in state.teammates}
-    )
+    # Phase 1: strong joins — leadSessionId > leadAgentId > member ID intersection.
+    # Empty ids are dropped: a malformed spawn (agent_id="") and a config member
+    # with no "agentId" both yield "", and {""} ∩ {""} would be a false strong
+    # match against an unrelated team's config.
+    known_agent_ids = {
+        aid for aid in (
+            {s.agent_id for s in state.subagents}
+            | {t.agent_id for t in state.teammates}
+        ) if aid
+    }
     for cfg in configs:
         if state.lead_session_id and cfg.get("leadSessionId") == state.lead_session_id:
             matched_config = cfg
@@ -938,7 +945,7 @@ def merge_config_into_state(state: TeamState, configs: list[dict] | None = None)
             matched_config = cfg
             break
         if known_agent_ids:
-            cfg_member_ids = {m.get("agentId", "") for m in cfg.get("members", [])}
+            cfg_member_ids = {m.get("agentId", "") for m in cfg.get("members", []) if m.get("agentId")}
             if known_agent_ids & cfg_member_ids:
                 matched_config = cfg
                 break
