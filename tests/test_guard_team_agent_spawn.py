@@ -407,10 +407,10 @@ class TestIdleNotificationTransition(unittest.TestCase):
         state = _extract(msgs)
         mate = next((t for t in state.teammates
                      if t.name == "finder-p2" or "finder-p2" in t.agent_id), None)
-        if mate is not None:
-            s = (mate.status or "").strip().lower()
-            self.assertNotIn(s, _TEAMMATE_BENIGN,
-                             f"Prose teammate-message must NOT transition to benign, got {s!r}")
+        self.assertIsNotNone(mate, "finder-p2 must be in teammates after Agent spawn")
+        s = (mate.status or "").strip().lower()
+        self.assertNotIn(s, _TEAMMATE_BENIGN,
+                         f"Prose teammate-message must NOT transition to benign, got {s!r}")
 
 
 # ─── TestSessionScopedAntiWedge (P0-E) ───────────────────────────────────────
@@ -795,6 +795,162 @@ class TestFailedAgentSpawnNoWedge(unittest.TestCase):
             "Successful Agent spawn must block safe_to_reload; "
             f"got safe={safe}, reason={reason!r}"
         )
+
+
+# ─── TestGateRemoval (C-1 gate-removal regression guards) ────────────────────
+
+class TestGateRemoval(unittest.TestCase):
+    """C-1 (gate removal): _team_is_current_session was a redundant gate that
+    could MISFIRE: stale same-name config could inject a different leadSessionId,
+    causing the gate to skip the teammate block and return (True,'quiescent') for
+    a live team — SIGKILL.
+
+    The real safety invariant is simpler: a non-benign teammate status ("running")
+    can only come from THIS session's JSONL (Agent spawn / TeamCreate / SendMessage).
+    Config-only members always get status="config" (∈ _TEAMMATE_BENIGN) from
+    merge_config_into_state — they never block. So the teammate block must fire
+    UNCONDITIONALLY on any non-benign status, regardless of lead_session_id.
+
+    Regression guards below are RED at round-2 HEAD (where P0-E gate exists),
+    GREEN after gate removal.
+    """
+
+    def test_running_teammate_blocks_unconditionally_regardless_of_session_id(self):
+        """REGRESSION GUARD — RED at round-2 HEAD: P0-E gate skips block when
+        lead_session_id differs from session_path.stem.
+
+        A TeamState with a "running" teammate and ANY lead_session_id (including
+        one that doesn't match the session path) must block safe_to_reload.
+        After gate removal: the block is unconditional → returns (False, ...).
+        """
+        from cozempic.guard import safe_to_reload
+        from cozempic.team import TeamState, TeammateInfo
+        # Simulate a state where a stale config injected a wrong lead_session_id
+        # but the JSONL gave a "running" teammate (the real current-session signal).
+        state = TeamState(
+            team_name="myteam",
+            lead_session_id="STALE-SESSION-ID",   # does NOT match session_path.stem
+            teammates=[TeammateInfo("alice@myteam", "alice", status="running")],
+        )
+        session_path = Path("/tmp/LIVE-SESSION-2222.jsonl")
+        safe, reason = safe_to_reload(state, [], session_path)
+        self.assertFalse(
+            safe,
+            "A 'running' teammate must block safe_to_reload unconditionally, "
+            "regardless of lead_session_id vs session_path mismatch; "
+            f"got safe={safe}, reason={reason!r}"
+        )
+
+    def test_config_only_member_does_not_block_reload(self):
+        """INVARIANT (GREEN at both bases): config-only member (status='config')
+        must NOT block safe_to_reload.
+
+        merge_config_into_state hardcodes status='config' for members added from
+        config.json (not seen in JSONL). 'config' ∈ _TEAMMATE_BENIGN → never blocks.
+        This test documents the real safety mechanism.
+        """
+        from cozempic.guard import safe_to_reload
+        from cozempic.team import TeamState, TeammateInfo
+        state = TeamState(
+            team_name="myteam",
+            teammates=[TeammateInfo("alice@myteam", "alice", status="config")],
+        )
+        safe, _ = safe_to_reload(state, [], Path("/tmp/anysession.jsonl"))
+        self.assertTrue(safe,
+                        "config-only member (status='config') must not block reload")
+
+    def test_stale_same_name_config_with_live_jsonl_team_must_block(self):
+        """REGRESSION GUARD — RED at round-2 HEAD when C-1 name-only guard is absent
+        (or even with it present, this repro uses a STRONG join to inject stale id):
+        LIVE JSONL team + stale config injected leadSessionId → must still block.
+
+        This is the lead's C-1 repro. The state has:
+        - a "running" teammate from JSONL (finder-p1@myteam)
+        - stale config injected leadSessionId=OLD-SESSION-1111 via a strong join
+          on member-id intersection (bypasses the name-only guard if the stale
+          config lists the same member IDs).
+        After gate removal: block is unconditional on "running" status → safe=False.
+        """
+        from cozempic.guard import safe_to_reload
+        from cozempic.team import TeamState, TeammateInfo
+        # Construct the post-merge state directly: JSONL gave finder-p1 "running",
+        # but stale config successfully injected OLD-SESSION-1111 as lead_session_id.
+        state = TeamState(
+            team_name="myteam",
+            lead_session_id="OLD-SESSION-1111",   # injected by stale config
+            teammates=[TeammateInfo("finder-p1@myteam", "finder-p1", status="running")],
+        )
+        live_path = Path("/tmp/LIVE-SESSION-2222.jsonl")
+        safe, reason = safe_to_reload(state, [], live_path)
+        self.assertFalse(
+            safe,
+            "C-1 repro: JSONL 'running' teammate + stale lead_session_id must still "
+            f"block safe_to_reload; got safe={safe}, reason={reason!r}"
+        )
+
+
+# ─── TestNestedTeammateMessageRegex (M-1 regression guards) ──────────────────
+
+class TestNestedTeammateMessageRegex(unittest.TestCase):
+    """M-1: _TEAMMATE_MSG_RE with DOTALL can eat a nested <teammate-message> block
+    and mis-attribute its idle_notification to the outer teammate.
+
+    The fix: tighten the regex body group to exclude nested opening tags, e.g.
+    using a negative-lookahead: ((?:(?!<teammate-message).)*?)
+    so the match stops before any nested <teammate-message.
+    """
+
+    def test_nested_teammate_message_does_not_mis_attribute_idle(self):
+        """REGRESSION GUARD — RED at round-2 HEAD: DOTALL greedy body matches
+        nested <teammate-message>, mis-attributing the inner idle to the outer.
+
+        Scenario: outer block for 'lead' contains a nested block for 'alice'
+        (an idle_notification). The outer 'lead' must NOT be transitioned to idle.
+        After fix: only 'alice' is transitioned.
+        """
+        from cozempic.team import extract_team_state, TeammateInfo
+        # Build a message with a nested block: outer=lead (NOT idle), inner=alice (idle)
+        nested_content = (
+            '<teammate-message teammate_id="lead" summary="forwarded">'
+            'Forwarded for logging: '
+            '<teammate-message teammate_id="alice@myteam" summary="idle">'
+            '{"type":"idle_notification","from":"alice","idleReason":"available"}'
+            '</teammate-message>'
+            '</teammate-message>'
+        )
+        msgs = [
+            (0, _tool_use("u0", "TeamCreate", {
+                "team_name": "myteam",
+                "teammates": [
+                    {"agentId": "alice@myteam", "name": "alice"},
+                    {"agentId": "lead@myteam", "name": "lead"},
+                ],
+            }), 100),
+            (1, _user_content(nested_content), 200),
+        ]
+        with patch("cozempic.team.load_team_configs", return_value=[]):
+            state = extract_team_state(msgs)
+
+        lead_mate = next((t for t in state.teammates
+                          if t.name == "lead" or t.agent_id == "lead@myteam"), None)
+        alice_mate = next((t for t in state.teammates
+                           if t.name == "alice" or t.agent_id == "alice@myteam"), None)
+
+        from cozempic.guard import _TEAMMATE_BENIGN
+        if lead_mate is not None:
+            s = (lead_mate.status or "").strip().lower()
+            self.assertNotIn(
+                s, _TEAMMATE_BENIGN,
+                "Outer 'lead' must NOT be mis-attributed idle from nested block; "
+                f"got lead.status={s!r}"
+            )
+        if alice_mate is not None:
+            s = (alice_mate.status or "").strip().lower()
+            self.assertIn(
+                s, _TEAMMATE_BENIGN,
+                "Inner 'alice' idle_notification SHOULD transition alice to benign; "
+                f"got alice.status={s!r}"
+            )
 
 
 if __name__ == "__main__":
