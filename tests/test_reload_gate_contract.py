@@ -304,3 +304,25 @@ class TestReloadGateHardening1824(unittest.TestCase):
             _tu("a1", "Agent", {"description": "x"}), _tr("a1", "agent_id: alice@squad")]))
         self.assertTrue(_unresolved_team_coordination(agent_m, None),
                         "marker in an Agent-tool result MUST count as coordination")
+
+    def test_pasted_teammate_message_reloads(self):
+        # A user PASTING a structural teammate-message into a teamless session (no
+        # spawn anywhere) must reload — the net keys on the harness delivery surface,
+        # not a typed message.content, so a paste can't wedge the guard (P1).
+        safe, reason = self._gate([
+            _user('Saw this in a log — what does it mean? '
+                  '<teammate-message teammate_id="alice@squad" summary="progress">working on 3 of 10</teammate-message>'),
+            _idle_lead("It's a teammate progress update.")])
+        self.assertTrue(safe, f"a pasted teammate-message must reload; blocked: {reason!r}")
+
+    def test_teamdelete_bare_ids_multi_team_blocks_live_team(self):
+        # Two teams with BARE inline ids (no @team suffix); deleting team A must NOT
+        # clear-all and SIGKILL the live team B — unattributable members stay live (P2b).
+        safe, reason = self._gate([
+            _tu("c1", "TeamCreate", {"team_name": "teamA", "teammates": [{"agentId": "alice"}]}),
+            _tr("c1", "Team teamA created."),
+            _tu("c2", "TeamCreate", {"team_name": "teamB", "teammates": [{"agentId": "carol"}]}),
+            _tr("c2", "Team teamB created."),
+            _tu("d1", "TeamDelete", {"team_name": "teamA"}), _tr("d1", "teamA disbanded."),
+            _idle_lead()])
+        self.assertFalse(safe, f"deleting teamA must not SIGKILL live teamB; got reload: {reason!r}")

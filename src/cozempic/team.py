@@ -667,18 +667,21 @@ def extract_team_state(messages: list[Message]) -> TeamState:
                 # TeamDelete — the lead disbanded a team; its members are done.
                 # Without this a torn-down team's teammates stay "running" forever →
                 # safe_to_reload wedges (never reloads). (1.8.24, fleet F1.)
-                # SCOPE to the named team when teammate agentIds carry an `@team`
-                # suffix, so disbanding team A never marks a LIVE team B's members
-                # terminal → SIGKILL (fleet P2, 2026-06-09). Fall back to clearing
-                # all only when no member matches the suffix (single-team / unsuffixed
-                # rosters), preserving the anti-wedge.
+                # Clear ONLY members we can POSITIVELY attribute to the deleted team
+                # (their agentId carries its `@team` suffix). A member we can't
+                # attribute is LEFT running: a wedge (inert guard) is recoverable,
+                # but clearing a LIVE other team's members is an unrecoverable
+                # SIGKILL — so on ambiguity we fail toward block, NEVER clear-all
+                # (fleet P2/P2b, 2026-06-09). The real F1 case (Agent-spawned teams)
+                # uses suffixed ids (alice@myteam), so a genuine disband still lifts
+                # the wedge; only bare-id inline rosters fall back to the safe wedge.
                 elif name == "TeamDelete":
                     _del_team = (inp.get("team_name") or inp.get("name") or "").strip()
                     _suffix = "@" + _del_team
-                    _scoped = [tm for tm in seen_teammates.values()
-                               if _del_team and (tm.agent_id or "").endswith(_suffix)]
-                    for _tm in (_scoped or list(seen_teammates.values())):
-                        _tm.status = "completed"
+                    if _del_team:
+                        for _tm in seen_teammates.values():
+                            if (_tm.agent_id or "").endswith(_suffix):
+                                _tm.status = "completed"
 
                 # TaskCreate (shared todo list)
                 elif name == "TaskCreate":

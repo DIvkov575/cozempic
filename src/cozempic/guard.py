@@ -2472,8 +2472,15 @@ def _unresolved_team_coordination(messages, team_state) -> bool:
     results: list = []         # (tool_use_id|None, text) per tool_result
     for item in messages or []:
         msg = _msg_dict(item)
-        # Structural teammate-message carrier on a genuine delivery surface only.
-        if _TEAMMATE_MSG_MARKER_RE.search(_completion_text(msg)):
+        # Structural teammate-message carrier — checked ONLY on the harness's
+        # synthetic delivery surface (root / queue-operation `content`), NOT a
+        # user's typed `message.content`. A user PASTING a teammate-message line
+        # into a teamless session must not wedge the guard (fleet P1, 2026-06-09);
+        # and in cozempic's real pre-prune gating a genuine team's spawn tool_use
+        # is still present → non-empty roster → this net is skipped anyway, so
+        # narrowing the surface loses no real-team coverage.
+        _root = msg.get("content")
+        if isinstance(_root, str) and _TEAMMATE_MSG_MARKER_RE.search(_root):
             return True
         c = (msg.get("message") or {}).get("content")
         if isinstance(c, list):
