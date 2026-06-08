@@ -376,8 +376,15 @@ _AGENT_SPAWN_TEAM_RE = re.compile(
 
 # <teammate-message teammate_id="X">…</teammate-message> blocks in user messages.
 # Used in the second pass to parse idle_notification transitions (P0-D).
+#
+# Body group uses a negative-lookahead to stop before any nested <teammate-message
+# opening tag (M-1 fix, 2026-06-08). DOTALL alone was greedy enough to eat a nested
+# block, mis-attributing the inner idle_notification to the OUTER teammate_id.
+# The lookahead `(?!<teammate-message)` makes the body stop at the first inner tag.
 _TEAMMATE_MSG_RE = re.compile(
-    r'<teammate-message\s[^>]*teammate_id="([^"]+)"[^>]*>(.*?)</teammate-message>',
+    r'<teammate-message\s[^>]*teammate_id="([^"]+)"[^>]*>'
+    r'((?:(?!<teammate-message).)*?)'
+    r'</teammate-message>',
     re.DOTALL | re.IGNORECASE,
 )
 _IDLE_NOTIFICATION_RE = re.compile(

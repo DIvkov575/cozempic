@@ -2425,25 +2425,6 @@ def detect_in_flight(messages) -> dict:
     }
 
 
-def _team_is_current_session(team_state, session_path) -> bool:
-    """True if the TeamState belongs to the session currently being guarded.
-
-    A stale config.json from a prior session can present a non-quiescent
-    team_state (teammates still "running") long after those agents exited.
-    Comparing the state's lead_session_id to the guarded session's stem prevents
-    that stale state from wedging a reload of a completely different session.
-    Conservative: unknown session (None lead_session_id or None session_path)
-    is treated as current-session — we block the reload rather than skip the
-    check.
-    """
-    if not (team_state and team_state.lead_session_id):
-        return True  # unknown → conservative: treat as current
-    if session_path is None:
-        return True  # no path to compare → conservative
-    guarded = Path(session_path).stem
-    return team_state.lead_session_id == guarded
-
-
 def safe_to_reload(team_state, messages, session_path) -> tuple[bool, str]:
     """Validate-BEFORE-terminate safe-point gate (1.8.22 component B).
 
@@ -2482,22 +2463,25 @@ def safe_to_reload(team_state, messages, session_path) -> tuple[bool, str]:
             if any((s.status or "").strip().lower() not in _STATUS_TERMINAL
                    for s in (team_state.subagents or [])):
                 return (False, "subagent mid-execution")
-            # Teammate block — DENYLIST too, but with a small benign-marker exempt
-            # set so an idle/config membership row can't wedge the gate. A teammate
-            # actively working (and with no subagent entry yet, in the
-            # SendMessage→completion window) reads "running" → caught HERE, closing
-            # the destroy-active-teammate gap. extract_team_state propagates
-            # completions to teammates (chronology-aware), so a finished team reads
-            # terminal; if a completion never arrives the teammate stays non-benign
-            # and we keep deferring — safe (PreCompact/PostCompact re-injects the
-            # checkpoint at the wall).
-            # Session anti-wedge (P0-E): stale config.json from a prior session
-            # must not hold the current session's reload hostage. Only enforce the
-            # teammate check when this TeamState actually belongs to our session.
-            if (_team_is_current_session(team_state, session_path)
-                    and any((t.status or "").strip().lower()
-                            not in (_STATUS_TERMINAL | _TEAMMATE_BENIGN)
-                            for t in (team_state.teammates or []))):
+            # Teammate block — DENYLIST with a benign-marker exempt set so an
+            # idle/config membership row never wedges the gate.
+            #
+            # Safety invariant (replaces the removed P0-E _team_is_current_session
+            # gate, 2026-06-08):
+            #   A non-benign teammate status ("running") can ONLY originate from
+            #   THIS session's JSONL (Agent spawn / TeamCreate-inline / SendMessage).
+            #   merge_config_into_state hardcodes status="config" (∈ _TEAMMATE_BENIGN)
+            #   for members added from config.json — config-only members are always
+            #   benign and never block. Therefore the block can fire unconditionally
+            #   on any non-benign status without risk of a stale-config false-block.
+            #
+            #   The P0-E session-ID gate was removed because it was redundant (the
+            #   status mechanism is sufficient) AND could MISFIRE: a stale same-name
+            #   config.json could inject a different leadSessionId, causing the gate
+            #   to skip the block for a LIVE "running" teammate → false-safe SIGKILL.
+            if any((t.status or "").strip().lower()
+                   not in (_STATUS_TERMINAL | _TEAMMATE_BENIGN)
+                   for t in (team_state.teammates or [])):
                 return (False, "teammate mid-execution")
             active_tasks, _, _ = team_state._task_groups()
             if active_tasks:

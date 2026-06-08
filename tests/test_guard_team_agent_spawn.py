@@ -5,12 +5,17 @@ any fix is applied; characterization / invariant-preservation tests that pass at
 base are clearly labelled as such in their docstrings.
 
 Test classes:
-  TestTeamNameExtraction         — P0-A: team_name key mismatch
-  TestAgentSpawnRecognition      — P0-B: Agent tool recognition in extract_team_state
-  TestSendMessageByNameLookup    — P0-C: by-name SendMessage resolution
-  TestIdleNotificationTransition — P0-D: idle_notification terminal transition
-  TestSessionScopedAntiWedge     — P0-E: session-scoped anti-wedge in safe_to_reload
-  TestFullScenario               — integration: pure-SendMessage team, no shared tasks
+  TestTeamNameExtraction           — P0-A: team_name key mismatch
+  TestAgentSpawnRecognition        — P0-B: Agent tool recognition in extract_team_state
+  TestSendMessageByNameLookup      — P0-C: by-name SendMessage resolution
+  TestIdleNotificationTransition   — P0-D: idle_notification terminal transition
+  TestStatusBasedSafetyInvariant   — documents status-only invariant (P0-E gate removed)
+  TestFullScenario                 — integration: pure-SendMessage team, no shared tasks
+  TestStaleConfigAntiWedge         — C-1: stale config can't inject "running" status
+  TestIdleNotificationPruneProtection — C-2: idle carrier prune protection
+  TestFailedAgentSpawnNoWedge      — H-1: failed spawn placeholder cleanup
+  TestGateRemoval                  — C-1 gate-removal regression guards
+  TestNestedTeammateMessageRegex   — M-1: nested teammate-message regex tightening
 
 Isolation:
   All tests go through _extract() which patches load_team_configs to return []
@@ -413,84 +418,84 @@ class TestIdleNotificationTransition(unittest.TestCase):
                          f"Prose teammate-message must NOT transition to benign, got {s!r}")
 
 
-# ─── TestSessionScopedAntiWedge (P0-E) ───────────────────────────────────────
+# ─── TestStatusBasedSafetyInvariant (documents gate-removal safety) ───────────
 
-class TestSessionScopedAntiWedge(unittest.TestCase):
-    """P0-E: stale/cross-session config must NOT block safe_to_reload.
+class TestStatusBasedSafetyInvariant(unittest.TestCase):
+    """Documents the safety invariant that makes removing _team_is_current_session safe.
 
-    A stale team's config.json persisting on disk with non-benign teammates
-    must be silently bypassed when the team belongs to a different session.
+    The invariant: a non-benign ("running") teammate status can ONLY originate from
+    THIS session's JSONL (Agent spawn / TeamCreate / SendMessage in this transcript).
+    merge_config_into_state always assigns status="config" (∈ _TEAMMATE_BENIGN) to
+    config-only members. So "running" = current-session, always. No session-ID
+    comparison is needed.
+
+    The removed P0-E gate was both redundant AND a source of false-safes (C-1): a
+    stale same-name config could inject a different leadSessionId, causing the gate to
+    skip the block for a LIVE "running" teammate → (True,'quiescent') → SIGKILL.
     """
 
-    def test_stale_cross_session_team_does_not_wedge_reload(self):
-        """REGRESSION GUARD — RED at base: no session-scope check; 'running' teammate wedges.
+    def test_running_teammate_always_blocks_regardless_of_session_id(self):
+        """INVARIANT: any non-benign status blocks, regardless of lead_session_id.
 
-        A TeamState with lead_session_id that does NOT match the session_path.stem
-        must NOT block safe_to_reload. Only the current session's team matters.
+        No session-ID comparison needed — "running" can only come from this session.
+        """
+        from cozempic.guard import safe_to_reload
+        from cozempic.team import TeamState, TeammateInfo
+        # Even with a completely arbitrary lead_session_id, "running" must block.
+        for session_id in ("", "old-session", "aabbccdd", None):
+            state = TeamState(
+                team_name="myteam",
+                lead_session_id=session_id or "",
+                teammates=[TeammateInfo("alice@myteam", "alice", status="running")],
+            )
+            safe, reason = safe_to_reload(state, [], Path("/tmp/anysession.jsonl"))
+            self.assertFalse(
+                safe,
+                f"'running' teammate must block regardless of lead_session_id={session_id!r}; "
+                f"got safe={safe}, reason={reason!r}"
+            )
+
+    def test_config_only_teammate_never_blocks(self):
+        """INVARIANT: config-only member (status='config', from merge_config_into_state)
+        must never block safe_to_reload.
+
+        merge_config_into_state assigns status='config' to members not seen in JSONL.
+        'config' ∈ _TEAMMATE_BENIGN. This is the mechanism that prevents stale
+        configs from wedging reloads — not a session-ID comparison.
         """
         from cozempic.guard import safe_to_reload
         from cozempic.team import TeamState, TeammateInfo
         state = TeamState(
             team_name="old-team",
-            lead_session_id="deadbeef-0000-0000-0000-000000000000",
-            teammates=[TeammateInfo("alice@old-team", "alice", status="running")],
+            teammates=[TeammateInfo("alice@old-team", "alice", status="config")],
         )
-        # Current session has a DIFFERENT id in the path stem
-        session_path = Path("/tmp/aabbccdd1234abcd.jsonl")
-        safe, reason = safe_to_reload(state, [], session_path)
+        safe, _ = safe_to_reload(state, [], Path("/tmp/anysession.jsonl"))
         self.assertTrue(safe,
-                        "Stale/cross-session running teammate must NOT wedge reload; "
-                        f"got safe={safe}, reason={reason!r}")
+                        "config-only member (status='config') must never block reload")
 
-    def test_same_session_running_teammate_blocks_reload(self):
-        """INVARIANT (GREEN at base — blocks; correct reason after fix):
-        when lead_session_id matches the guarded session, a running teammate blocks.
-
-        This is an invariant-preservation test, not a regression guard.
-        """
+    def test_idle_teammate_never_blocks(self):
+        """INVARIANT: idle teammate (status='idle', from idle_notification) is benign."""
         from cozempic.guard import safe_to_reload
         from cozempic.team import TeamState, TeammateInfo
         state = TeamState(
-            team_name="live-team",
-            lead_session_id="aabbccdd1234abcd",
-            teammates=[TeammateInfo("alice@live-team", "alice", status="running")],
+            team_name="myteam",
+            teammates=[TeammateInfo("alice@myteam", "alice", status="idle")],
         )
-        session_path = Path("/tmp/aabbccdd1234abcd.jsonl")
-        safe, reason = safe_to_reload(state, [], session_path)
-        self.assertFalse(safe,
-                         "Same-session running teammate must block reload")
-        self.assertIn("teammate", reason)
+        safe, _ = safe_to_reload(state, [], Path("/tmp/anysession.jsonl"))
+        self.assertTrue(safe, "idle teammate must not block reload")
 
-    def test_no_session_id_in_state_is_conservative(self):
-        """INVARIANT (GREEN at base): empty lead_session_id → conservative → blocks.
-
-        Unknown session → assume it IS the current session → block if running.
-        Safe-fail mode.
-        """
-        from cozempic.guard import safe_to_reload
+    def test_terminal_teammate_never_blocks(self):
+        """INVARIANT: terminal status (completed/failed/done) never blocks."""
+        from cozempic.guard import safe_to_reload, _STATUS_TERMINAL
         from cozempic.team import TeamState, TeammateInfo
-        state = TeamState(
-            team_name="unknown-team",
-            lead_session_id="",
-            teammates=[TeammateInfo("alice@unknown-team", "alice", status="running")],
-        )
-        session_path = Path("/tmp/aabbccdd1234abcd.jsonl")
-        safe, _ = safe_to_reload(state, [], session_path)
-        self.assertFalse(safe,
-                         "Unknown lead_session_id must be conservative → blocks reload")
-
-    def test_none_session_path_is_conservative(self):
-        """INVARIANT: session_path=None → cannot compare → conservative → blocks."""
-        from cozempic.guard import safe_to_reload
-        from cozempic.team import TeamState, TeammateInfo
-        state = TeamState(
-            team_name="t",
-            lead_session_id="some-session-id",
-            teammates=[TeammateInfo("a1", "alice", status="running")],
-        )
-        safe, _ = safe_to_reload(state, [], None)
-        self.assertFalse(safe,
-                         "session_path=None must be conservative → blocks reload")
+        for status in sorted(_STATUS_TERMINAL)[:3]:
+            state = TeamState(
+                team_name="myteam",
+                teammates=[TeammateInfo("alice@myteam", "alice", status=status)],
+            )
+            safe, _ = safe_to_reload(state, [], Path("/tmp/anysession.jsonl"))
+            self.assertTrue(safe,
+                            f"terminal status={status!r} must not block reload")
 
 
 # ─── TestFullScenario (integration) ──────────────────────────────────────────
@@ -612,12 +617,16 @@ class TestFullScenario(unittest.TestCase):
 # ─── TestStaleConfigAntiWedge (C-1 regression guards) ───────────────────────
 
 class TestStaleConfigAntiWedge(unittest.TestCase):
-    """C-1 (CRITICAL): Stale same-name config.json overwrites lead_session_id →
-    _team_is_current_session returns False for the LIVE session →
-    safe_to_reload returns (True, 'quiescent') → SIGKILL of working team.
+    """C-1 (CRITICAL): The now-removed P0-E _team_is_current_session gate could be
+    fooled by a stale same-name config.json injecting an old leadSessionId, causing
+    it to return (True,'quiescent') for a live team → SIGKILL.
 
-    These tests are REGRESSION GUARDs — RED at base (confirmed: stale config
-    overwrites lead_session_id via merge_config_into_state name-join).
+    The fix (gate removal + C-1 name-join guard in merge_config_into_state) means:
+    - extract_team_state still returns teammates with "running" status (from JSONL)
+    - safe_to_reload blocks unconditionally on any non-benign status
+    - stale config can inject at most "config" status members (benign) — never "running"
+
+    These tests are REGRESSION GUARDs proving the fix end-to-end.
     """
 
     _SPAWN_RESULT = (
