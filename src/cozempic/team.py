@@ -525,7 +525,10 @@ def extract_team_state(messages: list[Message]) -> TeamState:
 
                 # TeamCreate (explicit team)
                 elif name == "TeamCreate":
-                    state.team_name = inp.get("name", state.team_name)
+                    # Real TeamCreate tool emits "team_name" key (verified from
+                    # production transcripts, 2026-06-08); "name" is the legacy key
+                    # kept as a fallback for backward compat.
+                    state.team_name = inp.get("name", inp.get("team_name", state.team_name))
                     for tm in inp.get("teammates", []):
                         agent_id = tm.get("agentId", tm.get("agent_id", ""))
                         tm_name = tm.get("name", agent_id)
