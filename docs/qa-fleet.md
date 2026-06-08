@@ -76,7 +76,23 @@ validation + a floor (don't over-prune below a safe ratio). Refuse to prune an a
 in-flight session. Metadata-singleton protection. Team state survives compaction
 (checkpoint + PostCompact re-inject). *Motivating PRs: #114, #102, #22, #110.*
 
-### L8 — Reload safety (the 1.8.x guard line)  ·  standing tests: `tests/test_guard_safe_point.py`, `tests/test_interactive_*`, `tests/test_guard_team_agent_spawn.py`
+### L0 — Harness-contract / marker drift  ·  standing test: `tests/test_reload_gate_contract.py`
+**The class that has bitten us most (1.8.22 Agent-marker blindness, PR #116, PR #117).**
+cozempic's safety gate recognizes harness activity by *hardcoded, assumed* tool names,
+input keys, and result-string markers (`name` vs `team_name`; `agent_id:` vs
+`agentId:`; "Async agent launched" vs "Spawned successfully"). When the assumed shape
+is wrong or drifts, the matcher silently misses → empty roster → the gate reloads
+through live work. Our *synthetic* unit fixtures CANNOT catch this — they encode the
+same assumption. Defenses: (1) **ground-truth every literal marker against REAL
+transcripts** (grep `~/.claude/projects`, excluding our own meta-discussion) — list
+the exact tool-use names, input keys, and result strings, and test casing/key
+variants (camelCase↔snake, `to`/`agentId`/`recipient`); (2) commit **redacted REAL
+fixtures** (`tests/fixtures/harness/`) and assert the detectors match them — a matcher
+with zero real-fixture coverage is unverified; (3) **deny-by-default**: if the
+transcript shows any coordination signal the parser can't resolve, the gate must
+BLOCK, never SIGKILL. A matcher should fail toward "block", not "reload".
+
+### L8 — Reload safety (the 1.8.x guard line)  ·  standing tests: `tests/test_guard_safe_point.py`, `tests/test_interactive_*`, `tests/test_guard_team_agent_spawn.py`, `tests/test_reload_gate_contract.py`
 A reload SIGKILLs + resumes, so: NEVER reload through in-flight work (running Workflow
 / background `Agent` subagent / agent team / open tool call) — defer instead.
 Interactive: warn-before-reload, reload only at a sustained idle breakpoint, force only
