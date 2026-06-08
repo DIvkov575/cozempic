@@ -323,7 +323,12 @@ def build_team_recovery_receipt(state: TeamState) -> dict:
 
 # ─── Patterns for team message detection ─────────────────────────────────────
 
-# Tool names that indicate team/agent coordination
+# Tool names that indicate team/agent coordination.
+# NOTE: "Agent" is intentionally NOT included here. Adding it would cause
+# prune_with_team_protect (and _is_team_message) to protect ALL Agent tool_uses,
+# including plain non-team subagent calls — over-protecting non-team sessions.
+# extract_team_state uses _TEAM_EXTRACT_TOOL_NAMES (a superset) for its own
+# pre-pass; prune_with_team_protect uses this set via _is_team_message.
 TEAM_TOOL_NAMES = {
     # Explicit team coordination
     "TeamCreate", "TeamDelete", "TeamMessage", "SendMessage",
@@ -333,6 +338,11 @@ TEAM_TOOL_NAMES = {
     # Subagent spawning and results (Claude Code's Task tool)
     "Task", "TaskOutput", "TaskStop",
 }
+
+# Extended set for extract_team_state's pre-pass only — includes "Agent" so that
+# Agent tool_use + tool_result pairs are scanned for teammate creation. Must NOT
+# be used in _is_team_message (prune_with_team_protect path).
+_TEAM_EXTRACT_TOOL_NAMES = TEAM_TOOL_NAMES | {"Agent"}
 
 
 # Patterns for parsing task-notification XML in user messages
@@ -348,6 +358,30 @@ _TASK_NOTIFICATION_RE = re.compile(
 # Pattern for agent progress notifications in system-reminder tags
 _AGENT_PROGRESS_RE = re.compile(
     r"Agent\s+([a-f0-9]+)\s+progress:.*?(\d+)\s+new\s+tool",
+    re.IGNORECASE,
+)
+
+# Agent-spawn result format: "Spawned successfully.\nagent_id: NAME@TEAM\n..."
+# Verified from production transcripts 2026-06-08 (transcript 371f5917, line 196).
+# If the harness changes this format the regex will gracefully miss (fallback:
+# placeholder key retained; only terminal transitions are affected).
+_AGENT_SPAWN_ID_RE = re.compile(
+    r"agent_id:\s*([A-Za-z0-9@._-]+)",
+    re.IGNORECASE,
+)
+_AGENT_SPAWN_TEAM_RE = re.compile(
+    r"^team_name:\s*([A-Za-z0-9_-]+)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# <teammate-message teammate_id="X">…</teammate-message> blocks in user messages.
+# Used in the second pass to parse idle_notification transitions (P0-D).
+_TEAMMATE_MSG_RE = re.compile(
+    r'<teammate-message\s[^>]*teammate_id="([^"]+)"[^>]*>(.*?)</teammate-message>',
+    re.DOTALL | re.IGNORECASE,
+)
+_IDLE_NOTIFICATION_RE = re.compile(
+    r'"type"\s*:\s*"idle_notification"',
     re.IGNORECASE,
 )
 
@@ -447,20 +481,52 @@ def extract_team_state(messages: list[Message]) -> TeamState:
     tool_use_id_to_name: dict[str, str] = {}
     # Track tool_use_id -> subagent key for Task tool results
     tool_use_id_to_subagent: dict[str, str] = {}
+    # Track bare teammate name -> agentId for SendMessage bare-name resolution (P0-C)
+    # and idle_notification resolution (P0-D). Populated when a TeammateInfo is
+    # inserted into seen_teammates with a known bare name.
+    _name_to_agent_id: dict[str, str] = {}
 
     # Pre-pass: collect all team tool_use IDs so _is_team_message can match
-    # their corresponding tool_result messages (task completions, etc.)
+    # their corresponding tool_result messages (task completions, etc.).
+    # Uses _TEAM_EXTRACT_TOOL_NAMES (includes "Agent") so Agent spawn results
+    # are also scanned; _is_team_message itself still uses TEAM_TOOL_NAMES only.
     pending_task_ids: set[str] = set()
     for _, msg, _ in messages:
         inner = msg.get("message", {})
         for block in (inner.get("content", []) if isinstance(inner.get("content"), list) else []):
-            if block.get("type") == "tool_use" and block.get("name") in TEAM_TOOL_NAMES:
+            if block.get("type") == "tool_use" and block.get("name") in _TEAM_EXTRACT_TOOL_NAMES:
                 uid = block.get("id", "")
                 if uid:
                     pending_task_ids.add(uid)
 
+    def _is_extract_message(m: dict) -> bool:
+        """Like _is_team_message but uses _TEAM_EXTRACT_TOOL_NAMES (includes 'Agent').
+
+        Used only inside extract_team_state so that Agent tool_use blocks are
+        processed for teammate creation. prune_with_team_protect's call to
+        _is_team_message is unaffected (uses TEAM_TOOL_NAMES only).
+        """
+        if m.get("type") == "queue-operation":
+            rc = m.get("content", "")
+            return isinstance(rc, str) and "<task-notification>" in rc
+        inner_m = m.get("message", {})
+        c = inner_m.get("content", [])
+        if isinstance(c, list):
+            for blk in c:
+                if not isinstance(blk, dict):
+                    continue
+                bt = blk.get("type", "")
+                if bt == "tool_use" and blk.get("name") in _TEAM_EXTRACT_TOOL_NAMES:
+                    return True
+                if bt == "tool_result" and pending_task_ids:
+                    if blk.get("tool_use_id", "") in pending_task_ids:
+                        return True
+        elif isinstance(c, str):
+            return "<task-notification>" in c
+        return False
+
     for line_idx, msg, byte_size in messages:
-        if not _is_team_message(msg, pending_task_ids):
+        if not _is_extract_message(msg):
             continue
 
         state.message_count += 1
@@ -540,6 +606,29 @@ def extract_team_state(messages: list[Message]) -> TeamState:
                                 role=role,
                                 status="running",
                             )
+                            # Populate name → agentId index for bare-name lookups
+                            if tm_name and tm_name != agent_id:
+                                _name_to_agent_id[tm_name] = agent_id
+
+                # Agent tool = teammate spawn via the Agent tool (not Task tool).
+                # The real agentId and team_name are in the tool_result text;
+                # create a placeholder entry now so the spawn is immediately
+                # visible; the result handler below upgrades to the real agentId.
+                elif name == "Agent":
+                    agent_name = inp.get("name", "")
+                    agent_role = inp.get("role", inp.get("description", ""))
+                    # Placeholder key: use tool_use_id if available, else name.
+                    # The result handler re-keys by the real agentId.
+                    placeholder = tool_use_id or agent_name or f"agent-{len(seen_teammates)}"
+                    if placeholder not in seen_teammates:
+                        seen_teammates[placeholder] = TeammateInfo(
+                            agent_id=placeholder,
+                            name=agent_name,
+                            role=agent_role,
+                            status="running",  # non-benign, non-terminal → blocks reload
+                        )
+                    if tool_use_id:
+                        tool_use_id_to_subagent[tool_use_id] = placeholder
 
                 # TaskCreate (shared todo list)
                 elif name == "TaskCreate":
@@ -573,9 +662,14 @@ def extract_team_state(messages: list[Message]) -> TeamState:
 
                 elif name in ("SendMessage", "TeamMessage"):
                     target = inp.get("to", inp.get("agentId", ""))
-                    if target and target in seen_teammates:
-                        seen_teammates[target].status = "running"
-                        last_send_line[target] = line_idx
+                    # Resolve bare name to agentId (P0-C): SendMessage carries a
+                    # bare name ("alice") but seen_teammates is keyed by full
+                    # agentId ("alice@myteam"). The _name_to_agent_id index bridges
+                    # the gap; fall back to the literal target if not in index.
+                    resolved = _name_to_agent_id.get(target, target)
+                    if resolved in seen_teammates:
+                        seen_teammates[resolved].status = "running"
+                        last_send_line[resolved] = line_idx
 
             # ── Tool result blocks ───────────────────────────────────
             elif block_type == "tool_result":
@@ -607,11 +701,53 @@ def extract_team_state(messages: list[Message]) -> TeamState:
                         agent.agent_id = real_id
                         seen_subagents[real_id] = agent
 
-    # ── Second pass: scan for task-notification messages ────────────
-    # These appear in two places:
-    #   1. User messages: msg['message']['content'] as string with XML
-    #   2. Queue-operation messages: msg['content'] at root level with XML
-    # Both carry the real result text (not just "Async agent launched").
+                # Agent tool result: parse real agentId + team_name from spawn text.
+                # Format: "Spawned successfully.\nagent_id: NAME@TEAM\n..."
+                # (verified from production transcripts 2026-06-08).
+                if tool_name == "Agent":
+                    result_text = ""
+                    rc = block.get("content", "")
+                    if isinstance(rc, str):
+                        result_text = rc
+                    elif isinstance(rc, list):
+                        for sub in rc:
+                            if isinstance(sub, dict) and sub.get("type") == "text":
+                                result_text += sub.get("text", "")
+
+                    agent_id_m = _AGENT_SPAWN_ID_RE.search(result_text)
+                    if agent_id_m:
+                        real_agent_id = agent_id_m.group(1).strip()
+                        # Re-key placeholder entry by real agentId
+                        placeholder = tool_use_id_to_subagent.get(tool_use_id, "")
+                        if placeholder and placeholder in seen_teammates:
+                            tm = seen_teammates.pop(placeholder)
+                            tm.agent_id = real_agent_id
+                            seen_teammates[real_agent_id] = tm
+                            # Populate name → agentId index for bare-name resolution
+                            if tm.name and tm.name != real_agent_id:
+                                _name_to_agent_id[tm.name] = real_agent_id
+                        elif real_agent_id not in seen_teammates:
+                            # No placeholder — insert directly (robustness)
+                            bare = real_agent_id.split("@")[0] if "@" in real_agent_id else real_agent_id
+                            seen_teammates[real_agent_id] = TeammateInfo(
+                                agent_id=real_agent_id,
+                                name=bare,
+                                status="running",
+                            )
+                            if bare and bare != real_agent_id:
+                                _name_to_agent_id[bare] = real_agent_id
+                    # Parse team_name from result if not yet set
+                    team_m = _AGENT_SPAWN_TEAM_RE.search(result_text)
+                    if team_m and not state.team_name:
+                        state.team_name = team_m.group(1).strip()
+
+    # ── Second pass: scan for task-notifications and idle-notifications ──
+    # Both XML patterns live in string content (user messages or queue-operations).
+    # Combining them in one pass avoids a third full-transcript scan.
+    #
+    # Sources:
+    #   task-notification — <task-notification>…</task-notification> (subagent done)
+    #   idle_notification — <teammate-message teammate_id="X">{"type":"idle_notification"…}
     for line_idx, msg, byte_size in messages:
         # Extract content string from either schema
         if msg.get("type") == "queue-operation":
@@ -620,10 +756,10 @@ def extract_team_state(messages: list[Message]) -> TeamState:
             inner = msg.get("message", {})
             content = inner.get("content", "")
 
-        # task-notifications are string content
-        if not isinstance(content, str) or "<task-notification>" not in content:
+        if not isinstance(content, str):
             continue
 
+        # ── task-notifications ────────────────────────────────────────────
         for match in _TASK_NOTIFICATION_RE.finditer(content):
             task_id = match.group(1).strip()
             status = match.group(2).strip()
@@ -645,19 +781,34 @@ def extract_team_state(messages: list[Message]) -> TeamState:
                     result_summary=result[:300],
                 )
 
-            # Propagate the terminal status to the TEAMMATE of the same agent_id.
-            # Without this, TeamCreate/SendMessage left teammate.status stuck at
-            # "running" forever (nothing transitioned it), so the safe-point reload
-            # gate could never recognize a finished team as quiesced — every
-            # agent-team session (the guard's primary use case) would never reload.
-            if task_id in seen_teammates and line_idx >= last_send_line.get(task_id, -1):
-                # Only mark terminal if this completion is the teammate's LATEST
-                # event. A SendMessage after this notification means the teammate
-                # was re-activated (working phase 2) → keep it 'running' so the
-                # safe-point gate still blocks a reload (don't destroy live work).
-                seen_teammates[task_id].status = status
+            # Propagate terminal status to the matching TEAMMATE.
+            # Resolve bare task_id → real agentId when the notification carries
+            # only the bare name (e.g. "alice" instead of "alice@myteam").
+            resolved_tid = _name_to_agent_id.get(task_id, task_id)
+            for candidate in (task_id, resolved_tid):
+                if candidate in seen_teammates and line_idx >= last_send_line.get(candidate, -1):
+                    # Only mark terminal when this is the teammate's LATEST event.
+                    # A SendMessage after this notification means re-activation
+                    # (phase 2) → keep "running" so the gate keeps blocking.
+                    seen_teammates[candidate].status = status
+                    break
 
             state.message_count += 1
+
+        # ── idle-notifications (P0-D) ────────────────────────────────────
+        # <teammate-message teammate_id="X">{"type":"idle_notification",...}</teammate-message>
+        # Transition status to "idle" UNLESS a later SendMessage re-activated it.
+        for tm_match in _TEAMMATE_MSG_RE.finditer(content):
+            tm_id = tm_match.group(1).strip()
+            tm_body = tm_match.group(2)
+            if not _IDLE_NOTIFICATION_RE.search(tm_body):
+                continue
+            resolved = _name_to_agent_id.get(tm_id, tm_id)
+            if resolved in seen_teammates:
+                # Chronology guard: SendMessage after this line re-activates
+                # the teammate — don't clobber "running" back to "idle".
+                if line_idx >= last_send_line.get(resolved, -1):
+                    seen_teammates[resolved].status = "idle"
 
     state.teammates = list(seen_teammates.values())
     state.subagents = list(seen_subagents.values())

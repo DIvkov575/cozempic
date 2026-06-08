@@ -507,7 +507,12 @@ class TestFullScenario(unittest.TestCase):
     """
 
     def _pure_sendmessage_msgs(self, n_spawns=3):
-        """Build a message list with n Agent spawns + SendMessages, no TaskCreate."""
+        """Build a message list with n Agent spawns + SendMessages, no TaskCreate.
+
+        Every tool_use must have a matching tool_result so that
+        detect_in_flight.open_call stays False; otherwise open-call detection
+        returns False for the wrong reason, masking the teammate gate under test.
+        """
         msgs = []
         idx = 0
         # TeamCreate with 'team_name' key (P0-A trigger)
@@ -515,6 +520,9 @@ class TestFullScenario(unittest.TestCase):
             "team_name": "myteam",
             "description": "test team",
         }), 100))
+        idx += 1
+        # TeamCreate result (required to close the open_call for u0)
+        msgs.append((idx, _tool_result("u0", "Team created successfully."), 50))
         idx += 1
         # n Agent spawns (P0-B trigger)
         for i in range(1, n_spawns + 1):
@@ -532,12 +540,19 @@ class TestFullScenario(unittest.TestCase):
             idx += 1
             msgs.append((idx, _tool_result(f"us{i}", spawn_result), 300))
             idx += 1
-        # SendMessages to each (P0-C trigger: bare names)
+        # SendMessages to each (P0-C trigger: bare names).
+        # Each SendMessage must have a matching tool_result so that
+        # detect_in_flight.open_call stays False.  Without the result the
+        # un-paired tool_use id lands in use_ids - res_ids → open_call=True →
+        # safe_to_reload returns False for the WRONG reason (open tool call
+        # instead of active teammate), masking the teammate-based gate under test.
         for i in range(1, n_spawns + 1):
             msgs.append((idx, _tool_use(f"um{i}", "SendMessage", {
                 "to": f"finder-p{i}",
                 "message": "start your task",
             }), 100))
+            idx += 1
+            msgs.append((idx, _tool_result(f"um{i}", "Message delivered."), 50))
             idx += 1
         return msgs
 
