@@ -1086,7 +1086,7 @@ def _build_nudge_message(tier_key: int, pct: float, proj: float | None,
     reload then."""
     pct_disp = int(round(pct * 100))
     if tier_key <= 25:
-        return (f"✦ Cozempic: context {pct_disp}%. Optional — `cozempic reload` does a "
+        return (f"✦ Cozempic: context {pct_disp}%. Optional — `/cozempic reload` does a "
                 f"lossless prune+resume at any breakpoint (higher fidelity than autocompact).")
     reclaim = f"reclaims ~{int(round(proj))}% by pruning bloat" if proj else "prunes bloat"
     # When agents/tools are in flight, the safe-point gate holds the reload until
@@ -1096,20 +1096,20 @@ def _build_nudge_message(tier_key: int, pct: float, proj: float | None,
     if tier_key <= 55:
         return (f"✦ Cozempic: you're at {pct_disp}% context. A safe reload {reclaim} and "
                 f"resumes automatically (conversation preserved). Your call:\n"
-                f"    • run `cozempic reload` now to control the timing, or\n"
+                f"    • run `/cozempic reload` now to control the timing, or\n"
                 f"    • do nothing — {when}.")
     reclaim80 = (f"reclaims ~{int(round(proj))}% without loss" if proj
                  else "prunes bloat without losing your conversation")
-    tail = ("Run `cozempic reload` now to pick the moment, or it reloads once your "
+    tail = ("Run `/cozempic reload` now to pick the moment, or it reloads once your "
             "agents/tools finish." if inflight else
-            "Run `cozempic reload` now to pick the moment or wait for the autoreload to kick in.")
+            "Run `/cozempic reload` now to pick the moment or wait for the autoreload to kick in.")
     return (f"✦ Cozempic: context {pct_disp}% — approaching the autocompact wall. A reload "
             f"{reclaim80}. {tail}")
 
 
 def cmd_nudge(args):
     """Stop-hook: emit a non-blocking systemMessage nudging the user to
-    `cozempic reload` at 25/55/80% context, ONCE per tier. Takes NO action — no
+    `/cozempic reload` at 25/55/80% context, ONCE per tier. Takes NO action — no
     prune, no reload, never blocks the stop, never fed to the model. Always exit 0.
     """
     import json as _json

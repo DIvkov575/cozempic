@@ -60,8 +60,23 @@ class TestNudge(unittest.TestCase):
         m = self._run(560_000, "s55")  # 56%
         self.assertIsNotNone(m)
         self.assertIn("56%", m)
-        self.assertIn("cozempic reload", m)
+        # Must point at the SLASH command, not the bare shell command: this is an
+        # in-TUI systemMessage, and a bare `cozempic reload` typed in the prompt goes
+        # to the model (does NOT run the CLI). Regression guard for that UX bug.
+        self.assertIn("/cozempic reload", m)
+        self.assertNotRegex(m, r"(?<!/)`cozempic reload`")
         self.assertIn("pause between turns", m.lower())
+
+    def test_all_tiers_use_slash_command_not_bare(self):
+        # No tier may tell the user to run the bare `cozempic reload` (it would be
+        # routed to the model in the Claude Code TUI, not the shell).
+        for size, sid in ((260_000, "a25"), (560_000, "a55"), (820_000, "a80")):
+            m = self._run(size, sid)
+            self.assertIsNotNone(m)
+            if "reload" in m:
+                self.assertNotRegex(
+                    m, r"(?<!/)`cozempic reload`",
+                    f"tier message uses bare `cozempic reload` (should be /cozempic reload): {m!r}")
 
     def test_80_tier_urgent_no_emergency_word(self):
         m = self._run(820_000, "s80")  # 82%

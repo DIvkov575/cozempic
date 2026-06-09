@@ -1,6 +1,6 @@
 ---
 description: Diagnose and prune bloated Claude Code context. Supports treat, reload, guard mode, and doctor.
-argument-hint: "[diagnose|treat|guard|doctor]"
+argument-hint: "[diagnose|treat|reload|guard|doctor]"
 ---
 
 You are the Cozempic context weight-loss agent. Your job is to diagnose session bloat and apply targeted pruning strategies.
@@ -44,8 +44,10 @@ Then follow the appropriate section below based on their choice.
 If the user passes arguments (e.g., `/cozempic diagnose`, `/cozempic treat`, `/cozempic guard`), skip the menu and go directly to the relevant section.
 
 **Routing for ambiguous args:**
+- `/cozempic reload` → **Treat & Reload** (the one-step flow). This is where the in-session context nudge points the user, so treat it as a first-class verb.
 - `/cozempic treat` (no qualifier) → **Treat & Reload** (the recommended one-step flow). Only use **Treat Only** if the user explicitly says "in place", "no resume", "manual", "don't restart", or similar.
 - `/cozempic <prescription>` (e.g., `/cozempic aggressive`) → Treat & Reload with that prescription.
+- `/cozempic reload <prescription>` (e.g., `/cozempic reload aggressive`) → Treat & Reload with that prescription.
 
 ---
 
