@@ -85,7 +85,15 @@ class TeamState:
         active: list[TaskInfo] = []
         completed = 0
         blank = 0
-        inactive_statuses = {"completed", "done", "cancelled", "canceled"}
+        # Terminal task states. Kept consistent with the teammate/subagent terminal
+        # concept (e.g. "finished" was terminal there but counted ACTIVE here → an
+        # "active task in flight" over-block; fleet P2, 2026-06-09). Only unambiguously
+        # terminal words — never an active-work state (pending/in_progress/blocked).
+        inactive_statuses = {
+            "completed", "complete", "done", "finished", "cancelled", "canceled",
+            "closed", "resolved", "skipped", "merged", "archived", "obsolete",
+            "wont_fix", "wontfix",
+        }
         for task in self.tasks:
             subject = (task.subject or "").strip()
             if not subject:
@@ -345,15 +353,21 @@ TEAM_TOOL_NAMES = {
 _TEAM_EXTRACT_TOOL_NAMES = TEAM_TOOL_NAMES | {"Agent"}
 
 
-# Patterns for parsing task-notification XML in user messages
-_TASK_NOTIFICATION_RE = re.compile(
-    r"<task-notification>\s*"
-    r"<task-id>([^<]+)</task-id>\s*"
-    r"<status>([^<]+)</status>\s*"
-    r"<summary>([^<]*)</summary>\s*"
-    r"<result>(.*?)</result>",
-    re.DOTALL,
-)
+# Patterns for parsing task-notification XML in user messages. Fields are parsed
+# INDEPENDENTLY (order-, attribute-, and extra-tag tolerant) rather than as one
+# strictly-ordered regex: the REAL harness notification carries <tool-use-id> and
+# <output-file> tags BETWEEN <task-id> and <status> (ground-truthed 2026-06-09), which
+# a strict task-id→status regex misses → a COMPLETED background-Agent teammate is left
+# "running" forever → safe_to_reload wedges the guard inert. Mirrors detect_in_flight's
+# lenient _TN_*_RE so the two parsers agree on the same bytes.
+_TASK_NOTIF_BLOCK_RE = re.compile(
+    r"<task-notification(?:\s[^>]*)?>(.*?)</task-notification>", re.DOTALL | re.IGNORECASE)
+_TASK_NOTIF_ID_RE = re.compile(r"<task-id(?:\s[^>]*)?>([^<]+)</task-id>", re.IGNORECASE)
+_TASK_NOTIF_STATUS_RE = re.compile(r"<status(?:\s[^>]*)?>([^<]+)</status>", re.IGNORECASE)
+_TASK_NOTIF_SUMMARY_RE = re.compile(
+    r"<summary(?:\s[^>]*)?>(.*?)</summary>", re.IGNORECASE | re.DOTALL)
+_TASK_NOTIF_RESULT_RE = re.compile(
+    r"<result(?:\s[^>]*)?>(.*?)</result>", re.IGNORECASE | re.DOTALL)
 
 # Pattern for agent progress notifications in system-reminder tags
 _AGENT_PROGRESS_RE = re.compile(
@@ -779,9 +793,17 @@ def extract_team_state(messages: list[Message]) -> TeamState:
                             if _fg_done:
                                 tm.status = "completed"
                             seen_teammates[real_agent_id] = tm
-                            # Populate name → agentId index for bare-name resolution
+                            # Populate name → agentId index for bare-name resolution.
+                            # Index BOTH the teammate name AND the agentId's bare prefix
+                            # (alice ← alice@myteam): a completion task-notification often
+                            # carries the BARE id, and without the prefix index it never
+                            # resolves → the teammate stays "running" → over-block (fleet
+                            # P1, 2026-06-09; the direct-insert branch already does this).
                             if tm.name and tm.name != real_agent_id:
                                 _name_to_agent_id[tm.name] = real_agent_id
+                            _bare = real_agent_id.split("@")[0]
+                            if _bare and _bare != real_agent_id:
+                                _name_to_agent_id.setdefault(_bare, real_agent_id)
                         elif real_agent_id not in seen_teammates:
                             # No placeholder — insert directly (robustness)
                             bare = real_agent_id.split("@")[0] if "@" in real_agent_id else real_agent_id
@@ -834,11 +856,21 @@ def extract_team_state(messages: list[Message]) -> TeamState:
             continue
 
         # ── task-notifications ────────────────────────────────────────────
-        for match in _TASK_NOTIFICATION_RE.finditer(content):
-            task_id = match.group(1).strip()
-            status = match.group(2).strip()
-            summary = match.group(3).strip()
-            result = match.group(4).strip()
+        # Parse each notification block, then its fields INDEPENDENTLY (order- and
+        # extra-tag tolerant) so the REAL format (<tool-use-id>/<output-file> between
+        # <task-id> and <status>) still clears a completed teammate/subagent.
+        for _blk in _TASK_NOTIF_BLOCK_RE.finditer(content):
+            _body = _blk.group(1)
+            _id_m = _TASK_NOTIF_ID_RE.search(_body)
+            _st_m = _TASK_NOTIF_STATUS_RE.search(_body)
+            if not _id_m or not _st_m:
+                continue  # not a real task-notification (no id/status) — skip
+            task_id = _id_m.group(1).strip()
+            status = _st_m.group(1).strip()
+            _sm_m = _TASK_NOTIF_SUMMARY_RE.search(_body)
+            _rs_m = _TASK_NOTIF_RESULT_RE.search(_body)
+            summary = _sm_m.group(1).strip() if _sm_m else ""
+            result = _rs_m.group(1).strip() if _rs_m else ""
 
             # Find the matching subagent by agent_id
             if task_id in seen_subagents:

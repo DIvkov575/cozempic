@@ -113,6 +113,25 @@ one agent hunts false-negatives (live work the gate calls quiescent), one hunts
 over-blocks (quiescent/teamless sessions the gate wedges) — and re-run BOTH on the
 *fix*, since a fix that tightens one direction can open the other.
 
+**"Completed work read as LIVE" is its own over-block class — and only REAL fixtures
+catch it (1.8.25).** Synthetic fixtures encode the marker shape we *assume*; they
+cannot reveal that we mis-classify a *real* completion. Ground-truthing against an
+actual session (`tests/fixtures/harness/`, captured from a live run) surfaced two the
+synthetic suite hid: (a) a FOREGROUND `Agent` that returned inline (real trailer
+`...to continue this agent\n<usage>… duration_ms: N</usage>`) was left "running"
+forever — any session using `Agent` subagents went inert; (b) the strict
+`extract_team_state` task-notification regex didn't match the REAL notification
+(`<tool-use-id>`/`<output-file>` tags sit between `<task-id>` and `<status>`), so a
+completed background Agent never cleared — while `detect_in_flight`'s lenient parser
+*did* match the same bytes. Lessons: (7) **two parsers over the same bytes must agree**
+— a strict, order-dependent parser silently desyncs from a lenient one on harness
+drift; parse fields independently (order/attribute/extra-tag tolerant). (8) **unify
+the terminal vocabulary** — `_STATUS_TERMINAL` / task-inactive / `_INFLIGHT_DONE`
+drifting apart means a word that's "done" for a teammate reads "active" for a task
+(`finished` did). (9) the cheapest way to find all of this: **run the gate against a
+real captured transcript and assert it reloads when it should** — the synthetic suite
+will not tell you.
+
 ### L8 — Reload safety (the 1.8.x guard line)  ·  standing tests: `tests/test_guard_safe_point.py`, `tests/test_interactive_*`, `tests/test_guard_team_agent_spawn.py`, `tests/test_reload_gate_contract.py`
 A reload SIGKILLs + resumes, so: NEVER reload through in-flight work (running Workflow
 / background `Agent` subagent / agent team / open tool call) — defer instead.

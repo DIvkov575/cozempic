@@ -405,3 +405,78 @@ class TestForegroundAgentCompletion1825(unittest.TestCase):
             _tr("b1", "Command running in background with ID: realbg7")])))
         self.assertTrue(inflight["background"], "a real run_in_background Bash must be detected")
         self.assertIn("realbg7", inflight["ids"])
+
+
+# Real task-notification format, ground-truthed 2026-06-09: <task-id> is followed by
+# <tool-use-id> and <output-file> tags BEFORE <status> — a strictly-ordered parser
+# misses it and leaves a COMPLETED background-Agent teammate "running".
+def _real_task_notif(tid, status="completed"):
+    return (f"<task-notification>\n<task-id>{tid}</task-id>\n"
+            f"<tool-use-id>toolu_01abc</tool-use-id>\n<output-file>/tmp/{tid}.output</output-file>\n"
+            f"<status>{status}</status>\n<summary>done</summary>\n<result>findings</result>\n</task-notification>")
+
+
+def _qop(text):
+    return {"type": "queue-operation", "content": text}
+
+
+class TestTaskNotificationRealFormat1825(unittest.TestCase):
+    """1.8.25 — the second-pass task-notification parser must tolerate the REAL
+    format (extra tags between task-id and status), resolve a BARE-name completion
+    to a suffixed agentId, and count terminal task states as inactive."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = Path(tempfile.mkdtemp(prefix="cozempic_tn1825_"))
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _gate(self, rows):
+        p = _write(self.tmp, rows)
+        m = load_messages(p)
+        return safe_to_reload(extract_team_state(m), m, p)
+
+    def test_real_task_notification_format_clears_teammate(self):
+        # Background Agent + REAL completion notification (tool-use-id/output-file tags).
+        safe, reason = self._gate([
+            _tu("t1", "Agent", {"description": "a", "subagent_type": "general-purpose", "prompt": "x"}),
+            _tr("t1", "Async agent launched successfully.\nagentId: bg777 (Use SendMessage with to: 'bg777' to continue this agent.)"),
+            _qop(_real_task_notif("bg777")), _idle_lead()])
+        self.assertTrue(safe, f"real-format completion must clear the teammate; got {reason!r}")
+
+    def test_bare_name_completion_resolves_to_suffixed_id(self):
+        # Spawn worker7@myteam; a BARE-name "worker7" completion must resolve + clear.
+        safe, reason = self._gate([
+            _tu("t1", "Agent", {"name": "researcher"}),
+            _tr("t1", "Spawned successfully.\nagent_id: worker7@myteam"),
+            _qop(_real_task_notif("worker7")), _idle_lead()])
+        self.assertTrue(safe, f"bare-name completion must resolve to worker7@myteam; got {reason!r}")
+
+    def test_reordered_attributed_notification_clears(self):
+        # Order-independent + tag-attribute tolerant.
+        tn = ("<task-notification id='n1'>\n<summary>s</summary>\n<task-id>z9</task-id>\n"
+              "<status>completed</status>\n</task-notification>")
+        safe, _ = self._gate([
+            _tu("t1", "Agent", {"name": "z9"}),
+            _tr("t1", "Spawned successfully.\nagent_id: z9"), _qop(tn), _idle_lead()])
+        self.assertTrue(safe, "a reordered/attributed notification must still clear")
+
+    def test_incomplete_notification_still_blocks(self):
+        # A bg Agent with NO completion notification must still block.
+        safe, _ = self._gate([
+            _tu("t1", "Agent", {"description": "a", "subagent_type": "general-purpose", "prompt": "x"}),
+            _tr("t1", "Async agent launched successfully.\nagentId: bg888 (Use SendMessage with to: 'bg888' to continue this agent.)"),
+            _idle_lead()])
+        self.assertFalse(safe, "an uncompleted background Agent must still block")
+
+    def test_terminal_task_statuses_are_inactive(self):
+        from cozempic.team import TeamState, TaskInfo
+        for st in ("closed", "resolved", "finished", "merged", "skipped", "completed", "done"):
+            ts = TeamState()
+            ts.tasks = [TaskInfo(task_id="T1", subject="do x", status=st)]
+            self.assertEqual(ts._task_groups()[0], [], f"task status {st!r} must be inactive")
+        ts = TeamState()
+        ts.tasks = [TaskInfo(task_id="T2", subject="do y", status="in_progress")]
+        self.assertEqual(len(ts._task_groups()[0]), 1, "in_progress task must stay active")
