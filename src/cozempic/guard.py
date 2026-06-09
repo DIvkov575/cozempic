@@ -213,6 +213,66 @@ def _resolve_session_by_id(session_id: str, max_retries: int = 10, retry_delay: 
     return None
 
 
+# Seconds to patiently wait for an EXPLICIT session's JSONL to appear. Claude Code
+# writes the session JSONL LAZILY, on the FIRST USER TURN — user-paced, routinely
+# far beyond _resolve_session_by_id's 15s budget (#121 measured 109s). Generous
+# default so the guard survives a slow first message; bounded so a truly-abandoned
+# session (user opened Claude, never typed, walked away) can't leak a sleeping daemon.
+_DEFAULT_SESSION_WAIT_SECONDS = 900.0
+
+
+def _session_wait_budget() -> float:
+    """Total seconds to wait for an explicit session's lazily-created JSONL (#121).
+    `COZEMPIC_SESSION_WAIT_SECONDS` overrides; finite, clamped to [0, 3600]. 0
+    disables the patient wait (the daemon reverts to the bare 15s resolve)."""
+    try:
+        v = float(os.environ.get("COZEMPIC_SESSION_WAIT_SECONDS", _DEFAULT_SESSION_WAIT_SECONDS))
+    except (TypeError, ValueError):
+        return _DEFAULT_SESSION_WAIT_SECONDS
+    # Reject NaN/inf (every comparison would be False → the loop never bounds).
+    if not math.isfinite(v) or v < 0:
+        return _DEFAULT_SESSION_WAIT_SECONDS
+    return min(v, 3600.0)
+
+
+def _resolve_session_patiently(session_id: str, claude_pid: int | None = None) -> dict | None:
+    """Resolve an EXPLICIT (harness-vouched) session id, waiting for Claude Code to
+    create its JSONL lazily on the first user turn (#121, regression of #73).
+
+    After the initial 15s `_resolve_session_by_id` attempt, keep polling with
+    backoff until (a) the file appears, (b) the session's Claude process exits when
+    a `claude_pid` is known — nothing left to guard, or (c) the
+    `COZEMPIC_SESSION_WAIT_SECONDS` budget elapses. The daemon keeps its
+    already-acquired spawn claim while waiting, so a slow first message no longer
+    kills the guard for the whole session, and `doctor` still sees it alive.
+
+    ONLY for an explicit id the harness vouched for — auto-detect (no `--session`)
+    keeps the bare 15s resolve, since there is no authoritative id to wait on."""
+    sess = _resolve_session_by_id(session_id)
+    if sess:
+        return sess
+    budget = _session_wait_budget()
+    if budget <= 0:
+        return None
+    print(
+        f"  Session JSONL not written yet — Claude Code creates it on the first user "
+        f"turn; waiting up to {int(budget)}s (COZEMPIC_SESSION_WAIT_SECONDS to tune).",
+        file=sys.stderr,
+    )
+    waited = 0.0
+    delay = 3.0
+    while waited < budget:
+        if claude_pid is not None and not _pid_is_alive(claude_pid):
+            return None  # the session's Claude is gone — don't guard a dead session
+        time.sleep(delay)
+        waited += delay
+        sess = _resolve_session_by_id(session_id, max_retries=1, retry_delay=0)
+        if sess:
+            return sess
+        delay = min(delay * 1.5, 30.0)  # back off, cap at 30s
+    return None
+
+
 # ─── Lightweight checkpoint (no prune) ───────────────────────────────────────
 
 def checkpoint_team(
@@ -464,7 +524,10 @@ def start_guard(
     # Find the session — explicit ID or auto-detect
     # strict=True: guard is destructive, refuse to fall back to "most recently modified"
     if session_id:
-        sess = _resolve_session_by_id(session_id)
+        # Patient wait: Claude Code writes the session JSONL lazily on the first
+        # user turn (user-paced), far beyond the bare 15s resolve budget — giving up
+        # there killed the guard for the whole session with no respawn (#121).
+        sess = _resolve_session_patiently(session_id, claude_pid=claude_pid)
     else:
         sess = find_current_session(cwd, strict=True)
     if not sess:
