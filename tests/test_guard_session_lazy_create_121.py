@@ -119,5 +119,42 @@ class TestPatientSessionWait121(unittest.TestCase):
             self.assertEqual(guard._session_wait_budget(), 120.0)
 
 
+class TestResolveHardening1827(unittest.TestCase):
+    """Hardening our extensive QA fleet surfaced around the #121 patient wait (it
+    now routes claude_pid through _pid_is_alive and re-checks _resolve_session_by_id
+    in a loop, widening the blast radius of pre-existing edge cases)."""
+
+    def test_exact_id_wins_over_prefix_sharing_session(self):
+        # The guard is DESTRUCTIVE. When the requested id matches a session EXACTLY,
+        # that session must win even if another session has it as a leading prefix
+        # and sorts first — never attach to (and later prune/reload) the wrong one.
+        exact = {"session_id": "f0702a2b", "path": Path("/x/f0702a2b.jsonl"), "size": 0, "project": "right"}
+        longer = {"session_id": "f0702a2bzzzz", "path": Path("/y/f0702a2bzzzz.jsonl"), "size": 0, "project": "WRONG"}
+        with patch.object(guard, "find_sessions", return_value=[longer, exact]):  # WRONG iterates first
+            r = guard._resolve_session_by_id("f0702a2b", max_retries=1, retry_delay=0)
+        self.assertEqual(r["session_id"], "f0702a2b", "exact id must win over a prefix-sharing session")
+        self.assertEqual(r["project"], "right")
+
+    def test_prefix_still_resolves_when_no_exact_match(self):
+        # A genuine prefix (no exact match) still resolves — we only PREFER exact.
+        s = {"session_id": "f0702a2bzzzz", "path": Path("/y/f0702a2bzzzz.jsonl"), "size": 0, "project": "p"}
+        with patch.object(guard, "find_sessions", return_value=[s]):
+            r = guard._resolve_session_by_id("f0702a2b", max_retries=1, retry_delay=0)
+        self.assertIsNotNone(r)
+        self.assertEqual(r["session_id"], "f0702a2bzzzz")
+
+    def test_pid_is_alive_huge_int_does_not_crash(self):
+        # A malformed/huge --claude-pid must not raise OverflowError into the daemon.
+        self.assertFalse(guard._pid_is_alive(10 ** 30))
+        self.assertFalse(guard._pid_is_alive(2 ** 63))
+
+    def test_resolve_pathological_long_path_does_not_crash(self):
+        # An over-long --session value (ENAMETOOLONG) must degrade to None, not crash
+        # the daemon — the patient wait calls this repeatedly.
+        with patch.object(guard, "find_sessions", return_value=[]):
+            r = guard._resolve_session_by_id("/" + "a" * 5000 + ".jsonl", max_retries=1, retry_delay=0)
+        self.assertIsNone(r)
+
+
 if __name__ == "__main__":
     unittest.main()

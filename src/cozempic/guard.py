@@ -184,29 +184,39 @@ def _resolve_session_by_id(session_id: str, max_retries: int = 10, retry_delay: 
     """
     p = Path(session_id)
 
-    # Fast path: full path exists on disk
-    if p.exists() and p.suffix == ".jsonl":
-        return {
-            "path": p,
-            "session_id": p.stem,
-            "size": p.stat().st_size,
-            "project": p.parent.name,
-        }
+    # Fast path: full path exists on disk. Guard p.exists()/p.stat() with try/except —
+    # a pathological session_id (e.g. an over-long path → ENAMETOOLONG) raises OSError,
+    # which, now that the patient wait (#121) re-checks in a loop, would crash the
+    # daemon repeatedly. Treat any such error as "not a usable path yet".
+    def _from_path():
+        try:
+            if p.suffix == ".jsonl" and p.exists():
+                return {"path": p, "session_id": p.stem,
+                        "size": p.stat().st_size, "project": p.parent.name}
+        except OSError:
+            pass
+        return None
+
+    hit = _from_path()
+    if hit:
+        return hit
 
     # Extract UUID from path-like input (file may not exist yet)
     search_id = _normalize_session_id(session_id)
 
     for attempt in range(max_retries):
-        # Re-check path on each retry (file may appear)
-        if p.suffix == ".jsonl" and p.exists():
-            return {
-                "path": p,
-                "session_id": p.stem,
-                "size": p.stat().st_size,
-                "project": p.parent.name,
-            }
-        for sess in find_sessions():
-            if sess["session_id"] == search_id or sess["session_id"].startswith(search_id):
+        hit = _from_path()  # re-check the path on each retry (file may appear)
+        if hit:
+            return hit
+        sessions = find_sessions()
+        # Prefer an EXACT id match over a prefix match. The guard is DESTRUCTIVE, so a
+        # prefix collision (two sessions sharing a leading segment, e.g. across
+        # projects) must never attach it to the WRONG session — exact wins (QA P2).
+        for sess in sessions:
+            if sess["session_id"] == search_id:
+                return sess
+        for sess in sessions:
+            if sess["session_id"].startswith(search_id):
                 return sess
         if attempt < max_retries - 1:
             time.sleep(retry_delay)
@@ -217,7 +227,9 @@ def _resolve_session_by_id(session_id: str, max_retries: int = 10, retry_delay: 
 # writes the session JSONL LAZILY, on the FIRST USER TURN — user-paced, routinely
 # far beyond _resolve_session_by_id's 15s budget (#121 measured 109s). Generous
 # default so the guard survives a slow first message; bounded so a truly-abandoned
-# session (user opened Claude, never typed, walked away) can't leak a sleeping daemon.
+# session (user opened Claude, never typed, walked away) sleeps AT MOST the budget
+# then exits cleanly — a known claude_pid lets it exit sooner, but the SessionStart
+# hook doesn't pass one today, so the budget is the operative bound.
 _DEFAULT_SESSION_WAIT_SECONDS = 900.0
 
 
@@ -531,14 +543,18 @@ def start_guard(
     else:
         sess = find_current_session(cwd, strict=True)
     if not sess:
-        # Clean up any stale PID file from this failed startup
+        # Release our claim — CAS unlink (only if the pidfile still holds OUR pid),
+        # mirroring every other start_guard exit path. A bare unlink could clobber a
+        # peer daemon's just-written claim (QA P3).
         if session_id:
-            try:
-                _pid_file_for_session(session_id).unlink(missing_ok=True)
-            except Exception:
-                pass
+            _safe_unlink_session_pidfile(session_id)
         print("  ERROR: Could not detect current session.", file=sys.stderr)
-        if not session_id:
+        if session_id:
+            # Make the give-up visible in the guard log instead of a silent death.
+            print("  (waited for the session JSONL but it never appeared within the "
+                  "budget — raise COZEMPIC_SESSION_WAIT_SECONDS to wait longer)",
+                  file=sys.stderr)
+        else:
             print("  Tip: Use --session <session_id> for explicit targeting.", file=sys.stderr)
         sys.exit(1)
 
@@ -3536,6 +3552,8 @@ def _pid_is_alive(pid: int) -> bool:
         return False
     except PermissionError:
         return True  # process exists, owned by another user
+    except OverflowError:
+        return False  # pid too large to be a real process id (malformed --claude-pid)
     except OSError:
         # Windows raises OSError [WinError 87] for a non-existent PID; treat any
         # Windows os.kill failure as "gone". On POSIX an unexpected OSError here
