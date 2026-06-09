@@ -326,3 +326,82 @@ class TestReloadGateHardening1824(unittest.TestCase):
             _tu("d1", "TeamDelete", {"team_name": "teamA"}), _tr("d1", "teamA disbanded."),
             _idle_lead()])
         self.assertFalse(safe, f"deleting teamA must not SIGKILL live teamB; got reload: {reason!r}")
+
+
+# Real harness marker formats, captured + verified from a live session 2026-06-09.
+# A FOREGROUND Agent that returned its result inline carries the duration_ms usage
+# trailer; a BACKGROUND Agent launch / live team-spawn does not.
+_FG_DONE = ("[analysis output]\n\n**Net:** complete.\n"
+            "agentId: aca896c66561b5001 (use SendMessage with to: 'aca896c66561b5001' "
+            "to continue this agent)\n<usage>subagent_tokens: 94765\ntool_uses: 34\n"
+            "duration_ms: 445383</usage>")
+_BG_LAUNCH = ("Async agent launched successfully.\nagentId: a9a0ae189567a510d (internal "
+              "ID - do not mention to user. Use SendMessage with to: 'a9a0ae189567a510d' "
+              "to continue this agent.)\nThe agent is working in the background.")
+
+
+class TestForegroundAgentCompletion1825(unittest.TestCase):
+    """1.8.25 — a COMPLETED foreground Agent must not be read as a live teammate
+    (real-transcript over-block: the synthetic team-spawn format hid it), and a
+    launch marker QUOTED in tool output must not fabricate a phantom in-flight task."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = Path(tempfile.mkdtemp(prefix="cozempic_fg1825_"))
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _state(self, rows):
+        p = _write(self.tmp, rows)
+        m = load_messages(p)
+        return extract_team_state(m), m, p
+
+    def test_completed_foreground_agent_reloads(self):
+        ts, m, p = self._state([
+            _tu("t1", "Agent", {"description": "qa", "subagent_type": "general-purpose", "prompt": "x"}),
+            _tr("t1", _FG_DONE), _idle_lead("done")])
+        self.assertEqual([t.status for t in ts.teammates], ["completed"],
+                         "a foreground Agent with the duration_ms trailer must be terminal")
+        self.assertTrue(safe_to_reload(ts, m, p)[0], "completed foreground Agent must reload")
+
+    def test_background_launch_blocks(self):
+        ts, m, p = self._state([
+            _tu("t1", "Agent", {"description": "qa", "subagent_type": "general-purpose", "prompt": "x"}),
+            _tr("t1", _BG_LAUNCH), _idle_lead("launched")])
+        self.assertFalse(safe_to_reload(ts, m, p)[0], "an in-flight background Agent must block")
+
+    def test_team_spawn_without_trailer_still_blocks(self):
+        # The live team-spawn ack (no duration_ms) must remain non-terminal.
+        ts, m, p = self._state([
+            _tu("t1", "Agent", {"name": "alice"}),
+            _tr("t1", "Spawned successfully.\nagent_id: alice@squad"), _idle_lead()])
+        self.assertFalse(safe_to_reload(ts, m, p)[0], "a live team-spawn must still block")
+
+    def test_agent_output_quoting_launch_not_credited(self):
+        # A COMPLETED agent whose OUTPUT quotes a launch marker must not be read as
+        # an in-flight launch (detect_in_flight skips foreground-completed results).
+        inflight = detect_in_flight(load_messages(_write(self.tmp, [
+            _tu("t1", "Agent", {"description": "review", "subagent_type": "general-purpose", "prompt": "x"}),
+            _tr("t1", "I checked _AGENT_LAUNCH_RE against 'Async agent launched "
+                      "successfully. agentId: phantom123'.\n" + _FG_DONE)])))
+        self.assertNotIn("phantom123", inflight["ids"],
+                         "a launch marker quoted in a completed agent's output is not a launch")
+        self.assertFalse(inflight["agent"])
+
+    def test_normal_bash_echoing_bg_ack_not_credited(self):
+        # A normal Bash (no run_in_background) whose OUTPUT echoes the bg-ack text
+        # must not be credited as a launch.
+        inflight = detect_in_flight(load_messages(_write(self.tmp, [
+            _tu("b1", "Bash", {"command": "grep -r 'in background with ID'"}),
+            _tr("b1", "test_x.py:5: running in background with ID: notreal99")])))
+        self.assertFalse(inflight["background"], "a Bash output echoing the ack text is not a launch")
+
+    def test_real_run_in_background_bash_still_blocks(self):
+        # A genuine run_in_background Bash launch must still be detected.
+        inflight = detect_in_flight(load_messages(_write(self.tmp, [
+            _tu("b1", "Bash", {"command": "sleep 99", "run_in_background": True}),
+            _tr("b1", "Command running in background with ID: realbg7")])))
+        self.assertTrue(inflight["background"], "a real run_in_background Bash must be detected")
+        self.assertIn("realbg7", inflight["ids"])

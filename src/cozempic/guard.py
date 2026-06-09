@@ -152,7 +152,10 @@ from .session import (
     save_messages,
     snapshot_session,
 )
-from .team import TeamState, extract_team_state, inject_team_recovery, write_team_checkpoint
+from .team import (
+    TeamState, extract_team_state, inject_team_recovery, write_team_checkpoint,
+    _AGENT_DONE_TRAILER_RE,
+)
 from .tokens import default_token_thresholds, quick_token_estimate
 # Eager import: ensures the daemon's upgrade check uses code from the daemon's
 # OWN install state (frozen at import time), not whatever happens to be on
@@ -2359,6 +2362,7 @@ def detect_in_flight(messages) -> dict:
     use_ids: set[str] = set()
     res_ids: set[str] = set()
     use_name: dict = {}            # tool_use_id -> tool name
+    bg_bash_ids: set[str] = set()  # ids of Bash tool_uses with run_in_background=true
     results: list = []            # (tool_use_id|None, text) per tool_result
     open_unkeyed = False
     for item in messages or []:
@@ -2383,6 +2387,15 @@ def detect_in_flight(messages) -> dict:
                     if b.get("id"):
                         use_ids.add(b["id"])
                         use_name[b["id"]] = (b.get("name") or "")
+                        # Only a Bash with run_in_background=true actually launches a
+                        # bg task; a normal Bash whose OUTPUT merely contains the
+                        # ack-marker text (a test/grep printing "running in background
+                        # with ID: X") must NOT be credited as a launch (real-transcript
+                        # pollution, 2026-06-09).
+                        if ((b.get("name") or "") == "Bash"
+                                and isinstance(b.get("input"), dict)
+                                and b["input"].get("run_in_background")):
+                            bg_bash_ids.add(b["id"])
                     else:
                         # A tool_use with no id can never be paired to a result —
                         # fail toward "open" rather than silently treat it closed.
@@ -2403,13 +2416,22 @@ def detect_in_flight(messages) -> dict:
     for tid, rtext in results:
         if not rtext:
             continue
+        # A FOREGROUND-completed Agent result is the agent's OUTPUT (prose), not a
+        # launch ack — skip it, so a launch marker QUOTED in an agent's text (agents
+        # that discuss/echo "Async agent launched ... agentId: X", e.g. when working
+        # ON cozempic) can't fabricate a PHANTOM in-flight task that wedges the gate
+        # (real-transcript pollution, 2026-06-09).
+        if _AGENT_DONE_TRAILER_RE.search(rtext):
+            continue
         if _ok(tid, _LAUNCH_TOOLS["wf"]):
             for m in _WF_LAUNCH_RE.findall(rtext):
                 launched_wf.add(m.strip().lower())
         if _ok(tid, _LAUNCH_TOOLS["agent"]):
             for m in _AGENT_LAUNCH_RE.findall(rtext):
                 launched_agent.add(m.strip().lower())
-        if _ok(tid, _LAUNCH_TOOLS["bg"]):
+        # bg launch credited only from a result whose paired tool_use is a
+        # run_in_background Bash (or a pruned/unknown tool_use → conservative).
+        if _ok(tid, _LAUNCH_TOOLS["bg"]) and (use_name.get(tid) is None or tid in bg_bash_ids):
             for m in _BG_LAUNCH_RE.findall(rtext):
                 launched_bg.add(m.strip().lower())
     wf = launched_wf - completed

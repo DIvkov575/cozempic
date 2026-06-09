@@ -375,6 +375,16 @@ _AGENT_SPAWN_TEAM_RE = re.compile(
     r"^team_name:\s*([A-Za-z0-9_-]+)",
     re.IGNORECASE | re.MULTILINE,
 )
+# Foreground-Agent COMPLETION trailer. When an `Agent` subagent RETURNS its result
+# inline the harness appends "...to continue this agent\n<usage>subagent_tokens: N
+# tool_uses: N\nduration_ms: N</usage>". GROUND-TRUTHED against a real session
+# (27/27 foreground completions carried `duration_ms: N`, 2026-06-09). Its presence
+# means the agent RAN AND FINISHED → the teammate is TERMINAL. A live team-spawn ack
+# ("Spawned successfully\nagent_id: NAME@TEAM") and a background launch ("Async agent
+# launched successfully. agentId: X") have NO duration_ms, so they stay non-terminal
+# and keep blocking. Without this a completed FOREGROUND Agent reads "running"
+# forever → safe_to_reload wedges the guard inert (real-transcript finding 2026-06-09).
+_AGENT_DONE_TRAILER_RE = re.compile(r"\bduration_ms\b\s*[:=]\s*\d+", re.IGNORECASE)
 
 # <teammate-message teammate_id="X">…</teammate-message> blocks in user messages.
 # Used in the second pass to parse idle_notification transitions (P0-D).
@@ -751,6 +761,12 @@ def extract_team_state(messages: list[Message]) -> TeamState:
                 # (verified from production transcripts 2026-06-08).
                 if tool_name == "Agent":
                     result_text = _extract_block_text(block)
+                    # A FOREGROUND Agent that RETURNED its result inline is DONE — the
+                    # harness appends the duration_ms usage trailer. Such a teammate is
+                    # TERMINAL; without this it reads "running" forever and wedges the
+                    # gate inert (real-transcript finding 2026-06-09). A live team-spawn
+                    # ack / background launch has no trailer → stays non-terminal.
+                    _fg_done = bool(_AGENT_DONE_TRAILER_RE.search(result_text))
 
                     agent_id_m = _AGENT_SPAWN_ID_RE.search(result_text)
                     if agent_id_m:
@@ -760,6 +776,8 @@ def extract_team_state(messages: list[Message]) -> TeamState:
                         if placeholder and placeholder in seen_teammates:
                             tm = seen_teammates.pop(placeholder)
                             tm.agent_id = real_agent_id
+                            if _fg_done:
+                                tm.status = "completed"
                             seen_teammates[real_agent_id] = tm
                             # Populate name → agentId index for bare-name resolution
                             if tm.name and tm.name != real_agent_id:
@@ -770,21 +788,24 @@ def extract_team_state(messages: list[Message]) -> TeamState:
                             seen_teammates[real_agent_id] = TeammateInfo(
                                 agent_id=real_agent_id,
                                 name=bare,
-                                status="running",
+                                status="completed" if _fg_done else "running",
                             )
                             if bare and bare != real_agent_id:
                                 _name_to_agent_id[bare] = real_agent_id
                     else:
-                        # No agentId parsed. Mark terminal "failed" ONLY if the result
-                        # AFFIRMATIVELY signals failure (quota/error/rejected) — else
-                        # the spawn likely SUCCEEDED with an off-pattern result string,
-                        # so keep the placeholder "running" (block). Fail toward block,
-                        # never toward SIGKILL on a parse miss (1.8.24 fail-safe; the
-                        # earlier H-1 marked every parse miss "failed" → false-safe).
+                        # No agentId parsed. A FOREGROUND completion (duration_ms) is
+                        # TERMINAL. Else mark "failed" ONLY if the result AFFIRMATIVELY
+                        # signals failure (quota/error/rejected) — otherwise the spawn
+                        # likely SUCCEEDED with an off-pattern string, so keep "running"
+                        # (block). Fail toward block, never toward SIGKILL on a parse
+                        # miss (1.8.24 fail-safe; the earlier H-1 marked every parse miss
+                        # "failed" → false-safe).
                         placeholder = tool_use_id_to_subagent.get(tool_use_id, "")
                         if placeholder and placeholder in seen_teammates:
                             _low = result_text.lower()
-                            if any(k in _low for k in (
+                            if _fg_done:
+                                seen_teammates[placeholder].status = "completed"
+                            elif any(k in _low for k in (
                                     "error", "fail", "quota", "rejected", "denied",
                                     "could not", "unable", "cancel", "timeout")):
                                 seen_teammates[placeholder].status = "failed"
