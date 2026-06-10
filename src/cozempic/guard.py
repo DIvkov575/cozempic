@@ -134,6 +134,37 @@ def _read_min_prune_ratio() -> float:
 
 _MIN_PRUNE_RATIO = _read_min_prune_ratio()
 
+
+def _hard_prune_counts_as_futile(result: dict) -> bool:
+    """Whether a HARD-tier prune cycle counts toward the futile-loop K-exit counter.
+
+    Counts when the cycle freed nothing usable: a deferred-conflict, an explicit
+    futile-reload-skip, or a non-live prune that saved <= 0.
+
+    The subtle case (the f641174c 202-cycle loop, 2026-06-10): a READ-ONLY live
+    skip is normally BENIGN — the session is busy and a real prune will help once
+    Claude pauses — so it must NOT count (a long agent run can't be allowed to trip
+    the K-exit). BUT when the COMPUTED prune barely helps (projected token reduction
+    below _MIN_PRUNE_RATIO), the session is fundamentally unprunable and the guard is
+    powerless against it busy or not; that DOES count, so the daemon K-exits instead
+    of SIGKILL-reloading a session it can never get below threshold."""
+    if result.get("prune_deferred_conflict") or result.get("futile_reload_skipped"):
+        return True
+    if result.get("live_write_skipped"):
+        # Primary signal: the COMPUTED prune's BYTE reduction (always present on the
+        # read-only return, matching the GAP-D byte-ratio definition of "futile").
+        orig = result.get("original_bytes", 0)
+        if isinstance(orig, (int, float)) and orig > 0:
+            would_free = result.get("would_free_mb", 0.0) * 1024 * 1024
+            return (would_free / orig) < _MIN_PRUNE_RATIO
+        # Fallback: token projection (only present when project=True).
+        proj = result.get("projected_final_tokens")
+        pre = result.get("final_tokens", 0)
+        return (proj is not None and isinstance(pre, (int, float)) and pre > 0
+                and (pre - proj) / pre < _MIN_PRUNE_RATIO)
+    return result.get("saved_mb", 0) <= 0
+
+
 from ._validation import ConfigError
 from .executor import run_prescription
 from .helpers import is_ssh_session, shell_quote, tag_pattern_matches, strip_pattern_tags
@@ -680,17 +711,14 @@ def start_guard(
         # kill→no-write→resume loop on a sustained deferred-conflict).
         nonlocal consecutive_empty_hard_prunes, deferred_exit_announced, _futile_skip_announced
 
-        if result.get("live_write_skipped") and not result.get("prune_deferred_conflict"):
-            # #106 read-only deferral (agents active at 55%): we
-            # intentionally did not prune the live file. This is neither a
-            # successful prune nor a futile one — leave the futile-loop
-            # circuit breaker untouched so a long agent run doesn't trip
-            # the K-exit or emit the misleading "guard is powerless"
-            # diagnostic. HARD2 (80%) still force-reloads if needed.
-            pass
-        elif (result.get("saved_mb", 0) <= 0
-              or result.get("futile_reload_skipped")
-              or result.get("prune_deferred_conflict")):
+        # A benign read-only deferral (a LIVE session that is busy but COULD be
+        # pruned once Claude pauses) leaves the breaker untouched — a long agent run
+        # must not trip the K-exit. BUT a live session that is ALSO unprunable (the
+        # COMPUTED prune barely helps) must count toward K-exit, or the guard
+        # reload-loops forever on a session it is powerless against — busy or not
+        # (f641174c: 202 cycles freeing 0 tokens, 2026-06-10). _hard_prune_counts_as
+        # _futile() draws that line. HARD2 (80%) still force-reloads if needed.
+        if _hard_prune_counts_as_futile(result):
             consecutive_empty_hard_prunes += 1
 
             # GAP-D: emit one-shot diagnostic when reload was skipped
@@ -1439,11 +1467,19 @@ def guard_prune_cycle(
                             pruned_messages, pre_calibrated_ratio=pre_ratio).total
                     except Exception:
                         projected_final = None
+                # ALWAYS expose the COMPUTED prune's byte reduction (the prune was
+                # already run; this is cheap) so the futile-loop breaker can tell an
+                # UNPRUNABLE live session (must K-exit) from a busy-but-prunable one
+                # (benign). Without this, a live session that frees ~0 looped forever
+                # (f641174c, 2026-06-10).
+                _ro_would_free = original_bytes - sum(b for _, _, b in pruned_messages)
                 return {
                     "saved_mb": 0.0,
                     "original_tokens": pre_te.total,
                     "final_tokens": pre_te.total,
                     "projected_final_tokens": projected_final,
+                    "would_free_mb": _ro_would_free / 1024 / 1024,
+                    "original_bytes": original_bytes,
                     "team_name": team_state.team_name or None,
                     "team_messages": team_state.message_count,
                     "checkpoint_path": str(checkpoint_path) if checkpoint_path else None,
