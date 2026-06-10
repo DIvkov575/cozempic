@@ -1,6 +1,6 @@
 ---
-name: doctor
-description: Run health checks on Claude Code configuration and sessions. Use when troubleshooting Claude Code issues.
+name: cozempic-doctor
+description: Run health checks on Claude Code configuration and sessions. Use when troubleshooting Claude Code issues. (cozempic — does not shadow Claude Code's built-in /doctor)
 allowed-tools: Bash(cozempic *)
 ---
 
