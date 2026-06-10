@@ -136,7 +136,7 @@ _MIN_PRUNE_RATIO = _read_min_prune_ratio()
 
 from ._validation import ConfigError
 from .executor import run_prescription
-from .helpers import is_ssh_session, shell_quote
+from .helpers import is_ssh_session, shell_quote, tag_pattern_matches, strip_pattern_tags
 from .registry import PRESCRIPTIONS
 import cozempic.strategies  # noqa: F401 — register strategies so guard_prune_cycle can actually prune (#15)
 from .session import (
@@ -462,6 +462,7 @@ def start_guard(
     soft_threshold_tokens: int | None = None,
     session_id: str | None = None,
     claude_pid: int | None = None,
+    protect_patterns: list | None = None,
 ) -> None:
     """Start the guard daemon with tiered pruning.
 
@@ -1029,6 +1030,7 @@ def start_guard(
                     cwd=cwd or os.getcwd(),
                     session_id=sess["session_id"],
                     claude_pid=claude_pid,
+                    protect_patterns=protect_patterns,
                     # --no-reload OR an interactive mid-turn defer: we won't
                     # terminate Claude, so we can't safely write the live file
                     # (#106) — go read-only instead of falsely reporting a prune
@@ -1108,6 +1110,7 @@ def start_guard(
                         cwd=cwd or os.getcwd(),
                         session_id=sess["session_id"],
                         claude_pid=claude_pid,
+                        protect_patterns=protect_patterns,
                         # --no-reload OR an interactive mid-turn defer: read-only
                         # (can't safely write a live file without terminating
                         # Claude — #106).
@@ -1334,6 +1337,7 @@ def guard_prune_cycle(
     claude_pid: int | None = None,
     read_only_live: bool = False,
     project: bool = False,
+    protect_patterns: list | None = None,
 ) -> dict:
     """Execute a single guard prune cycle.
 
@@ -1371,6 +1375,11 @@ def guard_prune_cycle(
             messages = load_messages(session_path)
             original_bytes = sum(b for _, _, b in messages)
 
+            # --protect-pattern (#122): tag matching messages so the strategies spare
+            # them (via is_protected) during this prune cycle. Stripped after the prune.
+            if protect_patterns:
+                tag_pattern_matches(messages, protect_patterns)
+
             # Token estimate before pruning — capture calibrated ratio before metadata-strip
             pre_te = estimate_session_tokens(messages)
             pre_ratio = calibrate_ratio(messages)
@@ -1397,6 +1406,14 @@ def guard_prune_cycle(
                     "validation_error": ve.reason,
                     "evidence": ve.evidence,
                 }
+
+            # --protect-pattern: strip the transient tag now (the strategies already
+            # honored it via is_protected) so it can never persist into the saved
+            # session. On the validation-error path above we return before saving, so
+            # the in-memory tag is discarded with no disk leak.
+            if protect_patterns:
+                strip_pattern_tags(messages)
+                strip_pattern_tags(pruned_messages)
 
             # #106 — never rewrite a live session that Claude holds open.
             # The no-reload tiers (SOFT 25%, agents-active HARD) reach here with
@@ -3016,6 +3033,7 @@ def start_guard_daemon(
     soft_threshold_tokens: int | None = None,
     session_id: str | None = None,
     claude_pid: int | None = None,
+    protect_patterns: list | None = None,
 ) -> dict:
     """Start the guard as a background daemon.
 
@@ -3193,6 +3211,10 @@ def start_guard_daemon(
             cmd_parts.extend(["--session", _normalize_session_id(session_id)])
         if claude_pid is not None:
             cmd_parts.extend(["--claude-pid", str(claude_pid)])
+        # --protect-pattern (#122): serialize each user regex back to a child CLI arg
+        # (list-argv → no shell injection; the child re-compiles it).
+        for _pp in (protect_patterns or []):
+            cmd_parts.extend(["--protect-pattern", getattr(_pp, "pattern", str(_pp))])
 
         # Wrap the spawn body in a graceful OSError handler so a
         # non-interactive SessionStart hook never crashes with a stack
@@ -3667,6 +3689,7 @@ def reload_self_daemon(
     reactive: bool = True,
     threshold_tokens: int | None = None,
     soft_threshold_tokens: int | None = None,
+    protect_patterns: list | None = None,
 ) -> dict:
     """Gracefully restart the running guard daemon for this session.
 
@@ -3760,6 +3783,7 @@ def reload_self_daemon(
         threshold_tokens=threshold_tokens,
         soft_threshold_tokens=soft_threshold_tokens,
         session_id=session_id,
+        protect_patterns=protect_patterns,
     )
     result = start_guard_daemon(**daemon_args)
     if not result.get("started") and not result.get("already_running"):

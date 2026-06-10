@@ -1,0 +1,135 @@
+"""--protect-pattern (#122, originally by @eggrollofchaos; extracted + hardened):
+user-defined regex prune-immunity. Messages whose text matches a pattern get the
+same is_protected() immunity as team messages, so every strategy spares them.
+
+Mechanism proof: the prescription strategies (gentle/standard/aggressive) all check
+is_protected() before pruning, and is_protected() honors __cozempic_pattern_protected__.
+These tests verify the matcher surfaces, the safeguards (ReDoS-length cap, input cap,
+over-protection warn), the crash-safe strip, and that a tagged message is excluded
+from a strategy's removal actions.
+"""
+
+import io
+import unittest
+from contextlib import redirect_stderr
+
+from cozempic.helpers import (
+    compile_protect_patterns, tag_pattern_matches, strip_pattern_tags, is_protected,
+    _msg_text_matches_any, _PATTERN_PROTECTED_KEY,
+    _MAX_PROTECT_PATTERN_LEN,
+)
+from cozempic.registry import STRATEGIES
+import cozempic.strategies  # noqa: F401  (register strategies)
+
+
+def _txt(t):
+    return {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": t}]}}
+
+
+def _tool_result(t):
+    return {"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "x", "content": t}]}}
+
+
+def _user_str(t):
+    return {"type": "user", "message": {"role": "user", "content": t}}
+
+
+class TestCompileGuards(unittest.TestCase):
+    def test_valid(self):
+        pats = compile_protect_patterns(["foo", r"R\d+"])
+        self.assertEqual(len(pats), 2)
+
+    def test_invalid_regex_rejected(self):
+        with self.assertRaises(ValueError):
+            compile_protect_patterns(["(unclosed"])
+
+    def test_overlong_pattern_rejected(self):
+        with self.assertRaises(ValueError):
+            compile_protect_patterns(["a" * (_MAX_PROTECT_PATTERN_LEN + 1)])
+
+    def test_nonstring_rejected(self):
+        with self.assertRaises(ValueError):
+            compile_protect_patterns([123])
+
+    def test_none_and_empty(self):
+        self.assertEqual(compile_protect_patterns(None), [])
+        self.assertEqual(compile_protect_patterns([]), [])
+
+
+class TestMatcherSurfaces(unittest.TestCase):
+    def setUp(self):
+        self.pats = compile_protect_patterns([r"GATE CONTRACT R\d+"])
+
+    def test_matches_text_block(self):
+        self.assertTrue(_msg_text_matches_any(_txt("see GATE CONTRACT R070 here"), self.pats))
+
+    def test_matches_tool_result(self):
+        # The key fix vs the original PR: tool outputs (which ARE pruned) are scanned.
+        self.assertTrue(_msg_text_matches_any(_tool_result("output: GATE CONTRACT R12"), self.pats))
+
+    def test_matches_user_string(self):
+        self.assertTrue(_msg_text_matches_any(_user_str("GATE CONTRACT R5 standing rule"), self.pats))
+
+    def test_no_false_match(self):
+        self.assertFalse(_msg_text_matches_any(_txt("ordinary chatter"), self.pats))
+
+    def test_input_capped_but_still_matches_early(self):
+        # A huge message still matches a pattern near the start without scanning all of it.
+        self.assertTrue(_msg_text_matches_any(_txt("GATE CONTRACT R1 " + "x" * 500_000), self.pats))
+
+
+class TestTagAndStrip(unittest.TestCase):
+    def test_tags_and_counts(self):
+        msgs = [(0, _txt("GATE CONTRACT R1"), 10), (1, _txt("nope"), 10), (2, _tool_result("GATE CONTRACT R2"), 10)]
+        n = tag_pattern_matches(msgs, compile_protect_patterns([r"GATE CONTRACT R\d+"]))
+        self.assertEqual(n, 2)
+        self.assertEqual([is_protected(d) for _, d, _ in msgs], [True, False, True])
+
+    def test_strip_clears(self):
+        msgs = [(0, _txt("GATE CONTRACT R1"), 10)]
+        tag_pattern_matches(msgs, compile_protect_patterns([r"GATE CONTRACT R\d+"]))
+        strip_pattern_tags(msgs)
+        self.assertFalse(is_protected(msgs[0][1]))
+        self.assertNotIn(_PATTERN_PROTECTED_KEY, msgs[0][1])
+
+    def test_empty_patterns_noop(self):
+        msgs = [(0, _txt("x"), 10)]
+        self.assertEqual(tag_pattern_matches(msgs, []), 0)
+
+    def test_overprotection_warns(self):
+        msgs = [(i, _txt("GATE CONTRACT R1"), 10) for i in range(5)]
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            tag_pattern_matches(msgs, compile_protect_patterns([r"GATE CONTRACT R\d+"]))
+        self.assertIn("matched 5/5", buf.getvalue())
+
+    def test_already_tagged_not_recounted(self):
+        msgs = [(0, _txt("GATE CONTRACT R1"), 10)]
+        pats = compile_protect_patterns([r"GATE CONTRACT R\d+"])
+        self.assertEqual(tag_pattern_matches(msgs, pats), 1)
+        self.assertEqual(tag_pattern_matches(msgs, pats), 0)  # idempotent
+
+
+class TestStrategyHonorsPatternTag(unittest.TestCase):
+    """The linchpin: a pattern-protected message must be excluded from a strategy's
+    removal actions (every prescription strategy checks is_protected())."""
+
+    def _prog(self, i):
+        return (i, {"type": "progress", "data": {"type": "hook_progress"}, "uuid": f"u{i}"}, 30)
+
+    def test_progress_collapse_skips_protected(self):
+        msgs = [self._prog(0), self._prog(1), self._prog(2),
+                (3, {"type": "user", "message": {"role": "user", "content": "x"}}, 10)]
+        # Sanity: without protection, progress-collapse removes some of 0/1/2.
+        base = STRATEGIES["progress-collapse"].func(
+            [(i, dict(d), b) for i, d, b in msgs], {})
+        self.assertTrue(base.actions, "progress-collapse should remove something here")
+        # Protect the first progress message via the pattern key.
+        msgs[0][1][_PATTERN_PROTECTED_KEY] = True
+        sr = STRATEGIES["progress-collapse"].func(msgs, {})
+        removed = {a.line_index for a in sr.actions}
+        self.assertNotIn(0, removed, "a pattern-protected message must never be removed")
+
+
+if __name__ == "__main__":
+    unittest.main()

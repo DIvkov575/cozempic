@@ -15,7 +15,10 @@ from .diagnosis import diagnose_session
 from .doctor import run_doctor
 from .executor import execute_actions, run_prescription
 from .guard import checkpoint_team, start_guard, start_guard_daemon
-from .helpers import is_ssh_session, shell_quote
+from .helpers import (
+    is_ssh_session, shell_quote,
+    compile_protect_patterns, tag_pattern_matches, strip_pattern_tags,
+)
 from .init import run_init
 from .recap import save_recap
 from .registry import PRESCRIPTIONS, STRATEGIES
@@ -303,6 +306,19 @@ def cmd_diagnose(args):
     print()
 
 
+def _compile_protect_patterns_or_exit(args):
+    """Compile --protect-pattern regexes from args, or exit(2) with a clean error.
+    Returns the compiled list, or None when the flag is unused (#122, @eggrollofchaos)."""
+    raw = getattr(args, "protect_pattern", None)
+    if not raw:
+        return None
+    try:
+        return compile_protect_patterns(raw)
+    except ValueError as e:
+        print(f"  Error: {e}", file=sys.stderr)
+        sys.exit(2)
+
+
 def cmd_treat(args):
     path = resolve_session(args.session, getattr(args, "project", None), strict=getattr(args, "execute", False))
     # Take snapshot BEFORE load so append-conflict detection in save_messages
@@ -328,6 +344,11 @@ def cmd_treat(args):
     pre_te = estimate_session_tokens(messages)
     pre_ratio = calibrate_ratio(messages)
 
+    # --protect-pattern: tag matching messages so the strategies spare them (#122).
+    protect_patterns = _compile_protect_patterns_or_exit(args)
+    if protect_patterns:
+        tag_pattern_matches(messages, protect_patterns)
+
     try:
         new_messages, strategy_results = run_prescription(messages, strategy_names, config)
     except PruneValidationError as ve:
@@ -341,7 +362,14 @@ def cmd_treat(args):
             file=sys.stderr,
         )
         sys.exit(5)
+    finally:
+        # Strip the transient tag from EVERY message (crash-safe), so it can never
+        # persist into the saved session.
+        if protect_patterns:
+            strip_pattern_tags(messages)
 
+    if protect_patterns:
+        strip_pattern_tags(new_messages)  # belt-and-suspenders if a strategy copied dicts
     final_bytes = sum(b for _, _, b in new_messages)
     final_count = len(new_messages)
 
@@ -629,6 +657,11 @@ def cmd_reload(args):
         pre_te = estimate_session_tokens(messages)
         pre_ratio = calibrate_ratio(messages)
 
+        # --protect-pattern: tag matching messages so the strategies spare them (#122).
+        protect_patterns = _compile_protect_patterns_or_exit(args)
+        if protect_patterns:
+            tag_pattern_matches(messages, protect_patterns)
+
         try:
             new_messages, strategy_results = run_prescription(messages, strategy_names, config)
         except PruneValidationError as ve:
@@ -642,6 +675,11 @@ def cmd_reload(args):
                 file=sys.stderr,
             )
             sys.exit(5)
+        finally:
+            if protect_patterns:
+                strip_pattern_tags(messages)
+        if protect_patterns:
+            strip_pattern_tags(new_messages)
 
         final_bytes = sum(b for _, _, b in new_messages)
         final_count = len(new_messages)
@@ -838,6 +876,7 @@ def cmd_guard(args):
     """Start the guard daemon to prevent compaction-induced state loss."""
     session_id = args.session or None
     claude_pid = args.claude_pid or find_claude_pid()
+    protect_patterns = _compile_protect_patterns_or_exit(args)  # #122
 
     if getattr(args, "system_overhead_tokens", None):
         os.environ["COZEMPIC_SYSTEM_OVERHEAD_TOKENS"] = str(args.system_overhead_tokens)
@@ -855,6 +894,7 @@ def cmd_guard(args):
             reactive=not args.no_reactive,
             threshold_tokens=args.threshold_tokens,
             soft_threshold_tokens=args.soft_threshold_tokens,
+            protect_patterns=protect_patterns,
         )
         if result.get("reloaded"):
             print(f"  Guard daemon reloaded (PID {result['old_pid']} → {result['new_pid']})")
@@ -875,6 +915,7 @@ def cmd_guard(args):
             soft_threshold_tokens=args.soft_threshold_tokens,
             session_id=session_id,
             claude_pid=claude_pid,
+            protect_patterns=protect_patterns,
         )
         # Defensive .get() so a future regression that drops a key from
         # start_guard_daemon's return dict surfaces as a readable message
@@ -901,6 +942,7 @@ def cmd_guard(args):
         soft_threshold_tokens=args.soft_threshold_tokens,
         session_id=session_id,
         claude_pid=claude_pid,
+        protect_patterns=protect_patterns,
     )
 
 
@@ -1468,6 +1510,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_treat.add_argument("--execute", action="store_true", help="Apply changes (default is dry-run)")
     p_treat.add_argument("--project", help="Filter by project name")
     p_treat.add_argument("--thinking-mode", choices=["remove", "truncate", "signature-only"], help="Thinking block mode")
+    p_treat.add_argument("--protect-pattern", action="append", metavar="REGEX",
+                         help="Protect messages whose text matches REGEX from pruning (repeatable). Runs against every message — avoid catastrophic-backtracking regexes.")
 
     # strategy
     p_strat = sub.add_parser("strategy", help="Run single strategy")
@@ -1484,6 +1528,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_reload.add_argument("-rx", help="Prescription: gentle, standard, aggressive (default: standard)")
     p_reload.add_argument("--thinking-mode", choices=["remove", "truncate", "signature-only"])
     p_reload.add_argument("--session", help="Explicit session ID, UUID prefix, or .jsonl path (bypasses auto-detection)")
+    p_reload.add_argument("--protect-pattern", action="append", metavar="REGEX",
+                          help="Protect messages whose text matches REGEX from pruning (repeatable).")
     p_reload.add_argument(
         "--wait", nargs="?", const=30, type=int, default=None,
         metavar="SECS",
@@ -1517,6 +1563,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_guard.add_argument("--session", help="Explicit session ID or path (bypasses auto-detection)")
     p_guard.add_argument("--claude-pid", type=int, default=None, help=argparse.SUPPRESS)
     p_guard.add_argument("--system-overhead-tokens", type=int, default=None, help="Override system overhead token estimate (default: 21000). Increase for heavy configs with many rules files, MCP servers, or large CLAUDE.md")
+    p_guard.add_argument("--protect-pattern", action="append", metavar="REGEX",
+                         help="Protect messages whose text matches REGEX from pruning during auto-prunes (repeatable).")
 
     # init
     p_init = sub.add_parser("init", help="Auto-wire hooks and slash command into this project (or globally with --global)")

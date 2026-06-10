@@ -318,7 +318,122 @@ def is_protected(msg: dict) -> bool:
     # of each protected type before strategies run; strip happens after.
     if msg.get(_METADATA_SINGLETON_KEY):
         return True
+    # --protect-pattern: user-defined regex protection (#122, @eggrollofchaos).
+    # Tagged before prune by tag_pattern_matches(), stripped after in a finally.
+    if msg.get(_PATTERN_PROTECTED_KEY):
+        return True
     return False
+
+
+# ── --protect-pattern: user-defined regex prune-immunity (#122, @eggrollofchaos) ──
+# Patterns are matched against EVERY message's text on each prune, so two safeguards
+# bound the footgun: a length cap per pattern (a crude complexity bound — stdlib `re`
+# has no step limit, so a catastrophic-backtracking pattern can't be fully prevented,
+# only discouraged + documented), and a cap on the text matched per block. A pattern
+# that protects most of the session is WARNED (a too-broad pattern makes the prune a
+# no-op — the inert-guard failure cozempic exists to prevent).
+_PATTERN_PROTECTED_KEY: str = "__cozempic_pattern_protected__"
+_MAX_PROTECT_PATTERN_LEN: int = 1000
+_MAX_PROTECT_MATCH_BYTES: int = 256 * 1024
+_PROTECT_OVERMATCH_WARN_FRACTION: float = 0.8
+
+
+def compile_protect_patterns(raw_patterns: list) -> list:
+    """Compile --protect-pattern regex strings to compiled patterns. Raises
+    ValueError (with context) on an invalid, non-string, or over-long pattern."""
+    import re
+    compiled = []
+    for pat in raw_patterns or []:
+        if not isinstance(pat, str):
+            raise ValueError(f"protect-pattern must be a string, got {type(pat).__name__}")
+        if len(pat) > _MAX_PROTECT_PATTERN_LEN:
+            raise ValueError(
+                f"protect-pattern too long ({len(pat)} > {_MAX_PROTECT_PATTERN_LEN} chars)")
+        try:
+            compiled.append(re.compile(pat))
+        except re.error as e:
+            raise ValueError(f"Invalid protect-pattern regex {pat!r}: {e}") from e
+    return compiled
+
+
+def _iter_msg_texts(msg: dict):
+    """Yield every text surface of a message that a prune strategy might remove:
+    the raw string content (typed user / queue-operation messages), assistant/user
+    `text` blocks, and `tool_result` content. Scanning tool_result text is what makes
+    --protect-pattern actually protect prunable content (tool outputs are pruned;
+    assistant prose mostly isn't). Each surface is capped at _MAX_PROTECT_MATCH_BYTES."""
+    def _cap(t):
+        return t[:_MAX_PROTECT_MATCH_BYTES] if isinstance(t, str) and len(t) > _MAX_PROTECT_MATCH_BYTES else t
+
+    root = msg.get("content")
+    if isinstance(root, str):
+        yield _cap(root)
+    inner = msg.get("message") if isinstance(msg.get("message"), dict) else {}
+    content = inner.get("content")
+    if isinstance(content, str):
+        yield _cap(content)
+    elif isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            t = block.get("type")
+            if t == "text" and isinstance(block.get("text"), str):
+                yield _cap(block["text"])
+            elif t == "tool_result":
+                rc = block.get("content")
+                if isinstance(rc, str):
+                    yield _cap(rc)
+                elif isinstance(rc, list):
+                    for sub in rc:
+                        if isinstance(sub, dict) and isinstance(sub.get("text"), str):
+                            yield _cap(sub["text"])
+
+
+def _msg_text_matches_any(msg: dict, patterns: list) -> bool:
+    """True if any compiled pattern matches any text surface of the message
+    (string content, text blocks, or tool_result content — see _iter_msg_texts)."""
+    for text in _iter_msg_texts(msg):
+        if not isinstance(text, str):
+            continue
+        for p in patterns:
+            if p.search(text):
+                return True
+    return False
+
+
+def tag_pattern_matches(messages: list, patterns: list) -> int:
+    """Tag messages whose text matches any compiled pattern with the
+    pattern-protected key so is_protected() spares them. Returns the count newly
+    tagged. Warns (stderr) when a pattern protects a large fraction of the session —
+    a too-broad pattern makes the prune a no-op (the inert-guard failure)."""
+    if not patterns:
+        return 0
+    count = 0
+    total = 0
+    for _, msg_dict, _ in messages:
+        if not isinstance(msg_dict, dict):
+            continue
+        total += 1
+        if msg_dict.get(_PATTERN_PROTECTED_KEY):
+            continue
+        if _msg_text_matches_any(msg_dict, patterns):
+            msg_dict[_PATTERN_PROTECTED_KEY] = True
+            count += 1
+    if total and count >= _PROTECT_OVERMATCH_WARN_FRACTION * total:
+        import sys
+        print(f"  Cozempic: --protect-pattern matched {count}/{total} messages "
+              f"({100 * count // total}%) — pruning may free little; consider a narrower pattern.",
+              file=sys.stderr)
+    return count
+
+
+def strip_pattern_tags(messages: list) -> None:
+    """Remove the pattern-protected tag from all messages (call in a finally after a
+    prune, so the transient tag never persists into the saved session)."""
+    for item in messages:
+        msg_dict = item[1] if isinstance(item, tuple) and len(item) > 1 else item
+        if isinstance(msg_dict, dict):
+            msg_dict.pop(_PATTERN_PROTECTED_KEY, None)
 
 
 def find_active_background_tasks(messages: list) -> list[dict]:
