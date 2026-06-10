@@ -379,6 +379,8 @@ def _iter_msg_texts(msg: dict):
             t = block.get("type")
             if t == "text" and isinstance(block.get("text"), str):
                 yield _cap(block["text"])
+            elif t == "thinking" and isinstance(block.get("thinking"), str):
+                yield _cap(block["thinking"])  # thinking-blocks strategy prunes these
             elif t == "tool_result":
                 rc = block.get("content")
                 if isinstance(rc, str):
@@ -401,29 +403,96 @@ def _msg_text_matches_any(msg: dict, patterns: list) -> bool:
     return False
 
 
+class _ProtectMatchTimeout(Exception):
+    """Raised when --protect-pattern matching exceeds its wall-clock budget."""
+
+
+def _protect_match_budget() -> float:
+    """Seconds budget for a full --protect-pattern matching pass (#122 hardening).
+    stdlib `re` has no step limit, so a catastrophic-backtracking user pattern would
+    otherwise hang the prune — worst, the guard daemon which re-scans every cycle.
+    COZEMPIC_PROTECT_MATCH_SECONDS overrides; finite, clamped to [0, 60]; 0 disables."""
+    import math
+    try:
+        v = float(os.environ.get("COZEMPIC_PROTECT_MATCH_SECONDS", "2.0"))
+    except (TypeError, ValueError):
+        return 2.0
+    if not math.isfinite(v) or v < 0:
+        return 2.0
+    return min(v, 60.0)
+
+
+def _match_time_budget(seconds: float):
+    """Best-effort wall-clock budget for regex matching via SIGALRM (POSIX main
+    thread only). On Windows or a non-main thread it yields WITHOUT a timeout — the
+    pattern-length + per-surface input caps remain the only bound there (documented).
+    Returns a context manager."""
+    import signal
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _cm():
+        if seconds <= 0 or not hasattr(signal, "SIGALRM"):
+            yield
+            return
+
+        def _on_alarm(signum, frame):
+            raise _ProtectMatchTimeout()
+
+        try:
+            old = signal.signal(signal.SIGALRM, _on_alarm)
+        except (ValueError, OSError):
+            yield  # not the main thread — SIGALRM unavailable
+            return
+        try:
+            signal.setitimer(signal.ITIMER_REAL, seconds)
+            yield
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, old)
+
+    return _cm()
+
+
 def tag_pattern_matches(messages: list, patterns: list) -> int:
     """Tag messages whose text matches any compiled pattern with the
     pattern-protected key so is_protected() spares them. Returns the count newly
-    tagged. Warns (stderr) when a pattern protects a large fraction of the session —
-    a too-broad pattern makes the prune a no-op (the inert-guard failure)."""
+    tagged.
+
+    Two safeguards: a wall-clock budget around the whole scan (a runaway regex
+    fails OPEN — skip protection this cycle, never hang the daemon); and an
+    over-protection warn measured over MATCHABLE messages (those with text the
+    pattern could match), so a broad pattern that immunizes all the prunable content
+    is flagged even when unmatchable carriers/singletons dilute the total."""
     if not patterns:
         return 0
     count = 0
-    total = 0
-    for _, msg_dict, _ in messages:
-        if not isinstance(msg_dict, dict):
-            continue
-        total += 1
-        if msg_dict.get(_PATTERN_PROTECTED_KEY):
-            continue
-        if _msg_text_matches_any(msg_dict, patterns):
-            msg_dict[_PATTERN_PROTECTED_KEY] = True
-            count += 1
-    if total and count >= _PROTECT_OVERMATCH_WARN_FRACTION * total:
+    matchable = 0
+    try:
+        with _match_time_budget(_protect_match_budget()):
+            for _, msg_dict, _ in messages:
+                if not isinstance(msg_dict, dict):
+                    continue
+                texts = [t for t in _iter_msg_texts(msg_dict) if isinstance(t, str)]
+                if texts:
+                    matchable += 1
+                if msg_dict.get(_PATTERN_PROTECTED_KEY):
+                    continue
+                if any(p.search(t) for t in texts for p in patterns):
+                    msg_dict[_PATTERN_PROTECTED_KEY] = True
+                    count += 1
+    except _ProtectMatchTimeout:
         import sys
-        print(f"  Cozempic: --protect-pattern matched {count}/{total} messages "
-              f"({100 * count // total}%) — pruning may free little; consider a narrower pattern.",
-              file=sys.stderr)
+        strip_pattern_tags(messages)  # fail-open: don't leave a half-protected session
+        print("  Cozempic: --protect-pattern matching exceeded its time budget — the "
+              "pattern is too expensive; skipping pattern protection this cycle "
+              "(COZEMPIC_PROTECT_MATCH_SECONDS to tune).", file=sys.stderr)
+        return 0
+    if matchable and count >= _PROTECT_OVERMATCH_WARN_FRACTION * matchable:
+        import sys
+        print(f"  Cozempic: --protect-pattern matched {count}/{matchable} matchable "
+              f"messages ({100 * count // matchable}%) — pruning may free little; "
+              f"consider a narrower pattern.", file=sys.stderr)
     return count
 
 

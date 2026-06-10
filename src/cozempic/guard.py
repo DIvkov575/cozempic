@@ -3211,10 +3211,13 @@ def start_guard_daemon(
             cmd_parts.extend(["--session", _normalize_session_id(session_id)])
         if claude_pid is not None:
             cmd_parts.extend(["--claude-pid", str(claude_pid)])
-        # --protect-pattern (#122): serialize each user regex back to a child CLI arg
-        # (list-argv → no shell injection; the child re-compiles it).
+        # --protect-pattern (#122): serialize each user regex back to a child CLI arg.
+        # Use the `--opt=VALUE` form (not two argv elements): a pattern starting with
+        # `-` (e.g. `-rf`) is otherwise mis-parsed by the child's argparse as a flag,
+        # which exits(2) and silently kills the spawned daemon. list-argv → no shell
+        # injection; the child re-compiles the verbatim pattern.
         for _pp in (protect_patterns or []):
-            cmd_parts.extend(["--protect-pattern", getattr(_pp, "pattern", str(_pp))])
+            cmd_parts.append(f"--protect-pattern={getattr(_pp, 'pattern', str(_pp))}")
 
         # Wrap the spawn body in a graceful OSError handler so a
         # non-interactive SessionStart hook never crashes with a stack

@@ -101,7 +101,52 @@ class TestTagAndStrip(unittest.TestCase):
         buf = io.StringIO()
         with redirect_stderr(buf):
             tag_pattern_matches(msgs, compile_protect_patterns([r"GATE CONTRACT R\d+"]))
-        self.assertIn("matched 5/5", buf.getvalue())
+        self.assertIn("matched 5/5 matchable", buf.getvalue())
+
+
+class TestHardening1828(unittest.TestCase):
+    """QA-fleet-driven hardening of the extracted #122 feature."""
+
+    def _tu(self, i):
+        return {"type": "assistant", "message": {"role": "assistant",
+                "content": [{"type": "tool_use", "id": i, "name": "Bash", "input": {"command": "x"}}]}}
+
+    def test_redos_pattern_fails_open_within_budget(self):
+        # A catastrophic-backtracking pattern must NOT hang the prune/daemon — it
+        # times out and fails open (no protection this cycle), not seconds/minutes.
+        import os, time
+        os.environ["COZEMPIC_PROTECT_MATCH_SECONDS"] = "1.0"
+        try:
+            evil = compile_protect_patterns([r"(a+)+$"])
+            msgs = [(0, _txt("a" * 40 + "!"), 50)]
+            t0 = time.perf_counter()
+            buf = io.StringIO()
+            with redirect_stderr(buf):
+                n = tag_pattern_matches(msgs, evil)
+            dt = time.perf_counter() - t0
+            self.assertLess(dt, 5.0, "ReDoS pattern must be time-bounded")
+            self.assertEqual(n, 0, "must fail open (skip protection) on timeout")
+            self.assertNotIn(_PATTERN_PROTECTED_KEY, msgs[0][1], "no half-protection left behind")
+            self.assertIn("exceeded its time budget", buf.getvalue())
+        finally:
+            os.environ.pop("COZEMPIC_PROTECT_MATCH_SECONDS", None)
+
+    def test_thinking_block_is_scanned(self):
+        think = {"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "SECRET reasoning GATE CONTRACT R9", "signature": "s"},
+            {"type": "text", "text": "visible"}]}}
+        self.assertTrue(_msg_text_matches_any(think, compile_protect_patterns([r"GATE CONTRACT R\d+"])))
+
+    def test_overprotection_warn_uses_matchable_denominator(self):
+        # Mixed session: 2 matchable text msgs + 2 unmatchable tool_use carriers.
+        # A broad pattern protects all matchable content → must warn (it didn't when
+        # the denominator was ALL messages: 2/4 = 50% < 80%).
+        mixed = [(0, _txt("keep a"), 10), (1, self._tu("a"), 10),
+                 (2, _txt("keep b"), 10), (3, self._tu("b"), 10)]
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            tag_pattern_matches(mixed, compile_protect_patterns(["keep"]))
+        self.assertIn("matched 2/2 matchable", buf.getvalue())
 
     def test_already_tagged_not_recounted(self):
         msgs = [(0, _txt("GATE CONTRACT R1"), 10)]
