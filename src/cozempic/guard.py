@@ -155,7 +155,10 @@ def _hard_prune_counts_as_futile(result: dict) -> bool:
         # read-only return, matching the GAP-D byte-ratio definition of "futile").
         orig = result.get("original_bytes", 0)
         if isinstance(orig, (int, float)) and orig > 0:
-            would_free = result.get("would_free_mb", 0.0) * 1024 * 1024
+            # Coerce defensively: a malformed/None would_free_mb must never raise
+            # into the daemon's main loop (which has no broad try/except).
+            wf = result.get("would_free_mb", 0.0)
+            would_free = (wf if isinstance(wf, (int, float)) else 0.0) * 1024 * 1024
             return (would_free / orig) < _MIN_PRUNE_RATIO
         # Fallback: token projection (only present when project=True).
         proj = result.get("projected_final_tokens")

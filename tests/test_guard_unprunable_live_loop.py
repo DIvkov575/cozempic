@@ -84,6 +84,17 @@ class TestUnprunableLiveLoopF641174c(unittest.TestCase):
              "final_tokens": 776558, "projected_final_tokens": 1}
         self.assertTrue(_hard_prune_counts_as_futile(r))
 
+    def test_malformed_would_free_does_not_crash(self):
+        # A malformed/None would_free_mb with a valid original_bytes must not RAISE
+        # into the daemon loop. (Coerces to 0 free -> treated as futile, which is the
+        # safe direction: a session we can't measure as freeing bytes is unprunable.)
+        for wf in (None, "x", [], {}):
+            r = {"live_write_skipped": True, "original_bytes": 1000, "would_free_mb": wf}
+            try:
+                _hard_prune_counts_as_futile(r)  # must not raise
+            except Exception as e:
+                self.fail(f"malformed would_free_mb={wf!r} raised {e!r}")
+
 
 if __name__ == "__main__":
     unittest.main()
