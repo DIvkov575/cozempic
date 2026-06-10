@@ -946,6 +946,58 @@ def cmd_guard(args):
     )
 
 
+def cmd_guard_watchdog(args):
+    """Scan guard logs for stuck reload-loops; report, and optionally arrest them.
+
+    A process safeguard outside the daemon: an OLD or broken guard that fails to
+    self-arrest (the f641174c / PilotCC reload-loop) keeps spinning until killed.
+    This reads the guard logs and flags the loop signature. ``--fix`` SIGTERMs a
+    LIVE looping daemon (our own process — stopping a harmful loop is safe); the
+    default is report-only.
+    """
+    import signal
+    from .watchdog import scan_guard_logs
+    from .guard import _guard_tmp_root
+
+    log_dir = getattr(args, "log_dir", None) or str(_guard_tmp_root())
+    loop_trip = getattr(args, "loop_trip", None) or 20
+    hits = scan_guard_logs(log_dir, loop_trip=loop_trip)
+
+    print("\n  COZEMPIC GUARD-LOOP WATCHDOG")
+    print("  ═══════════════════════════════════════════════════════════════════")
+    print(f"  Scanned: {log_dir}")
+    if not hits:
+        print("  ✓ No stuck guard loops detected.\n")
+        return
+
+    arrested = 0
+    for h in hits:
+        live = "LIVE" if h.pid_alive else "dead/stale"
+        print(f"\n  ✗ {h.log_file.name}")
+        print(f"      pid={h.pid} ({live})")
+        print(f"      {h.report.reason}")
+        print(f"      futile={h.report.futile_cycles} total={h.report.total_prune_cycles} "
+              f"backoff_max={h.report.max_backoff_s}s exit_seen={h.report.has_exit}")
+        if getattr(args, "fix", False) and h.pid_alive and h.pid:
+            try:
+                os.kill(int(h.pid), signal.SIGTERM)
+                print(f"      → SIGTERM sent to looping daemon pid {h.pid}")
+                arrested += 1
+            except (ProcessLookupError, PermissionError, OSError) as e:
+                print(f"      ! could not signal pid {h.pid}: {e}")
+        elif h.pid_alive:
+            print(f"      → re-run with --fix to terminate this looping daemon "
+                  f"(or: kill {h.pid})")
+
+    live_hits = sum(1 for h in hits if h.pid_alive)
+    print(f"\n  {len(hits)} stuck loop(s); {live_hits} live"
+          + (f", {arrested} arrested" if arrested else "") + ".\n")
+    # Non-zero exit so a cron / CI wrapper can alert on a LIVE stuck loop that
+    # wasn't arrested.
+    if live_hits and not arrested:
+        sys.exit(3)
+
+
 def cmd_doctor(args):
     """Run health checks on Claude Code configuration and sessions."""
     STATUS_ICONS = {
@@ -1452,6 +1504,17 @@ def cmd_digest(args):
 
     elif action == "inject":
         cwd = getattr(args, "cwd", None) or os.getcwd()
+        # The SessionStart hook calls `digest inject --session "$TRANSCRIPT"`, and
+        # runs as a child of the live Claude process — the one moment we can learn
+        # CC's own active session. Record it (keyed by the live Claude PID) so the
+        # manual CLI path follows the real transcript instead of guessing from cwd.
+        _transcript = getattr(args, "session", None)
+        if _transcript and _transcript != "current":
+            try:
+                from .session import record_active_transcript
+                record_active_transcript(_transcript)
+            except Exception:
+                pass
         store = load_digest_store(cwd)
         if store.is_empty():
             print("No rules to inject.")
@@ -1481,7 +1544,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="cozempic",
         description="Context weight-loss tool for Claude Code — prune bloated JSONL conversation files",
     )
-    parser.add_argument("--version", action="version", version="%(prog)s 1.8.29")
+    parser.add_argument("--version", action="version", version="%(prog)s 1.8.30")
     parser.add_argument("--context-window", type=int, default=None, help="Override context window size in tokens (e.g. 1000000 for 1M beta)")
     parser.add_argument("--system-overhead-tokens", type=int, default=None, help="Override system overhead estimate (default: 21000). Increase for heavy rules/MCP configs.")
     sub = parser.add_subparsers(dest="command")
@@ -1577,6 +1640,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_doctor = sub.add_parser("doctor", help="Check for known Claude Code issues and fix them")
     p_doctor.add_argument("--fix", action="store_true", help="Auto-fix issues where possible")
 
+    # guard-watchdog (process safeguard: detect stuck reload-loops in guard logs)
+    p_wd = sub.add_parser("guard-watchdog",
+                          help="Scan guard logs for stuck reload-loops (report; --fix terminates them)")
+    p_wd.add_argument("--fix", action="store_true",
+                      help="SIGTERM any LIVE looping guard daemon (default: report only)")
+    p_wd.add_argument("--log-dir", help="Directory of guard logs (default: guard tmp root)")
+    p_wd.add_argument("--loop-trip", type=_positive_int, default=20,
+                      help="Futile-cycle count that flags a stuck loop (default: 20)")
+
     # formulary
     sub.add_parser("formulary", help="Show all strategies & prescriptions")
 
@@ -1608,7 +1680,7 @@ def build_parser() -> argparse.ArgumentParser:
 _SUBCOMMANDS = {
     "list", "current", "diagnose", "treat", "strategy", "reload",
     "checkpoint", "post-compact", "guard", "init", "doctor", "formulary", "completions",
-    "digest", "self-update", "remind",
+    "digest", "self-update", "remind", "guard-watchdog",
 }
 
 
@@ -1696,6 +1768,7 @@ _AUTO_INIT_SKIP_CMDS = frozenset({
     "self-update",   # internal upgrade
     "doctor",        # diagnostic-only; doctor surfaces missing init via its own check
     "nudge",         # Stop-hook protocol command; never mutate state as a side effect
+    "guard-watchdog",  # read-only log scan; never mutate project state
 })
 
 _GLOBAL_INIT_MARKER = Path.home() / ".cozempic_global_initialized"
@@ -2058,6 +2131,7 @@ def main():
         "guard": cmd_guard,
         "init": cmd_init,
         "doctor": cmd_doctor,
+        "guard-watchdog": cmd_guard_watchdog,
         "formulary": cmd_formulary,
         "completions": cmd_completions,
         "digest": cmd_digest,

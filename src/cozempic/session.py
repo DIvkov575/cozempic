@@ -309,32 +309,64 @@ def find_current_session(
     """Find the current Claude Code session using multiple strategies.
 
     Detection priority:
-    1. Process-based: lsof on parent Claude process to find session UUID
-    2. Text matching: search session files for a unique text snippet
-    3. CWD slug: match working directory against project directory names
-    4. Fallback: most recently modified session (only when strict=False)
+    1. Active transcript: the session Claude Code itself reported to the
+       SessionStart hook, keyed by the live Claude PID (authoritative — follows
+       CC's own active session, immune to cwd/project mismatch).
+    2. Process-based: lsof on parent Claude process to find session UUID
+    3. Text matching: search session files for a unique text snippet
+    4. CWD slug: match working directory against project directory names
+    5. Fallback: most recently modified session (only when strict=False)
 
-    When strict=True, Strategy 4 is disabled — callers that perform
+    When strict=True, Strategy 5 is disabled — callers that perform
     destructive writes must not proceed on an ambiguous match.
     """
     sessions = find_sessions()
     if not sessions:
         return None
 
-    # Strategy 1: Process-based detection (most reliable for active sessions)
+    # Strategy 1: Active transcript reported by Claude Code to the SessionStart
+    # hook, keyed by the live Claude PID. This is the ONLY signal that follows
+    # CC's own notion of the active session, so it must win over cwd-inference
+    # (which mis-resolved when the active session lived in a different project
+    # dir than cwd — the f464a40c wrong-session incident).
+    rec = lookup_active_transcript()
+    if rec:
+        tp = rec.get("transcript_path", "")
+        for s in sessions:
+            if str(s["path"]) == tp:
+                return s
+        # The transcript exists (lookup verified it) but wasn't enumerated by
+        # find_sessions() — e.g. a project-dir filter. Build a record from it so
+        # we still follow CC's active session rather than guessing from cwd.
+        p = Path(tp)
+        if p.exists():
+            try:
+                st = p.stat()
+                return {
+                    "path": p,
+                    "project": p.parent.name,
+                    "session_id": p.stem,
+                    "size": st.st_size,
+                    "mtime": datetime.fromtimestamp(st.st_mtime),
+                    "lines": sum(1 for _ in open(p, "r", encoding="utf-8")),
+                }
+            except OSError:
+                pass
+
+    # Strategy 2: Process-based detection (open .claude/tasks/ dirs)
     proc_session_id = _session_id_from_process()
     if proc_session_id:
         for s in sessions:
             if s["session_id"] == proc_session_id:
                 return s
 
-    # Strategy 2: Text matching (for multi-session disambiguation)
+    # Strategy 3: Text matching (for multi-session disambiguation)
     if match_text:
         matched = _match_session_by_text(sessions, match_text)
         if matched:
             return matched
 
-    # Strategy 3: CWD slug match — exact, not substring.
+    # Strategy 4: CWD slug match — exact, not substring.
     # Substring caused prefix collisions: '-Users-x-foo' IN '-Users-x-foobar'.
     # Worktrees get their own project dir so exact-match is always correct.
     slug = cwd_to_project_slug(cwd)
@@ -342,7 +374,7 @@ def find_current_session(
     if matching:
         return max(matching, key=lambda s: s["mtime"])
 
-    # Strategy 4: Fallback to most recently modified
+    # Strategy 5: Fallback to most recently modified
     # Disabled in strict mode — refuse to guess on destructive paths.
     if strict:
         return None
@@ -487,6 +519,117 @@ def get_session_nudge_tiers(session_id: str) -> "list | None":
         except (TypeError, ValueError):
             return None
     return None
+
+
+# ─── Active-transcript store (follows Claude Code's own session) ──────────────
+#
+# The MANUAL CLI path (`cozempic current`, `/cozempic reload`) cannot ask Claude
+# Code which session is live, so it historically inferred it from cwd → project
+# slug → most-recent file. That picks the WRONG session whenever the active
+# session lives in a different project dir than cwd (the f464a40c incident:
+# active under -Users-ruya, cwd mapped to the Cozempic dir whose most-recent
+# session was a stale one).
+#
+# Claude Code DOES know the active session: it hands the SessionStart hook a
+# `transcript_path`. We record that path keyed by the LIVE Claude PID — one
+# claude process == exactly one session, which disambiguates precisely where cwd
+# cannot. `find_current_session` consults this FIRST. The record self-expires:
+# dead PIDs are pruned on every write, and a vanished transcript falls through.
+
+_ACTIVE_SESSIONS_FILENAME = "cozempic-active-sessions.json"
+_ACTIVE_SESSIONS_MAX = 64
+
+
+def _active_sessions_path() -> Path:
+    return get_claude_dir() / _ACTIVE_SESSIONS_FILENAME
+
+
+def _pid_alive(pid: int) -> bool:
+    """True if `pid` is a live process. Signal 0 probes without delivering."""
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (ProcessLookupError, OverflowError, ValueError):
+        return False
+    except PermissionError:
+        # Exists but owned by another user — still alive.
+        return True
+    except OSError:
+        return False
+
+
+def record_active_transcript(transcript_path: str, claude_pid: int | None = None) -> None:
+    """Record the active session's transcript keyed by the live Claude PID.
+
+    Called from the SessionStart hook path (which receives `transcript_path` and
+    runs as a child of the live claude process). Best-effort: never raises into
+    the hook. Dead PIDs are pruned on write so the store stays small and honest.
+    """
+    try:
+        if not transcript_path:
+            return
+        tp = Path(transcript_path)
+        if not tp.exists() or tp.suffix != ".jsonl":
+            return
+        if claude_pid is None:
+            claude_pid = find_claude_pid()
+        if not claude_pid:
+            return
+        from .helpers import _HostFileLock
+        with _HostFileLock(_active_sessions_path()):
+            try:
+                raw = _active_sessions_path().read_text(encoding="utf-8")
+                data = json.loads(raw)
+                if not isinstance(data, dict):
+                    data = {}
+            except (OSError, ValueError):
+                data = {}
+            # Prune dead pids and the entry we're about to overwrite.
+            data = {k: v for k, v in data.items()
+                    if k != str(claude_pid) and _pid_alive(k)}
+            data[str(claude_pid)] = {
+                "transcript_path": str(tp),
+                "session_id": tp.stem,
+                "recorded_at": datetime.now().isoformat(timespec="seconds"),
+            }
+            if len(data) > _ACTIVE_SESSIONS_MAX:
+                by_age = sorted(data, key=lambda k: data[k].get("recorded_at", ""), reverse=True)
+                data = {k: data[k] for k in by_age[:_ACTIVE_SESSIONS_MAX]}
+            from .helpers import atomic_write_text
+            atomic_write_text(_active_sessions_path(), json.dumps(data, indent=2))
+    except Exception:
+        # The hook must never fail because we couldn't record the active session.
+        pass
+
+
+def lookup_active_transcript(claude_pid: int | None = None) -> dict | None:
+    """Return the active-transcript record for a live Claude PID, or None.
+
+    Honours staleness: a record whose PID is dead, or whose transcript file no
+    longer exists, returns None so the caller falls through to other strategies.
+    """
+    try:
+        if claude_pid is None:
+            claude_pid = find_claude_pid()
+        if not claude_pid:
+            return None
+        try:
+            data = json.loads(_active_sessions_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        rec = data.get(str(claude_pid))
+        if not isinstance(rec, dict):
+            return None
+        if not _pid_alive(claude_pid):
+            return None
+        tp = rec.get("transcript_path", "")
+        if not tp or not Path(tp).exists():
+            return None
+        return rec
+    except Exception:
+        return None
 
 
 def get_session_cwd(session_id: str) -> str | None:

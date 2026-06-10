@@ -1,0 +1,53 @@
+--- Guard daemon started at 2026-06-02T15:11:57.973113 ---
+CWD: /Users/ruya/Documents/Advisor/Cozempic
+CMD: /opt/homebrew/Cellar/cozempic/1.8.14/libexec/bin/python -m cozempic.cli guard --cwd /Users/ruya/Documents/Advisor/Cozempic --threshold 50.0 --interval 30 -rx standard --session f641174c-d784-4aab-8c50-18ab9cd17f94
+
+
+  4-tier guard protecting context (1.0M window):
+    Soft  (25%): read-only checkpoint, no live-file write (#106)
+    Hard1 (55%): standard prune + reload (terminate-first)
+    Hard2 (80%): aggressive prune + reload (emergency)
+    User  (90%): manual aggressive (cozempic treat -rx aggressive --execute)
+
+  [15:12:28] HARD THRESHOLD (55%): 776,558 tokens >= 550,000 (55%)
+  Standard prune + reload (cycle #1)...
+  Pruned: 0 tokens freed (0.0%), 0.0MB saved
+
+  [15:12:58] HARD THRESHOLD (55%): 776,558 tokens >= 550,000 (55%)
+  Standard prune + reload (cycle #2)...
+  Pruned: 0 tokens freed (0.0%), 0.0MB saved
+
+  [15:13:28] HARD THRESHOLD (55%): 776,558 tokens >= 550,000 (55%)
+  Standard prune + reload (cycle #3)...
+  Pruned: 0 tokens freed (0.0%), 0.0MB saved
+  [15:13:28] Hard prune freed 0 bytes 3x — entering exponential back-off (next sleep: 60s, cap 300s, exit after 10 cycles).
+
+  [15:14:58] HARD THRESHOLD (55%): 776,558 tokens >= 550,000 (55%)
+  Standard prune + reload (cycle #4)...
+  Pruned: 0 tokens freed (0.0%), 0.0MB saved
+
+  [15:17:28] HARD THRESHOLD (55%): 776,558 tokens >= 550,000 (55%)
+  Standard prune + reload (cycle #5)...
+  Pruned: 0 tokens freed (0.0%), 0.0MB saved
+
+  [15:21:58] HARD THRESHOLD (55%): 776,558 tokens >= 550,000 (55%)
+  Standard prune + reload (cycle #6)...
+  Pruned: 0 tokens freed (0.0%), 0.0MB saved
+
+  [15:27:28] HARD THRESHOLD (55%): 776,558 tokens >= 550,000 (55%)
+  Standard prune + reload (cycle #7)...
+  Pruned: 0 tokens freed (0.0%), 0.0MB saved
+
+  [15:32:58] HARD THRESHOLD (55%): 776,558 tokens >= 550,000 (55%)
+  Standard prune + reload (cycle #8)...
+  Pruned: 0 tokens freed (0.0%), 0.0MB saved
+
+  [15:38:28] HARD THRESHOLD (55%): 776,558 tokens >= 550,000 (55%)
+  Standard prune + reload (cycle #9)...
+  Pruned: 0 tokens freed (0.0%), 0.0MB saved
+
+  [15:43:58] HARD THRESHOLD (55%): 776,558 tokens >= 550,000 (55%)
+  Standard prune + reload (cycle #10)...
+  Pruned: 0 tokens freed (0.0%), 0.0MB saved
+  [15:43:58] Guard powerless against live-context dominance (10 consecutive 0-byte HARD prunes). Exiting — NO further guard protection in this session. SessionStart fires only on startup/resume/clear, NOT on tool calls or message turns, so the daemon will NOT auto-respawn while the session continues. To re-enable cozempic: type /clear or restart the session. Recommended: split work across fresh sessions to avoid >55% context dominance by immutable tool-result blocks.
+
