@@ -32,24 +32,29 @@ Cozempic removes it with **18 composable strategies** across 3 prescription tier
 
 ## Install
 
-Pick your package manager:
+Pick your package manager. `uvx`/`pipx`/`npm`/`pip` are the lowest-friction (no Homebrew trust prompt — see the note below):
 
 ```bash
+# uv / uvx — no install needed, run on demand (recommended)
+uvx cozempic --help
+
+# pipx — isolated user install, always on PATH
+pipx install cozempic
+
+# npm — global install
+npm install -g cozempic
+
 # pip (Python ≥ 3.10)
 pip install cozempic
 
-# pipx — isolated user install, always available on PATH
-pipx install cozempic
-
-# uv / uvx — no install needed, run on demand
-uvx cozempic --help
-
-# Homebrew (macOS / Linux)
+# Homebrew (macOS / Linux) — use the fully-qualified name (see note below)
 brew install Ruya-AI/cozempic/cozempic
 
 # Nix flake
 nix profile install github:Ruya-AI/cozempic?dir=packaging/nix
 ```
+
+> **Homebrew tap trust:** recent Homebrew versions gate non-official taps behind an explicit trust step. The **fully-qualified** `brew install Ruya-AI/cozempic/cozempic` above trusts just this formula inline — no extra command. A bare `brew install cozempic` / `brew upgrade cozempic` will instead error with *"Refusing to load formula … from untrusted tap"*; if you hit that, run `brew trust Ruya-AI/cozempic` once (or just prefer one of the install methods above, none of which have this gate).
 
 AUR (`yay -S cozempic`) and MacPorts (`port install py-cozempic`) submissions are in progress — see [`packaging/README.md`](packaging/README.md) for status and PKGBUILD/Portfile sources.
 

@@ -81,7 +81,11 @@ def _install_method() -> str:
 def _upgrade_hint(method: str | None = None) -> str:
     """The correct manual upgrade command for the detected install method."""
     return {
-        "brew": "brew upgrade cozempic",
+        # Fully-qualified so it doesn't trip Homebrew's untrusted-tap gate on
+        # upgrade (a bare `brew upgrade cozempic` must load the whole non-official
+        # tap → "Refusing to load formula … from untrusted tap"); the qualified
+        # name trusts just this formula inline.
+        "brew": "brew upgrade Ruya-AI/cozempic/cozempic",
         "uv-tool": "uv tool upgrade cozempic",
         "pipx": "pipx upgrade cozempic",
     }.get(method or _install_method(), "pip install --upgrade cozempic")

@@ -198,5 +198,6 @@ class TestMaybeAutoUpdateBrew(unittest.TestCase):
             updater.maybe_auto_update()
             up.assert_not_called()
         out = buf.getvalue()
-        self.assertIn("brew upgrade cozempic", out)
+        # Fully-qualified so brew's untrusted-tap gate doesn't block the upgrade.
+        self.assertIn("brew upgrade Ruya-AI/cozempic/cozempic", out)
         self.assertNotIn("updating", out.lower())
