@@ -3,11 +3,12 @@ class Cozempic < Formula
 
   desc "Context cleaning CLI for Claude Code — prune bloat, protect agent teams"
   homepage "https://github.com/Ruya-AI/cozempic"
-  url "https://files.pythonhosted.org/packages/2e/a7/706f73d06da6ee719e38e70a4e9d933808c8e6b479a07c257a7c5a25f3b6/cozempic-1.8.19.tar.gz"
-  sha256 "14ff2a96256a57b457bdca9f4191bcbbbb715e34b638033ac3a98ffc0e0ebc47"
+  url "https://files.pythonhosted.org/packages/54/0a/dc68db45566f061dbd8a3e77f7b9214017d4f1ab82254d27c23f11086b2b/cozempic-1.8.30.tar.gz"
+  sha256 "6d9adea9e98f020ba01b82dbd2cdc94d1763456816afb6ba4530dc139038be5d"
   license "MIT"
 
   depends_on "python@3.12"
+  depends_on "uv" # MCP server launches via `uv run` (#120)
 
   def install
     virtualenv_install_with_resources
