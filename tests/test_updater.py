@@ -184,6 +184,86 @@ class TestDoUpgradeDispatch(unittest.TestCase):
             self.assertIn("install", run.call_args[0][0])
 
 
+class TestAutoUpdateOptOuts(unittest.TestCase):
+    """#123: the documented kill switch must actually stop the Python updater,
+    and COZEMPIC_PIN holds a reviewed version without auto-installing it."""
+
+    def setUp(self):
+        for k in ("COZEMPIC_NO_AUTO_UPDATE", "COZEMPIC_PIN"):
+            os.environ.pop(k, None)
+
+    def tearDown(self):
+        for k in ("COZEMPIC_NO_AUTO_UPDATE", "COZEMPIC_PIN"):
+            os.environ.pop(k, None)
+
+    def test_no_auto_update_skips_everything(self):
+        from cozempic import updater
+        os.environ["COZEMPIC_NO_AUTO_UPDATE"] = "1"
+        with patch("cozempic.updater._should_check") as sc, \
+             patch("cozempic.updater._do_upgrade") as up:
+            updater.maybe_auto_update(force=True)
+            sc.assert_not_called()   # returns before even checking
+            up.assert_not_called()
+
+    def test_pin_disables_autoupdate(self):
+        from cozempic import updater
+        os.environ["COZEMPIC_PIN"] = updater.__version__  # pinned to current
+        with patch("cozempic.updater._get_latest_version", return_value="99.0.0"), \
+             patch("cozempic.updater._do_upgrade") as up, \
+             patch("cozempic.updater._should_check", return_value=True):
+            updater.maybe_auto_update(force=True)
+            up.assert_not_called()   # never upgrades while pinned
+
+    def test_pin_warns_on_drift(self):
+        import io
+        from cozempic import updater
+        os.environ["COZEMPIC_PIN"] = "1.0.0"  # != current installed version
+        buf = io.StringIO()
+        with patch("sys.stdout", buf), \
+             patch("cozempic.updater._should_check", return_value=True), \
+             patch("cozempic.updater._mark_checked"), \
+             patch("cozempic.updater._do_upgrade") as up:
+            updater.maybe_auto_update(force=True)
+            up.assert_not_called()
+        out = buf.getvalue()
+        self.assertIn("pinned to 1.0.0", out)
+        self.assertIn("pip install 'cozempic==1.0.0'", out)
+
+    def test_pin_matching_current_is_silent(self):
+        import io
+        from cozempic import updater
+        os.environ["COZEMPIC_PIN"] = updater.__version__
+        buf = io.StringIO()
+        with patch("sys.stdout", buf), \
+             patch("cozempic.updater._should_check", return_value=True), \
+             patch("cozempic.updater._do_upgrade"):
+            updater.maybe_auto_update(force=True)
+        self.assertEqual(buf.getvalue(), "", "no drift warning when pin == current")
+
+    def test_pinned_version_helper(self):
+        from cozempic import updater
+        self.assertIsNone(updater._pinned_version())
+        os.environ["COZEMPIC_PIN"] = " 1.8.30 "
+        self.assertEqual(updater._pinned_version(), "1.8.30")  # trimmed
+
+
+class TestHookHonorsOptOuts(unittest.TestCase):
+    """#123 Defect 1: the SessionStart hook's shell upgrade must be gated on the
+    SAME env vars the README advertises, not bypass them."""
+
+    def test_sessionstart_upgrade_is_guarded(self):
+        import json
+        from pathlib import Path
+        import cozempic
+        hooks = json.loads((Path(cozempic.__file__).parent / "data" / "hooks.json").read_text())
+        cmd = hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+        # The pip --upgrade must be inside a guard that checks both opt-outs.
+        guard = 'if [ -z "$COZEMPIC_NO_AUTO_UPDATE" ] && [ -z "$COZEMPIC_PIN" ]; then'
+        self.assertIn(guard, cmd)
+        # And the guard must come BEFORE the upgrade in the command string.
+        self.assertLess(cmd.index(guard), cmd.index("pip install --upgrade cozempic"))
+
+
 class TestMaybeAutoUpdateBrew(unittest.TestCase):
     def test_brew_prints_hint_and_does_not_attempt(self):
         import io

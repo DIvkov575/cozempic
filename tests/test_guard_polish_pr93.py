@@ -558,8 +558,10 @@ class TestPolishPR93_HookSchemaV9(unittest.TestCase):
 
     def test_hook_schema_version_v9(self):
         from cozempic.init import HOOK_SCHEMA_VERSION
-        self.assertIn(
-            HOOK_SCHEMA_VERSION, ("v9", "v10", "v12"),
+        # Durable floor check (was a hardcoded allow-list that broke on every bump).
+        self.assertEqual(HOOK_SCHEMA_VERSION[0], "v"[0])
+        self.assertGreaterEqual(
+            int(HOOK_SCHEMA_VERSION.lstrip("v")), 9,
             "HOOK_SCHEMA_VERSION must be v9 or higher (PR #93 head -1 change, PR #94 Phase B bump, #109 NO_AUTO_INIT)",
         )
 
@@ -598,9 +600,11 @@ class TestPolishPR93_HookSchemaV9(unittest.TestCase):
             hooks_path = Path(__file__).parent.parent / hooks_rel
             with self.subTest(path=hooks_rel):
                 body = hooks_path.read_text()
-                self.assertTrue(
-                    "cozempic-hook-schema=v9" in body or "cozempic-hook-schema=v10" in body or "cozempic-hook-schema=v12" in body,
-                    f"{hooks_rel}: schema marker must be v9 or higher",
+                from cozempic.init import HOOK_SCHEMA_MARKER
+                # Track the current marker (was a hardcoded version list).
+                self.assertIn(
+                    HOOK_SCHEMA_MARKER, body,
+                    f"{hooks_rel}: must carry the current schema marker {HOOK_SCHEMA_MARKER}",
                 )
                 self.assertNotIn(
                     "cozempic-hook-schema=v8",

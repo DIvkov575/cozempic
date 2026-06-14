@@ -192,6 +192,18 @@ def ping_install_if_new() -> None:
         pass
 
 
+def _pinned_version() -> str | None:
+    """The version the user has pinned via COZEMPIC_PIN, or None.
+
+    A pin means "hold the version I reviewed" — auto-update is disabled while it
+    is set. We deliberately do NOT auto-install the pinned version (that would be
+    the very auto-ingress a security-conscious pinner is opting out of); instead
+    the caller warns on drift so the human reconciles it.
+    """
+    pin = os.environ.get("COZEMPIC_PIN", "").strip()
+    return pin or None
+
+
 def maybe_auto_update(force: bool = False, silent: bool = False) -> None:
     """Check PyPI and auto-update cozempic if a newer version is available.
 
@@ -201,9 +213,21 @@ def maybe_auto_update(force: bool = False, silent: bool = False) -> None:
         force: Bypass the TTY check (for guard daemon and MCP server startup).
         silent: Suppress all output (required for MCP context where stdout is the protocol stream).
 
-    Set COZEMPIC_NO_AUTO_UPDATE=1 to disable all automatic upgrade behaviour.
+    Opt-outs (both honored here AND by the SessionStart hook's shell upgrade):
+        COZEMPIC_NO_AUTO_UPDATE=1  — disable all automatic upgrade behaviour.
+        COZEMPIC_PIN=X.Y.Z         — hold a reviewed version; auto-update off,
+                                     warn (once/24h) if the running version drifts.
     """
     if os.environ.get("COZEMPIC_NO_AUTO_UPDATE"):
+        return
+    pin = _pinned_version()
+    if pin:
+        # Held at a reviewed version — never auto-upgrade. Surface drift (throttled
+        # via the same 24h gate) so the user can reconcile manually; no auto-install.
+        if pin != __version__ and not silent and _should_check():
+            _mark_checked()
+            print(f"  Cozempic: pinned to {pin} but running {__version__} — "
+                  f"reconcile with: pip install 'cozempic=={pin}'", flush=True)
         return
     # Removed TTY check — auto-update should work from hooks, daemons, and CLI.
     # The 24h throttle and silent mode are sufficient controls.
