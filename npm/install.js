@@ -7,14 +7,24 @@ const { join } = require("path");
 const os = require("os");
 
 // ── 1. Install or upgrade Python package ─────────────────────────────────────
-// Always try to upgrade — ensures users on old versions get the latest.
+// Honors the SAME documented opt-outs as the SessionStart hook + Python updater
+// (#123): a static `pip install --upgrade` here would otherwise bypass them.
+//   COZEMPIC_PIN=X.Y.Z      → install exactly that reviewed version, never --upgrade
+//   COZEMPIC_NO_AUTO_UPDATE → install without --upgrade (don't move an existing install)
+const noAutoUpdate = process.env.COZEMPIC_NO_AUTO_UPDATE;
+const pinRaw = process.env.COZEMPIC_PIN;
+// Only accept a version-shaped pin as a pip spec (no spaces/flags → no arg injection).
+const pin = pinRaw && /^v?[0-9][A-Za-z0-9.+!-]*$/.test(pinRaw.trim()) ? pinRaw.trim().replace(/^v/, "") : null;
+
+const spec = pin ? `cozempic==${pin}` : "cozempic";
+const up = pin || noAutoUpdate ? [] : ["--upgrade"];
 
 const attempts = [
-  ["uv", ["pip", "install", "--upgrade", "cozempic", "--quiet"]],
-  ["pip", ["install", "--upgrade", "cozempic", "--quiet", "--disable-pip-version-check"]],
-  ["pip3", ["install", "--upgrade", "cozempic", "--quiet", "--disable-pip-version-check"]],
-  ["python3", ["-m", "pip", "install", "--upgrade", "cozempic", "--quiet"]],
-  ["python", ["-m", "pip", "install", "--upgrade", "cozempic", "--quiet"]],
+  ["uv", ["pip", "install", ...up, spec, "--quiet"]],
+  ["pip", ["install", ...up, spec, "--quiet", "--disable-pip-version-check"]],
+  ["pip3", ["install", ...up, spec, "--quiet", "--disable-pip-version-check"]],
+  ["python3", ["-m", "pip", "install", ...up, spec, "--quiet"]],
+  ["python", ["-m", "pip", "install", ...up, spec, "--quiet"]],
 ];
 
 let installed = false;
@@ -38,8 +48,6 @@ try {
 } catch {}
 
 // ── 2. Wire global SessionStart hook in ~/.claude/settings.json ──────────────
-
-const noAutoUpdate = process.env.COZEMPIC_NO_AUTO_UPDATE;
 
 if (!noAutoUpdate) {
   const claudeDir = join(os.homedir(), ".claude");

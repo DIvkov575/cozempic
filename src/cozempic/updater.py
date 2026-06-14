@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -192,6 +193,12 @@ def ping_install_if_new() -> None:
         pass
 
 
+# Rough PEP 440 shape (dependency-free): leading-v optional, dotted release, opt
+# pre/post/dev suffix. Used only to decide whether to emit a copy-pasteable
+# reconcile command — never to validate (a non-matching pin still disables update).
+_VERSION_SHAPE = re.compile(r"^v?\d+(?:\.\d+)*(?:[._-]?(?:a|b|c|rc|alpha|beta|post|dev)\d*)?$", re.I)
+
+
 def _pinned_version() -> str | None:
     """The version the user has pinned via COZEMPIC_PIN, or None.
 
@@ -199,9 +206,17 @@ def _pinned_version() -> str | None:
     is set. We deliberately do NOT auto-install the pinned version (that would be
     the very auto-ingress a security-conscious pinner is opting out of); instead
     the caller warns on drift so the human reconciles it.
+
+    "Set but non-empty" is the pin test — IDENTICAL to the SessionStart hook's
+    ``[ -z "$COZEMPIC_PIN" ]`` (which sees the raw value), so a whitespace-only
+    pin disables auto-update on BOTH paths rather than diverging (#123 QA P3).
     """
-    pin = os.environ.get("COZEMPIC_PIN", "").strip()
-    return pin or None
+    raw = os.environ.get("COZEMPIC_PIN", "")
+    if not raw:
+        return None
+    # Any non-empty value is a pin; prefer the trimmed form for display but keep
+    # the raw value truthy if it is whitespace-only (so we still count as pinned).
+    return raw.strip() or raw
 
 
 def maybe_auto_update(force: bool = False, silent: bool = False) -> None:
@@ -224,10 +239,14 @@ def maybe_auto_update(force: bool = False, silent: bool = False) -> None:
     if pin:
         # Held at a reviewed version — never auto-upgrade. Surface drift (throttled
         # via the same 24h gate) so the user can reconcile manually; no auto-install.
-        if pin != __version__ and not silent and _should_check():
+        # Normalize a leading 'v' so e.g. COZEMPIC_PIN=v1.8.32 doesn't false-warn
+        # against 1.8.32, and only emit a reconcile COMMAND for a version-shaped pin
+        # so we never print an un-runnable `pip install 'cozempic==garbage'` (QA P3).
+        norm = pin.strip().lstrip("vV")
+        if norm != __version__ and not silent and _should_check() and _VERSION_SHAPE.match(pin.strip()):
             _mark_checked()
-            print(f"  Cozempic: pinned to {pin} but running {__version__} — "
-                  f"reconcile with: pip install 'cozempic=={pin}'", flush=True)
+            print(f"  Cozempic: pinned to {norm} but running {__version__} — "
+                  f"reconcile with: pip install 'cozempic=={norm}'", flush=True)
         return
     # Removed TTY check — auto-update should work from hooks, daemons, and CLI.
     # The 24h throttle and silent mode are sufficient controls.

@@ -49,7 +49,27 @@ class TestShouldCheck(unittest.TestCase):
                 self.assertTrue(_should_check())
 
 
-class TestMaybeAutoUpdate(unittest.TestCase):
+class _EnvIsolated(unittest.TestCase):
+    """Save → clear → restore the auto-update opt-out env vars around each test.
+
+    A maintainer who PINS carries COZEMPIC_PIN in their shell (the feature's own
+    target audience), so any test touching maybe_auto_update must neutralize these
+    or it fails order-dependently. We save-and-restore (not pop) so a pre-existing
+    ambient value survives the run (#123 QA P3 — was a destructive pop)."""
+
+    _OPT_VARS = ("COZEMPIC_NO_AUTO_UPDATE", "COZEMPIC_PIN")
+
+    def setUp(self):
+        self._saved_env = {k: os.environ.pop(k, None) for k in self._OPT_VARS}
+
+    def tearDown(self):
+        for k in self._OPT_VARS:
+            os.environ.pop(k, None)
+            if self._saved_env.get(k) is not None:
+                os.environ[k] = self._saved_env[k]
+
+
+class TestMaybeAutoUpdate(_EnvIsolated):
     def test_skips_when_env_var_set(self):
         """COZEMPIC_NO_AUTO_UPDATE=1 disables all update activity."""
         with patch.dict(os.environ, {"COZEMPIC_NO_AUTO_UPDATE": "1"}):
@@ -184,17 +204,9 @@ class TestDoUpgradeDispatch(unittest.TestCase):
             self.assertIn("install", run.call_args[0][0])
 
 
-class TestAutoUpdateOptOuts(unittest.TestCase):
+class TestAutoUpdateOptOuts(_EnvIsolated):
     """#123: the documented kill switch must actually stop the Python updater,
     and COZEMPIC_PIN holds a reviewed version without auto-installing it."""
-
-    def setUp(self):
-        for k in ("COZEMPIC_NO_AUTO_UPDATE", "COZEMPIC_PIN"):
-            os.environ.pop(k, None)
-
-    def tearDown(self):
-        for k in ("COZEMPIC_NO_AUTO_UPDATE", "COZEMPIC_PIN"):
-            os.environ.pop(k, None)
 
     def test_no_auto_update_skips_everything(self):
         from cozempic import updater
@@ -246,6 +258,45 @@ class TestAutoUpdateOptOuts(unittest.TestCase):
         os.environ["COZEMPIC_PIN"] = " 1.8.30 "
         self.assertEqual(updater._pinned_version(), "1.8.30")  # trimmed
 
+    def test_whitespace_pin_disables_update_matching_shell(self):
+        # #123 QA P3: a whitespace-only pin must be PINNED (auto-update OFF), the
+        # same as the hook's `[ -z "$COZEMPIC_PIN" ]` (non-empty → skip upgrade),
+        # not fall through to auto-update as the old .strip()->None did.
+        from cozempic import updater
+        os.environ["COZEMPIC_PIN"] = "   "
+        self.assertTrue(updater._pinned_version())  # truthy → counts as pinned
+        with patch("cozempic.updater._should_check", return_value=True), \
+             patch("cozempic.updater._do_upgrade") as up:
+            updater.maybe_auto_update(force=True)
+            up.assert_not_called()
+
+    def test_v_prefix_pin_does_not_false_warn(self):
+        # #123 QA P3: COZEMPIC_PIN=v<current> must not warn against <current>.
+        import io
+        from cozempic import updater
+        os.environ["COZEMPIC_PIN"] = "v" + updater.__version__
+        buf = io.StringIO()
+        with patch("sys.stdout", buf), \
+             patch("cozempic.updater._should_check", return_value=True), \
+             patch("cozempic.updater._do_upgrade"):
+            updater.maybe_auto_update(force=True)
+        self.assertEqual(buf.getvalue(), "", "leading-v pin equal to current must be silent")
+
+    def test_garbage_pin_emits_no_unrunnable_command(self):
+        # #123 QA P3: a non-version pin still disables update but must NOT print a
+        # copy-paste `pip install 'cozempic==garbage'` that errors.
+        import io
+        from cozempic import updater
+        os.environ["COZEMPIC_PIN"] = "garbage"
+        buf = io.StringIO()
+        with patch("sys.stdout", buf), \
+             patch("cozempic.updater._should_check", return_value=True), \
+             patch("cozempic.updater._mark_checked"), \
+             patch("cozempic.updater._do_upgrade") as up:
+            updater.maybe_auto_update(force=True)
+            up.assert_not_called()       # still pinned → no upgrade
+        self.assertNotIn("pip install", buf.getvalue())  # but no broken command
+
 
 class TestHookHonorsOptOuts(unittest.TestCase):
     """#123 Defect 1: the SessionStart hook's shell upgrade must be gated on the
@@ -263,8 +314,33 @@ class TestHookHonorsOptOuts(unittest.TestCase):
         # And the guard must come BEFORE the upgrade in the command string.
         self.assertLess(cmd.index(guard), cmd.index("pip install --upgrade cozempic"))
 
+    def test_mcp_json_has_no_unconditional_upgrade(self):
+        # #123 QA P1: `uv run --upgrade` in .mcp.json upgrades at the uv layer
+        # before the (opt-out-aware) Python updater runs — it must be removed.
+        import json
+        from pathlib import Path
+        root = Path(__file__).parent.parent
+        for rel in (".mcp.json", "plugin/.mcp.json"):
+            p = root / rel
+            if not p.exists():
+                continue
+            args = json.loads(p.read_text())["mcpServers"]["cozempic"]["args"]
+            self.assertNotIn("--upgrade", args,
+                             f"{rel}: `uv run --upgrade` bypasses the opt-outs (#123)")
 
-class TestMaybeAutoUpdateBrew(unittest.TestCase):
+    def test_npm_install_gates_upgrade_on_optouts(self):
+        # #123 QA P1: npm/install.js must read BOTH opt-outs and not carry a
+        # static unconditional `--upgrade` token in the attempts array.
+        from pathlib import Path
+        src = (Path(__file__).parent.parent / "npm" / "install.js").read_text()
+        self.assertIn("COZEMPIC_NO_AUTO_UPDATE", src)
+        self.assertIn("COZEMPIC_PIN", src)
+        # The hardcoded `"--upgrade", "cozempic"` literal must be gone (now conditional).
+        self.assertNotIn('"--upgrade", "cozempic"', src,
+                         "install.js must not hardcode --upgrade (gate it on the opt-outs)")
+
+
+class TestMaybeAutoUpdateBrew(_EnvIsolated):
     def test_brew_prints_hint_and_does_not_attempt(self):
         import io
         from cozempic import updater

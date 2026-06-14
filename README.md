@@ -1,6 +1,6 @@
 # Cozempic
 
-![Downloads](https://img.shields.io/badge/downloads-69k%2B-brightgreen) ![Version](https://img.shields.io/badge/version-1.8.31-blue) ![License](https://img.shields.io/badge/license-MIT-lightgrey)
+![Downloads](https://img.shields.io/badge/downloads-69k%2B-brightgreen) ![Version](https://img.shields.io/badge/version-1.8.32-blue) ![License](https://img.shields.io/badge/license-MIT-lightgrey)
 
 **50,000+ power users** trust Cozempic to keep their Claude Code sessions lean.
 
@@ -70,7 +70,7 @@ Cozempic auto-updates from PyPI by default, **on purpose**: Claude Code ships fr
 | Stop all auto-updates, keep hooks + guard running | `export COZEMPIC_NO_AUTO_UPDATE=1` |
 | No global hooks / no daemon at all (manual CLI only) | `export COZEMPIC_NO_GLOBAL_INIT=1` |
 
-Both `COZEMPIC_NO_AUTO_UPDATE` and `COZEMPIC_PIN` are honored by **both** update paths — the Python updater *and* the SessionStart hook's shell upgrade. `COZEMPIC_PIN` disables auto-update and warns (not auto-installs) if your running version drifts from the pin, so you stay on a version you've reviewed with a human in the loop. (Releases are published from CI via PyPI [Trusted Publishing](https://docs.pypi.org/trusted-publishers/) — no long-lived upload token — to reduce the chance of a compromised publish in the first place.)
+Both `COZEMPIC_NO_AUTO_UPDATE` and `COZEMPIC_PIN` are honored by **every** update path — the Python updater, the SessionStart hook's shell upgrade, the MCP server launcher, and the npm installer. `COZEMPIC_PIN` disables auto-update and warns (not auto-installs) if your running version drifts from the pin, so you stay on a version you've reviewed with a human in the loop. (Releases are published from CI via PyPI [Trusted Publishing](https://docs.pypi.org/trusted-publishers/) — no long-lived upload token — to reduce the chance of a compromised publish in the first place.)
 
 ### As a Claude Code Plugin
 
@@ -353,7 +353,7 @@ After `cozempic init`, these hooks are wired automatically:
 | Variable | Default | Effect |
 |----------|---------|--------|
 | `COZEMPIC_CONTEXT_WINDOW` | auto-detect | Override context window size (e.g. `200000` for Pro plan) |
-| `COZEMPIC_NO_AUTO_UPDATE` | off | Disable all automatic upgrades (honored by **both** the Python updater and the SessionStart hook). Not generally recommended — Claude Code ships frequent changes and cozempic updates keep strategies compatible with the latest session format. See [Auto-update & how to control it](#auto-update--how-to-control-it). |
+| `COZEMPIC_NO_AUTO_UPDATE` | off | Disable all automatic upgrades (honored by **every** update path: Python updater, SessionStart hook, MCP launcher, npm installer). Not generally recommended — Claude Code ships frequent changes and cozempic updates keep strategies compatible with the latest session format. See [Auto-update & how to control it](#auto-update--how-to-control-it). |
 | `COZEMPIC_PIN` | unset | Hold a reviewed version (e.g. `1.8.30`): disables auto-update on both paths and warns on drift instead of auto-installing. For users who want the protection on a version they've vetted. |
 | `COZEMPIC_NO_TELEMETRY` | off | Skip anonymous usage counters. Cozempic pings a simple counter on each prune — no personal data, session content, or identifiable information is sent. Helps us prioritize development. |
 

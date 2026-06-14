@@ -4,9 +4,10 @@
       "command": "uv",
       "args": [
         "run",
-        "--upgrade",
-        "--with", "fastmcp",
-        "--with", "cozempic",
+        "--with",
+        "fastmcp",
+        "--with",
+        "cozempic",
         "python",
         "${CLAUDE_PLUGIN_ROOT}/servers/cozempic_mcp.py"
       ]
