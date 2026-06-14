@@ -297,6 +297,23 @@ class TestAutoUpdateOptOuts(_EnvIsolated):
             up.assert_not_called()       # still pinned → no upgrade
         self.assertNotIn("pip install", buf.getvalue())  # but no broken command
 
+    def test_unicode_digit_pin_emits_no_command(self):
+        # #123 QA re-verify P3: a unicode-digit pin (fullwidth / Arabic-Indic) is
+        # NOT a pip-installable version — _VERSION_SHAPE (re.A) must reject it so we
+        # never print an un-runnable `pip install 'cozempic==１.８.３２'`.
+        import io
+        from cozempic import updater
+        for v in ("１.８.３２", "١.٨.٣٢"):
+            os.environ["COZEMPIC_PIN"] = v
+            buf = io.StringIO()
+            with patch("sys.stdout", buf), \
+                 patch("cozempic.updater._should_check", return_value=True), \
+                 patch("cozempic.updater._mark_checked"), \
+                 patch("cozempic.updater._do_upgrade") as up:
+                updater.maybe_auto_update(force=True)
+                up.assert_not_called()                    # still pinned → no upgrade
+            self.assertNotIn("pip install", buf.getvalue())  # no un-runnable command
+
 
 class TestHookHonorsOptOuts(unittest.TestCase):
     """#123 Defect 1: the SessionStart hook's shell upgrade must be gated on the
@@ -314,30 +331,43 @@ class TestHookHonorsOptOuts(unittest.TestCase):
         # And the guard must come BEFORE the upgrade in the command string.
         self.assertLess(cmd.index(guard), cmd.index("pip install --upgrade cozempic"))
 
-    def test_mcp_json_has_no_unconditional_upgrade(self):
-        # #123 QA P1: `uv run --upgrade` in .mcp.json upgrades at the uv layer
-        # before the (opt-out-aware) Python updater runs — it must be removed.
+    def test_npm_install_decide_honors_optouts(self):
+        # #123 QA P1/P2: BEHAVIORAL — exercise install.js's decideInstall(env) via
+        # node, not a static text check (the static-only test gave false confidence
+        # and missed a whitespace-pin divergence). Asserts parity with the hook /
+        # Python paths: ANY non-empty pin (incl. whitespace/garbage) drops --upgrade.
         import json
+        import shutil
+        import subprocess
         from pathlib import Path
-        root = Path(__file__).parent.parent
-        for rel in (".mcp.json", "plugin/.mcp.json"):
-            p = root / rel
-            if not p.exists():
-                continue
-            args = json.loads(p.read_text())["mcpServers"]["cozempic"]["args"]
-            self.assertNotIn("--upgrade", args,
-                             f"{rel}: `uv run --upgrade` bypasses the opt-outs (#123)")
-
-    def test_npm_install_gates_upgrade_on_optouts(self):
-        # #123 QA P1: npm/install.js must read BOTH opt-outs and not carry a
-        # static unconditional `--upgrade` token in the attempts array.
-        from pathlib import Path
-        src = (Path(__file__).parent.parent / "npm" / "install.js").read_text()
-        self.assertIn("COZEMPIC_NO_AUTO_UPDATE", src)
-        self.assertIn("COZEMPIC_PIN", src)
-        # The hardcoded `"--upgrade", "cozempic"` literal must be gone (now conditional).
-        self.assertNotIn('"--upgrade", "cozempic"', src,
-                         "install.js must not hardcode --upgrade (gate it on the opt-outs)")
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node not available")
+        install_js = Path(__file__).parent.parent / "npm" / "install.js"
+        script = (
+            "const {decideInstall}=require(process.argv[1]);"
+            "const cases=JSON.parse(process.argv[2]);"
+            "console.log(JSON.stringify(cases.map(decideInstall)));"
+        )
+        cases = [
+            {}, {"COZEMPIC_NO_AUTO_UPDATE": "1"}, {"COZEMPIC_PIN": "1.8.30"},
+            {"COZEMPIC_PIN": "v1.8.30"}, {"COZEMPIC_PIN": "garbage"},
+            {"COZEMPIC_PIN": "   "}, {"COZEMPIC_PIN": "1.0.0; rm -rf /"}, {"COZEMPIC_PIN": ""},
+        ]
+        out = subprocess.run([node, "-e", script, str(install_js), json.dumps(cases)],
+                             capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        res = json.loads(out.stdout)
+        # default + empty pin → --upgrade; everything else (opt-out) → no --upgrade.
+        self.assertEqual(res[0]["up"], ["--upgrade"], "default must still upgrade")
+        self.assertEqual(res[7]["up"], ["--upgrade"], "empty pin is not an opt-out")
+        for i in (1, 2, 3, 4, 5, 6):
+            self.assertEqual(res[i]["up"], [], f"case {i} ({cases[i]}) must drop --upgrade")
+        # version-shaped pin → exact spec; malformed/injection pin → bare cozempic.
+        self.assertEqual(res[2]["spec"], "cozempic==1.8.30")
+        self.assertEqual(res[3]["spec"], "cozempic==1.8.30")  # leading v stripped
+        self.assertEqual(res[4]["spec"], "cozempic")           # garbage not used as spec
+        self.assertEqual(res[6]["spec"], "cozempic")           # injection rejected
 
 
 class TestMaybeAutoUpdateBrew(_EnvIsolated):

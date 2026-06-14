@@ -196,7 +196,10 @@ def ping_install_if_new() -> None:
 # Rough PEP 440 shape (dependency-free): leading-v optional, dotted release, opt
 # pre/post/dev suffix. Used only to decide whether to emit a copy-pasteable
 # reconcile command — never to validate (a non-matching pin still disables update).
-_VERSION_SHAPE = re.compile(r"^v?\d+(?:\.\d+)*(?:[._-]?(?:a|b|c|rc|alpha|beta|post|dev)\d*)?$", re.I)
+# re.A so \d is ASCII 0-9 only — a unicode-digit pin (fullwidth/Arabic-Indic) is NOT
+# a pip-installable version, so it must not pass the shape gate and print an
+# un-runnable reconcile command (#123 QA P3).
+_VERSION_SHAPE = re.compile(r"^v?\d+(?:\.\d+)*(?:[._-]?(?:a|b|c|rc|alpha|beta|post|dev)\d*)?$", re.I | re.A)
 
 
 def _pinned_version() -> str | None:
@@ -242,7 +245,7 @@ def maybe_auto_update(force: bool = False, silent: bool = False) -> None:
         # Normalize a leading 'v' so e.g. COZEMPIC_PIN=v1.8.32 doesn't false-warn
         # against 1.8.32, and only emit a reconcile COMMAND for a version-shaped pin
         # so we never print an un-runnable `pip install 'cozempic==garbage'` (QA P3).
-        norm = pin.strip().lstrip("vV")
+        norm = pin.strip().lstrip("vV")[:64]  # cap display so a multi-KB pin can't spam the terminal
         if norm != __version__ and not silent and _should_check() and _VERSION_SHAPE.match(pin.strip()):
             _mark_checked()
             print(f"  Cozempic: pinned to {norm} but running {__version__} — "

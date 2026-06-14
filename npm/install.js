@@ -6,18 +6,37 @@ const { existsSync, readFileSync, writeFileSync } = require("fs");
 const { join } = require("path");
 const os = require("os");
 
-// ── 1. Install or upgrade Python package ─────────────────────────────────────
-// Honors the SAME documented opt-outs as the SessionStart hook + Python updater
-// (#123): a static `pip install --upgrade` here would otherwise bypass them.
-//   COZEMPIC_PIN=X.Y.Z      → install exactly that reviewed version, never --upgrade
-//   COZEMPIC_NO_AUTO_UPDATE → install without --upgrade (don't move an existing install)
-const noAutoUpdate = process.env.COZEMPIC_NO_AUTO_UPDATE;
-const pinRaw = process.env.COZEMPIC_PIN;
-// Only accept a version-shaped pin as a pip spec (no spaces/flags → no arg injection).
-const pin = pinRaw && /^v?[0-9][A-Za-z0-9.+!-]*$/.test(pinRaw.trim()) ? pinRaw.trim().replace(/^v/, "") : null;
+// ── Opt-out-aware install decision (#123) ────────────────────────────────────
+// Honors the SAME opt-outs as the SessionStart hook + Python updater — a static
+// `pip install --upgrade` here would otherwise bypass them. Pure + exported so
+// the behavior is unit-testable (the previous static-only test gave false
+// confidence and missed a whitespace-pin divergence).
+//   COZEMPIC_PIN=X.Y.Z       → install exactly that reviewed version, never --upgrade
+//   COZEMPIC_PIN=<malformed>  → still an opt-out (drop --upgrade); not used as a spec
+//   COZEMPIC_NO_AUTO_UPDATE   → install without --upgrade (don't move an existing install)
+function decideInstall(env) {
+  const noAutoUpdate = env.COZEMPIC_NO_AUTO_UPDATE;
+  const pinRaw = env.COZEMPIC_PIN;
+  // Non-empty raw value == pinned, EXACTLY like the hook's `[ -z "$COZEMPIC_PIN" ]`
+  // (empty/unset → not pinned; whitespace-only → pinned). "" and undefined are the
+  // only falsy strings, so !!pinRaw is precisely "raw is non-empty".
+  const pinSet = !!pinRaw;
+  // Only a version-shaped pin becomes a pip spec (no spaces/flags → no arg injection).
+  const pin = pinSet && /^v?[0-9][A-Za-z0-9.+!-]*$/.test(pinRaw.trim())
+    ? pinRaw.trim().replace(/^v/, "") : null;
+  const spec = pin ? `cozempic==${pin}` : "cozempic";
+  const up = pinSet || noAutoUpdate ? [] : ["--upgrade"];
+  return { spec, up, pinSet, pin };
+}
 
-const spec = pin ? `cozempic==${pin}` : "cozempic";
-const up = pin || noAutoUpdate ? [] : ["--upgrade"];
+if (require.main !== module) {
+  module.exports = { decideInstall };
+  return;
+}
+
+// ── 1. Install or upgrade Python package ─────────────────────────────────────
+const noAutoUpdate = process.env.COZEMPIC_NO_AUTO_UPDATE;
+const { spec, up } = decideInstall(process.env);
 
 const attempts = [
   ["uv", ["pip", "install", ...up, spec, "--quiet"]],
