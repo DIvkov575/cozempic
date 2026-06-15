@@ -181,6 +181,11 @@ def find_sessions(project_filter: str | None = None) -> list[dict]:
         for f in sorted(proj_dir.glob("*.jsonl")):
             if ".jsonl.bak" in f.name or f.name.endswith(".bak"):
                 continue
+            if f.name.startswith("."):
+                # atomic-write temp orphan (.tmp.*) or any dotfile — never a real
+                # session, and a crash between mkstemp and os.replace can leave one
+                # that the *.jsonl glob would otherwise enumerate as a phantom session.
+                continue
             size = f.stat().st_size
             mtime = datetime.fromtimestamp(f.stat().st_mtime)
             session_id = f.stem
@@ -859,7 +864,7 @@ def save_messages(
     import tempfile as _tempfile
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = _tempfile.mkstemp(
-        prefix=".tmp.", suffix=path.name, dir=str(path.parent)
+        prefix=".tmp." + path.name + ".", suffix=".partial", dir=str(path.parent)
     )
     tmp_path = Path(tmp_name)
     try:
