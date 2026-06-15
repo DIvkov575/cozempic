@@ -36,7 +36,11 @@ class TestNudge(unittest.TestCase):
         t = _transcript(self.tmp, total)
         payload = json.dumps({"transcript_path": str(t), "session_id": session})
         out = io.StringIO()
-        e = {k: v for k, v in os.environ.items() if not k.startswith("COZEMPIC_NUDGE")}
+        # These tests isolate via patch(Path.home)=self.home, so the read side must
+        # NOT inherit an ambient CLAUDE_CONFIG_DIR (e.g. the conftest autouse fixture)
+        # or get_claude_dir would diverge from where record_session wrote the sidecar.
+        e = {k: v for k, v in os.environ.items()
+             if not k.startswith("COZEMPIC_NUDGE") and k != "CLAUDE_CONFIG_DIR"}
         if env:
             e.update(env)
         with patch("sys.stdin", io.StringIO(payload)), patch("sys.stdout", out), \
