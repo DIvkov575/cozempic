@@ -155,6 +155,59 @@ class TestDetectContextWindow(unittest.TestCase):
             self.assertEqual(detect_context_window(messages), 1_000_000)
 
 
+class TestContextWindowFamilyFallback(unittest.TestCase):
+    """PR-3 (L10): an unknown future Haiku must size to 200K, not the 1M default."""
+
+    def setUp(self):
+        # Same isolation as TestDetectContextWindow — an inherited
+        # COZEMPIC_CONTEXT_WINDOW would short-circuit the model-mapping path.
+        self._prev_env = os.environ.pop("COZEMPIC_CONTEXT_WINDOW", None)
+
+    def tearDown(self):
+        if self._prev_env is not None:
+            os.environ["COZEMPIC_CONTEXT_WINDOW"] = self._prev_env
+
+    def test_future_haiku_version_is_200k(self):
+        # RED-at-base: a Haiku generation not in MODEL_CONTEXT_WINDOWS currently
+        # falls through to the 1M DEFAULT — a 5x over-estimate that mis-times every
+        # guard tier on a real 200K Haiku session.
+        for model in ["claude-haiku-5", "claude-haiku-4-6", "claude-haiku-4-6-20260601"]:
+            messages = [make_assistant_with_model(0, model)]
+            self.assertEqual(detect_context_window(messages), 200_000, f"{model} should be 200K")
+        # claude-haiku-4-5[1m] — deliberate behaviour CHANGE (1M → 200K), not
+        # preservation. The old bracket-aware loop required bracket_suffix == ""
+        # to enter the second prefix pass, so a bracket-suffixed Haiku fell through
+        # to DEFAULT (1M). The new simple prefix match correctly routes it to 200K
+        # via the prefix loop (startswith "claude-haiku-4-5"). This is an
+        # improvement, not a regression.
+        self.assertEqual(
+            detect_context_window([make_assistant_with_model(0, "claude-haiku-4-5[1m]")]),
+            200_000,
+        )
+
+    def test_known_haiku_still_200k(self):
+        messages = [make_assistant_with_model(0, "claude-haiku-4-5")]
+        self.assertEqual(detect_context_window(messages), 200_000)
+
+    def test_opus_48_is_1m(self):
+        messages = [make_assistant_with_model(0, "claude-opus-4-8")]
+        self.assertEqual(detect_context_window(messages), 1_000_000)
+
+    def test_unknown_non_haiku_still_defaults_1m(self):
+        messages = [make_assistant_with_model(0, "claude-future-99")]
+        self.assertEqual(detect_context_window(messages), DEFAULT_CONTEXT_WINDOW)
+
+    def test_bracket_suffix_opus_resolves_by_prefix(self):
+        # CC does not emit "[1m]", but if it ever did for a 1M model, the simple
+        # prefix match handles it with no behaviour change vs the old bracket-aware
+        # code. This is the no-change direction that justifies removing the dead
+        # bracket-handling branch: claude-opus-4-6[1m] → 1M in both old and new code.
+        self.assertEqual(
+            detect_context_window([make_assistant_with_model(0, "claude-opus-4-6[1m]")]),
+            1_000_000,
+        )
+
+
 class TestGetContextWindowOverride(unittest.TestCase):
 
     def test_returns_none_when_unset(self):
