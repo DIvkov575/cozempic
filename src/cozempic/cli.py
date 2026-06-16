@@ -1750,6 +1750,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_dash = sub.add_parser("dashboard", help="Generate + open the prune-value dashboard (HTML)")
     p_dash.add_argument("--no-open", action="store_true",
                         help="Write the HTML but don't open a browser")
+    p_dash.add_argument("--agent", help="Filter to one agent (e.g. claude, codex)")
 
     return parser
 
@@ -2176,9 +2177,15 @@ def cmd_dashboard(args):
     from .dashboard import aggregate, load_receipts
     from .dashboard.render import dashboard_path, render_html, write_dashboard
 
-    data = aggregate(load_receipts())
+    receipts = load_receipts()
+    agent = getattr(args, "agent", None)
+    if agent:
+        receipts = [r for r in receipts
+                    if isinstance(r.get("agent"), dict) and r["agent"].get("name") == agent]
+    data = aggregate(receipts)
     ts = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-    html_str = render_html(data, generated_ts=ts, source_label="~/.cozempic/receipts")
+    label = "~/.cozempic/receipts" + (f" · agent={agent}" if agent else "")
+    html_str = render_html(data, generated_ts=ts, source_label=label)
     try:
         path = write_dashboard(html_str)
     except Exception as exc:
@@ -2191,6 +2198,8 @@ def cmd_dashboard(args):
         lt = data["lifetime"]
         print(f"  {n} prune(s), {lt.get('committed', 0)} applied across "
               f"{lt.get('sessions', 0)} session(s).")
+    elif agent:
+        print(f"  No prunes recorded for agent '{agent}'.")
     else:
         print("  No prunes recorded yet — run `cozempic treat --execute` first.")
 

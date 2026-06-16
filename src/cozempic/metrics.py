@@ -138,6 +138,70 @@ class ClaudeMetricsAdapter:
         return msg_bytes(entry)
 
 
+class CodexMetricsAdapter:
+    """Codex measurement seam (D5) — proves the contract is agent-agnostic.
+
+    Entries are Codex rollout lines (``{timestamp, type, payload}``), NOT Claude
+    Message tuples. Token counting prefers Codex's own ``token_count`` telemetry
+    and falls back to a byte heuristic — no Claude/``tokens.py`` dependency. The
+    full Codex codec/locator/guard is the separate 1.10.0 effort; this is only
+    the metrics seam, so a Codex prune emits the SAME PruneReceipt the dashboard
+    already renders.
+    """
+
+    name = "codex"
+    schema_version = "1"
+    # gpt-5.x family default; the 1.10.0 codec will detect the real window.
+    _DEFAULT_WINDOW = 272_000
+
+    def __init__(self, agent_version: str | None = None):
+        self._version = agent_version
+
+    def agent_version(self) -> str | None:
+        return self._version
+
+    @staticmethod
+    def _token_count_payloads(entries):
+        for e in entries:
+            payload = e.get("payload") if isinstance(e, dict) else None
+            if isinstance(payload, dict) and payload.get("type") == "token_count":
+                yield payload
+
+    def count_tokens(self, entries) -> TokenCount:
+        # Real Codex (0.139): the cumulative total is nested at
+        # payload.info.total_token_usage.total_tokens. Fall back to a flat
+        # total/total_tokens (older/synthetic) then to a byte heuristic.
+        total = None
+        for payload in self._token_count_payloads(entries):
+            info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
+            usage = info.get("total_token_usage") if isinstance(info.get("total_token_usage"), dict) else {}
+            t = usage.get("total_tokens")
+            if not isinstance(t, int) or isinstance(t, bool):
+                t = payload.get("total", payload.get("total_tokens"))
+            if isinstance(t, int) and not isinstance(t, bool):
+                total = t  # last token_count event wins
+        if total is not None:
+            return TokenCount(total, "exact", "high")
+        approx = sum(self.entry_bytes(e) for e in entries) // 4
+        return TokenCount(approx, "heuristic", "medium")
+
+    def context_window(self, entries) -> int:
+        # Prefer the real window Codex records (info.model_context_window).
+        window = None
+        for payload in self._token_count_payloads(entries):
+            info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
+            w = info.get("model_context_window")
+            if isinstance(w, int) and not isinstance(w, bool) and w > 0:
+                window = w
+        return window if window is not None else self._DEFAULT_WINDOW
+
+    def entry_bytes(self, entry) -> int:
+        try:
+            return len(json.dumps(entry, separators=(",", ":")).encode("utf-8"))
+        except Exception:
+            return 0
+
+
 # --------------------------------------------------------------------------- #
 # Helpers callers use to stamp non-deterministic fields outside build_receipt  #
 # --------------------------------------------------------------------------- #
