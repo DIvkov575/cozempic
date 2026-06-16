@@ -1747,13 +1747,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_digest.add_argument("--session", help=session_help)
     p_digest.add_argument("--cwd", help="Working directory (default: current)")
 
+    p_dash = sub.add_parser("dashboard", help="Generate + open the prune-value dashboard (HTML)")
+    p_dash.add_argument("--no-open", action="store_true",
+                        help="Write the HTML but don't open a browser")
+
     return parser
 
 
 _SUBCOMMANDS = {
     "list", "current", "diagnose", "treat", "strategy", "reload",
     "checkpoint", "post-compact", "guard", "init", "doctor", "formulary", "completions",
-    "digest", "self-update", "remind", "guard-watchdog",
+    "digest", "self-update", "remind", "guard-watchdog", "dashboard",
 }
 
 
@@ -1842,6 +1846,7 @@ _AUTO_INIT_SKIP_CMDS = frozenset({
     "doctor",        # diagnostic-only; doctor surfaces missing init via its own check
     "nudge",         # Stop-hook protocol command; never mutate state as a side effect
     "guard-watchdog",  # read-only log scan; never mutate project state
+    "dashboard",     # report-only; reads/writes only ~/.cozempic, never project state
 })
 
 _GLOBAL_INIT_MARKER = Path.home() / ".cozempic_global_initialized"
@@ -2164,6 +2169,41 @@ def _maybe_auto_init(argv: list[str]) -> None:
         )
 
 
+def cmd_dashboard(args):
+    """Generate (and open) the local prune-value dashboard from receipts."""
+    from datetime import datetime, timezone
+
+    from .dashboard import aggregate, load_receipts
+    from .dashboard.render import dashboard_path, render_html, write_dashboard
+
+    data = aggregate(load_receipts())
+    ts = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    html_str = render_html(data, generated_ts=ts, source_label="~/.cozempic/receipts")
+    try:
+        path = write_dashboard(html_str)
+    except Exception as exc:
+        print(f"  Error: could not write dashboard: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    n = data.get("lifetime", {}).get("prunes_total", 0)
+    print(f"  Dashboard: {path}")
+    if n:
+        lt = data["lifetime"]
+        print(f"  {n} prune(s), {lt.get('committed', 0)} applied across "
+              f"{lt.get('sessions', 0)} session(s).")
+    else:
+        print("  No prunes recorded yet — run `cozempic treat --execute` first.")
+
+    if not getattr(args, "no_open", False):
+        try:
+            import webbrowser
+
+            if not webbrowser.open(dashboard_path().as_uri()):
+                print("  (open it manually in a browser)")
+        except Exception:
+            print("  (open it manually in a browser)")
+
+
 def main():
     from .updater import maybe_auto_update, ping_install_if_new
 
@@ -2209,6 +2249,7 @@ def main():
         "self-update": cmd_self_update,
         "remind": cmd_remind,
         "nudge": cmd_nudge,
+        "dashboard": cmd_dashboard,
     }
 
     try:

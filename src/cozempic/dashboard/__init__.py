@@ -7,5 +7,13 @@ adapter emits receipts.
 """
 
 from .aggregate import aggregate, load_receipts
+from .render import dashboard_path, render_dashboard, render_html, write_dashboard
 
-__all__ = ["aggregate", "load_receipts"]
+__all__ = [
+    "aggregate",
+    "load_receipts",
+    "render_html",
+    "render_dashboard",
+    "write_dashboard",
+    "dashboard_path",
+]
