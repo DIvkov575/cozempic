@@ -64,7 +64,7 @@ class TriggerInfo:
     """Why this prune ran."""
 
     source: str  # "manual" | "guard" | "hook" | "precompact" | "overflow"
-    tier: str  # "gentle" | "standard" | "aggressive"
+    tier: str  # overall prescription tier: "gentle"|"standard"|"aggressive"|"custom"
     prescription: str
     reason: str = ""
 

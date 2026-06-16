@@ -342,6 +342,46 @@ def _compile_protect_patterns_or_exit(args):
         sys.exit(2)
 
 
+_TIER_NAMES = {"gentle", "standard", "aggressive"}
+
+
+def _emit_prune_receipt(path, pr, *, source, outcome, session_id=None, cwd=None, defer_reason=None):
+    """Fire-and-forget a prune receipt (D1 of the dashboard path).
+
+    Doubly exception-isolated (here AND inside emit_receipt) so a receipt can
+    never break or defer the prune it records. Called on every outcome —
+    committed and deferred.
+    """
+    try:
+        from .metrics import ClaudeMetricsAdapter, TriggerInfo, ValidationInfo
+        from .receipts import emit_receipt
+
+        tiers = {
+            sr.strategy_name: STRATEGIES[sr.strategy_name].tier
+            for sr in pr.strategy_results
+            if sr.strategy_name in STRATEGIES
+        }
+        deferred = outcome != "committed"
+        tier = pr.prescription_name if pr.prescription_name in _TIER_NAMES else "custom"
+        emit_receipt(
+            pr,
+            adapter=ClaudeMetricsAdapter(),
+            session_id=session_id or (path.stem if path else None),
+            transcript_path=str(path) if path else None,
+            cwd=cwd,
+            trigger=TriggerInfo(
+                source=source, tier=tier, prescription=pr.prescription_name,
+            ),
+            outcome=outcome,
+            validation=ValidationInfo(
+                passed=not deferred, deferred=deferred, defer_reason=defer_reason,
+            ),
+            strategy_tiers=tiers,
+        )
+    except Exception:
+        pass
+
+
 def cmd_treat(args):
     path = resolve_session(args.session, getattr(args, "project", None), strict=getattr(args, "execute", False))
     # Take snapshot BEFORE load so append-conflict detection in save_messages
@@ -442,11 +482,16 @@ def cmd_treat(args):
             with _PruneLock(path):
                 backup = save_messages(path, new_messages, create_backup=True, snapshot=snapshot)
         except PruneLockError:
+            _emit_prune_receipt(path, pr, source="manual", outcome="deferred",
+                                cwd=os.getcwd(), defer_reason="prune_lock")
             print("  Aborted: another prune cycle (guard daemon) is active. Try again in a few seconds.", file=sys.stderr)
             sys.exit(2)
         except PruneConflictError as exc:
+            _emit_prune_receipt(path, pr, source="manual", outcome="deferred",
+                                cwd=os.getcwd(), defer_reason="session_changed")
             print(f"  Aborted: session changed mid-prune (Claude wrote new lines). {exc}", file=sys.stderr)
             sys.exit(3)
+        _emit_prune_receipt(path, pr, source="manual", outcome="committed", cwd=os.getcwd())
         print(f"  Applied to {path}")
         if backup:
             print(f"  Backup: {backup}")
@@ -733,11 +778,17 @@ def cmd_reload(args):
             with _PruneLock(path):
                 backup = save_messages(path, new_messages, create_backup=True, snapshot=snapshot)
         except PruneLockError:
+            _emit_prune_receipt(path, pr, source="manual", outcome="deferred",
+                                session_id=sess["session_id"], cwd=cwd, defer_reason="prune_lock")
             print("  Aborted: another prune cycle (guard daemon) is active. Try again in a few seconds.", file=sys.stderr)
             sys.exit(2)
         except PruneConflictError as exc:
+            _emit_prune_receipt(path, pr, source="manual", outcome="deferred",
+                                session_id=sess["session_id"], cwd=cwd, defer_reason="session_changed")
             print(f"  Aborted: session changed mid-prune (Claude wrote new lines). {exc}", file=sys.stderr)
             sys.exit(3)
+        _emit_prune_receipt(path, pr, source="manual", outcome="committed",
+                            session_id=sess["session_id"], cwd=cwd)
         print(f"  Applied to {path}")
         if backup:
             print(f"  Backup: {backup}")
