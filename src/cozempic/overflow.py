@@ -217,6 +217,7 @@ class OverflowRecovery:
             auto_reload=False,  # We handle reload ourselves
             cwd=self.cwd,
             session_id=self.session_id,
+            trigger_source="overflow",
         )
 
         # #106: guard_prune_cycle no longer writes the live file inline — it

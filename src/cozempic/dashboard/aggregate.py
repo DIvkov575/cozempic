@@ -98,6 +98,9 @@ def aggregate(receipts: list[dict]) -> dict:
         "deferred": deferred,
         "noop": _count("noop"),
         "failed": _count("failed"),
+        # NOTE: manual prunes (cli) emit 'deferred' receipts, but guard/overflow
+        # auto-prune deferrals do NOT yet — so this rate currently reflects mostly
+        # the manual path. Wiring guard deferrals is a tracked follow-up.
         "deferral_rate": round(deferred / total, 3) if total else 0.0,
         "tokens_reclaimed": sum(_int(_d(r, "tokens").get("reclaimed")) for r in committed),
         "bytes_reclaimed": sum(_int(_d(r, "bytes").get("reclaimed")) for r in committed),
