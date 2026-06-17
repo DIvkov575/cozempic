@@ -120,10 +120,39 @@ th{color:var(--mut);font-weight:500;font-size:12px}td{font-variant-numeric:tabul
 .spark{color:var(--acc);vertical-align:middle}.spark-na,.mono{color:var(--mut)}.mono{font-family:ui-monospace,monospace}
 .empty{color:var(--mut)}.foot{color:var(--mut);font-size:12px;margin-top:24px;text-align:center}
 .pill{font-size:11px;padding:1px 7px;border-radius:10px;background:#262a36;color:var(--mut)}
+.lifetime{background:linear-gradient(135deg,#1a2740,#1a1d27);border:1px solid #2b3a55;margin-bottom:24px}
+.lt-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:18px}
+.lt-cell .lt-n{font-size:26px;font-weight:700;color:#7aa2ff}
+.lt-cell .lt-l{color:var(--mut);font-size:12px}.lt-since{color:var(--mut);font-size:12px;margin-top:12px}
 """
 
 
-def render_html(data: dict, *, generated_ts: str, source_label: str = "") -> str:
+def _lifetime_band(ledger: dict | None) -> str:
+    """Header band of the user's TRUE lifetime totals (from the savings ledger)."""
+    if not ledger or not ledger.get("tokens_saved"):
+        return ""
+    chips = [(_fmt_tokens(ledger["tokens_saved"]), "tokens reclaimed (lifetime)")]
+    if ledger.get("prune_count"):
+        chips.append((_fmt_int(ledger["prune_count"]), "prunes applied"))
+    if ledger.get("turns_gained"):
+        chips.append((f"~{_fmt_int(ledger['turns_gained'])}", "est. extra turns"))
+    if ledger.get("savings_rate_pct") is not None:
+        # saved/processed (processed is cumulative-with-overlap) — NOT a per-prune average
+        chips.append((f"{ledger['savings_rate_pct']:.1f}%", "reclaimed of processed"))
+    cells = "".join(
+        f'<div class="lt-cell"><div class="lt-n">{_esc(n)}</div>'
+        f'<div class="lt-l">{_esc(label)}</div></div>'
+        for n, label in chips
+    )
+    since = f" since {_esc(ledger['since'])}" if ledger.get("since") else ""
+    return (
+        f'<section class="lifetime"><div class="lt-row">{cells}</div>'
+        f'<div class="lt-since">Lifetime totals{since} · ~/.cozempic_savings.json</div></section>'
+    )
+
+
+def render_html(data: dict, *, generated_ts: str, source_label: str = "",
+                ledger: dict | None = None) -> str:
     """Render aggregate() output to a complete self-contained HTML document."""
     lt = data.get("lifetime", {}) or {}
     per_strategy = data.get("per_strategy", []) or []
@@ -184,19 +213,22 @@ def render_html(data: dict, *, generated_ts: str, source_label: str = "") -> str
 <body><div class="wrap">
 <h1>cozempic — prune value</h1>
 <p class="sub">Generated {_esc(generated_ts)}{src}</p>
+{_lifetime_band(ledger)}
 {body}
 <p class="foot">Local-only · generated from ~/.cozempic/receipts · cozempic</p>
 </div></body></html>"""
 
 
 def render_dashboard(base_dir: Path | None = None, *, generated_ts: str) -> str:
-    """Convenience: load receipts -> aggregate -> render HTML string."""
+    """Convenience: load receipts + lifetime ledger -> aggregate -> render HTML."""
     from .aggregate import aggregate, load_receipts
+    from .lifetime import load_lifetime
 
     return render_html(
         aggregate(load_receipts(base_dir)),
         generated_ts=generated_ts,
         source_label="~/.cozempic/receipts",
+        ledger=load_lifetime(),
     )
 
 

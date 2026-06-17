@@ -7,11 +7,13 @@ adapter emits receipts.
 """
 
 from .aggregate import aggregate, load_receipts
+from .lifetime import load_lifetime
 from .render import dashboard_path, render_dashboard, render_html, write_dashboard
 
 __all__ = [
     "aggregate",
     "load_receipts",
+    "load_lifetime",
     "render_html",
     "render_dashboard",
     "write_dashboard",

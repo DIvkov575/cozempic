@@ -2175,6 +2175,7 @@ def cmd_dashboard(args):
     from datetime import datetime, timezone
 
     from .dashboard import aggregate, load_receipts
+    from .dashboard.lifetime import load_lifetime
     from .dashboard.render import dashboard_path, render_html, write_dashboard
 
     receipts = load_receipts()
@@ -2182,10 +2183,14 @@ def cmd_dashboard(args):
     if agent:
         receipts = [r for r in receipts
                     if isinstance(r.get("agent"), dict) and r["agent"].get("name") == agent]
+    # The lifetime ledger is GLOBAL (no agent dimension), so it would contradict
+    # an agent-filtered view ("456M reclaimed" next to "no prunes for codex").
+    # Show it only on the unfiltered dashboard.
+    ledger = None if agent else load_lifetime()
     data = aggregate(receipts)
     ts = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     label = "~/.cozempic/receipts" + (f" · agent={agent}" if agent else "")
-    html_str = render_html(data, generated_ts=ts, source_label=label)
+    html_str = render_html(data, generated_ts=ts, source_label=label, ledger=ledger)
     try:
         path = write_dashboard(html_str)
     except Exception as exc:
@@ -2194,6 +2199,11 @@ def cmd_dashboard(args):
 
     n = data.get("lifetime", {}).get("prunes_total", 0)
     print(f"  Dashboard: {path}")
+    if ledger:
+        line = f"  Lifetime: {ledger['tokens_saved'] / 1e6:.1f}M tokens reclaimed across {ledger['prune_count']:,} prunes"
+        if ledger.get("since"):
+            line += f" since {ledger['since']}"
+        print(line)
     if n:
         lt = data["lifetime"]
         print(f"  {n} prune(s), {lt.get('committed', 0)} applied across "
