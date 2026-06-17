@@ -1028,7 +1028,12 @@ def extract_team_state(messages: list[Message]) -> TeamState:
                     seen_teammates[candidate].status = status
                     break
 
-        state.message_count += 1
+            # Count team-coordination activity once per genuine task-notification
+            # block — NOT once per message. (Restored after #134 dedented this to the
+            # outer per-message loop, which inflated message_count for every message →
+            # bogus team_messages telemetry, config_source='jsonl' on teamless
+            # sessions, and a team-change hash that churned every guard cycle.)
+            state.message_count += 1
 
         # ── idle-notifications (P0-D) ────────────────────────────────────
         # <teammate-message teammate_id="X">{"type":"idle_notification",...}</teammate-message>
