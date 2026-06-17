@@ -11,6 +11,47 @@ from pathlib import Path as _Path
 _SAVINGS_FILE = _Path.home() / ".cozempic_savings.json"
 
 
+# ── Process-liveness probe ──────────────────────────────────────────────────
+
+def _pid_is_alive(pid: int) -> bool:
+    """Bare process-liveness probe via ``os.kill(pid, 0)``.
+
+    Fail-safe direction: on a POSIX-unknown OSError, return True (assume alive)
+    so we never skip a legitimate reload / never prematurely kill a live session.
+    Windows ``os.kill`` raises OSError [WinError 87] for non-existent PIDs —
+    return False there. On POSIX any unexpected OSError is rare; fail-open.
+
+    This is the canonical implementation shared by guard.py, session.py, and
+    watchdog.py (GC-3). The guard.py ``_pid_is_alive`` is an alias; session.py
+    and watchdog.py ``_pid_alive`` now import this.
+
+    Coercion contract: numeric strings (e.g. JSON dict keys from the active-
+    sessions store) are coerced to int before the liveness probe.  Non-numeric
+    strings and other non-int types return False immediately.
+    """
+    if not isinstance(pid, int):
+        try:
+            pid = int(pid)
+        except (ValueError, TypeError, OverflowError):
+            # OverflowError: int(float('inf')) raises OverflowError, not ValueError.
+            return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # process exists, owned by another user
+    except OverflowError:
+        return False  # pid too large — malformed input
+    except OSError:
+        # Windows raises OSError [WinError 87] for a non-existent PID.
+        # On POSIX an unexpected OSError here is rare — fail-open (assume alive).
+        return os.name != "nt"
+
+
 # ── Atomic write primitive ──────────────────────────────────────────────────
 #
 # Used by all single-writer-per-host paths (_save_sidecar, record_savings,
@@ -20,7 +61,8 @@ _SAVINGS_FILE = _Path.home() / ".cozempic_savings.json"
 # are durable before the rename, so power-loss or OOM-kill leaves the target
 # either fully-old or fully-new — never zeroed.
 
-def atomic_write_text(target: _Path, data: str, encoding: str = "utf-8") -> None:
+def atomic_write_text(target: _Path, data: str, encoding: str = "utf-8",
+                      errors: str = "strict") -> None:
     """Atomic, collision-safe text write.
 
     Two concurrent calls on the same `target` BOTH succeed without losing
@@ -38,7 +80,7 @@ def atomic_write_text(target: _Path, data: str, encoding: str = "utf-8") -> None
     )
     tmp_path = _Path(tmp_name)
     try:
-        with os.fdopen(fd, "w", encoding=encoding) as f:
+        with os.fdopen(fd, "w", encoding=encoding, errors=errors) as f:
             f.write(data)
             f.flush()
             try:
@@ -263,19 +305,59 @@ def msg_bytes(msg: dict) -> int:
 
 
 def get_msg_type(msg: dict) -> str:
-    """Get the type field from a message."""
+    """Get the type field from a message. Non-dict-safe (defense-in-depth: the
+    loader now wraps non-dict lines, but this is called widely)."""
+    if not isinstance(msg, dict):
+        return "unknown"
     return msg.get("type", "unknown")
 
 
 def get_content_blocks(msg: dict) -> list[dict]:
-    """Extract content blocks from a message's inner message object."""
-    m = msg.get("message", {})
+    """Extract content blocks from a message's inner message object.
+
+    Non-dict-safe at the message / inner-message level (returns [] for a non-dict
+    msg or non-dict inner "message"). Returns the content list VERBATIM — it does
+    NOT coerce or drop non-dict ELEMENTS: an earlier coercion lost those elements on
+    the prune-WRITE path (a strategy that read coerced blocks then wrote them back
+    dropped the originals = silent data loss). Consumers that iterate blocks must
+    isinstance-guard each element themselves; strategy crashes are contained by the
+    executor's per-strategy isolation, and read-only helpers (text_of, the token
+    estimator) skip non-dict/non-string elements without writing."""
+    if not isinstance(msg, dict):
+        return []
+    m = msg.get("message")
+    if not isinstance(m, dict):
+        return []
     content = m.get("content", [])
     if isinstance(content, str):
         return [{"type": "text", "text": content}]
     if isinstance(content, list):
         return content
     return []
+
+
+def hashable_str(v) -> str:
+    """An untrusted block field (tool_use `id` / `name` / `tool_use_id`) coerced to a
+    hashable str for SAFE use as a set member, dict key, or `in <set>` test. A non-str
+    value (an unhashable list/dict, or an int) becomes "" — the empty string is falsy,
+    so the ubiquitous `if tid: set.add(tid)` guard then skips it. This closes the
+    recurring TypeError-on-unhashable-key crash class (`cannot use 'list' as a set
+    element`) that appears at EVERY prune/guard/safety/executor/doctor site reading a
+    block field as a hashable on poisoned JSONL (R6 sibling-miss sweep). Coerce at the
+    `tid = ...` assignment so every downstream .add/[key]/.get/`in` is safe at once."""
+    return v if isinstance(v, str) else ""
+
+
+def get_dict_blocks(msg: dict) -> list[dict]:
+    """Like get_content_blocks but yields ONLY dict elements — for READ-ONLY
+    consumers (diagnosis, recap, token estimation) that never write the blocks
+    back, so dropping a non-dict element is safe. This is the shared guarded
+    iterator: read-only sites should use it instead of re-implementing a per-site
+    isinstance guard (the recurring sibling-miss this PR kept hitting — R5). WRITE
+    paths (strategies, executor) MUST keep get_content_blocks (verbatim) + their own
+    per-element guard, because they round-trip the list and dropping a non-dict
+    element there would be silent data loss."""
+    return [b for b in get_content_blocks(msg) if isinstance(b, dict)]
 
 
 def content_block_bytes(block: dict) -> int:
@@ -358,6 +440,16 @@ def is_protected(msg: dict) -> bool:
 _PATTERN_PROTECTED_KEY: str = "__cozempic_pattern_protected__"
 _MAX_PROTECT_PATTERN_LEN: int = 1000
 _MAX_PROTECT_MATCH_BYTES: int = 256 * 1024
+# Hard per-surface cap on the no-SIGALRM (Windows / non-main-thread) match path,
+# where no wall-clock timer can interrupt a runaway regex. 512 (not 4096): a
+# super-linear pattern the quantifier-count detector MISSED is bounded to ~512 chars
+# of backtracking — 4096 was ~6.5s/message, 512 is ~64x faster (~0.1s), a blink.
+# _pattern_is_redos_risky refuses any pattern with >=2 unbounded quantifiers (the
+# necessary condition for exponential ReDoS), so this cap only has to bound the
+# residual single-quantifier-ambiguous-alternation case. Trade-off (no-budget path
+# only): a legitimate marker past char 512 in one surface may not match — acceptable
+# vs a frozen daemon.
+_NO_BUDGET_MATCH_CAP: int = 512
 _PROTECT_OVERMATCH_WARN_FRACTION: float = 0.8
 
 
@@ -445,10 +537,346 @@ def _protect_match_budget() -> float:
     return min(v, 60.0)
 
 
+def _have_sigalrm() -> bool:
+    """True iff a real SIGALRM wall-clock budget can be armed here (POSIX main
+    thread). On Windows SIGALRM is absent; off the main thread signal.signal
+    raises. Factored out so both the budget CM and the Windows fail-closed
+    pre-check agree, and so tests can emulate Windows by patching this."""
+    import signal
+    import threading
+    if not hasattr(signal, "SIGALRM"):
+        return False
+    return threading.current_thread() is threading.main_thread()
+
+
+# Classic catastrophic-backtracking shapes: a quantified group that is itself
+# quantified — (x+)+ , (x*)* , (x+)* — or two unbounded quantifiers adjacent
+# across a group close. Conservative (may false-positive); used ONLY to fail
+# CLOSED where no wall-clock budget exists (Windows / non-main thread), never to
+# relax the POSIX SIGALRM path.
+def _count_variable_quantifiers(pattern: str) -> int:
+    """Count VARIABLE-WIDTH repetition operators (`*`, `+`, open-ended `{n,}`, and a
+    bounded range `{n,m}` with m != n) in PATTERN, ignoring escaped operators (`\\*`)
+    and operators inside a character class `[...]` (literal there). A fixed `{n}` /
+    `{n,n}` and `?` are single/bounded width and are NOT counted.
+
+    This is the PROVABLY-SAFE necessary-condition for super-linear backtracking:
+    catastrophic/polynomial ReDoS REQUIRES at least two overlapping variable-width
+    repetitions. So `>= 2` NEVER under-rejects (it cannot miss a freeze). The cost is
+    OVER-rejection: it also flags benign literal-separated ranges (`\\d{1,3}\\.\\d{1,3}`
+    IPv4, `.*foo.*`) whose required separator actually makes them linear.
+
+    WHY THE COUNT AND NOT A MORE PRECISE RULE (the hard-won lesson, rounds 7-10):
+    distinguishing a real separator from a fake one needs full regex semantics —
+    character-class OVERLAP (`.*X.*X` freezes because `.` matches `X`) and branch
+    EMPTINESS (`.*(?:Z|).*` freezes because the branch can be empty). Every heuristic
+    that tried to be precise (R8 adjacency, R9 top-level-anchor) re-opened the daemon
+    FREEZE in the dangerous direction. The over-rejection is the SAFE direction: it is
+    FAIL-OPEN (skip pattern protection this cycle + a stderr warning, content stays
+    prunable — never destroyed, never a crash, never a freeze), it only affects the
+    no-SIGALRM path (Windows / non-main-thread), and the 512-char no-budget cap is an
+    independent backstop. A durable fix for the over-rejection would require running
+    the match under a real hard timeout (a killable subprocess), not a shape heuristic."""
+    count = 0
+    i, n, in_class = 0, len(pattern), False
+    prev = ""  # previous structural char, to classify a bare '?'
+    while i < n:
+        c = pattern[i]
+        if c == "\\":
+            i += 2
+            prev = "x"  # an escaped atom
+            continue
+        if in_class:
+            if c == "]":
+                in_class = False
+                prev = "]"
+            i += 1
+            continue
+        if c == "[":
+            in_class = True
+            i += 1
+            prev = "["
+            continue
+        if c in "*+":
+            count += 1
+            i += 1
+            prev = c
+            continue
+        if c == "?":
+            # A '?' is a BRANCH-introducing quantifier (count it) EXCEPT when it is a
+            # group-type marker `(?...` or a lazy/possessive modifier on a preceding
+            # quantifier (`*?`, `+?`, `??`, `}?`). R11: a flat chain of optional atoms
+            # `a?a?...aaa` backtracks EXPONENTIALLY in the number of `?`, so excluding
+            # `?` made the count rule UNDER-reject (freeze). Counting it restores the
+            # true necessary condition: >=2 branch quantifiers of ANY kind => risky.
+            if prev not in ("(", "*", "+", "?", "}"):
+                count += 1
+            i += 1
+            prev = "?"
+            continue
+        if c == "{":
+            j = pattern.find("}", i)
+            if j == -1:
+                i += 1
+                prev = "{"
+                continue
+            sp = pattern[i + 1:j]
+            if "," in sp:
+                lo, _, hi = sp.partition(",")
+                hi = hi.strip()
+                if hi == "" or hi != lo.strip():
+                    count += 1
+            i = j + 1
+            prev = "}"
+            continue
+        i += 1
+        prev = c
+    return count
+
+
+def _has_alternation(pattern: str) -> bool:
+    """True if PATTERN contains an alternation `|` outside a character class / escape.
+
+    On the no-budget (no-SIGALRM) path we REFUSE all alternation categorically (R12).
+    Alternation is a super-linear backtracking source, and an AMBIGUOUS alternation
+    (nested `((a|a))+`, an unquantified chain `(a|a)(a|a)...`, an overlapping
+    `(aa|a)...`) cannot be reliably distinguished from a benign DISJOINT one
+    (`foo|bar`) without full regex analysis — rounds 8-12 proved every precise
+    heuristic (adjacency, top-level-anchor, recursive ambiguity, quantifier counting)
+    leaks and reopens the daemon freeze. Refusing ALL `|` closes the entire class
+    SOUNDLY. Verified empirically complete: with no `|` and < 2 quantifiers, no pattern
+    (incl backreferences) backtracks. The cost is over-rejecting benign alternations —
+    fail-OPEN (skip pattern protection this cycle + a stderr warning, content stays
+    prunable, no crash/freeze) and ONLY on the no-SIGALRM path (Windows / non-main
+    thread); the ~70k POSIX main-thread users use the SIGALRM timer and never consult
+    this detector. The zero-over-rejection alternative is a killable-subprocess hard
+    timeout (a larger change, out of scope for this PR)."""
+    i, n, in_class = 0, len(pattern), False
+    while i < n:
+        c = pattern[i]
+        if c == "\\":
+            i += 2
+            continue
+        if in_class:
+            if c == "]":
+                in_class = False
+            i += 1
+            continue
+        if c == "[":
+            in_class = True
+            i += 1
+            continue
+        if c == "|":
+            return True
+        i += 1
+    return False
+
+
+def _strip_group_prefix(body: str) -> str:
+    """Strip a leading group-type marker from a group body so rule-2 doesn't see the
+    marker's `?` as an inner quantifier (ynaamane review, LOW): `(?:abc)+` was
+    over-rejected because the body `?:abc` tripped _body_has_inner_quantifier on the
+    leading `?`. Handles `(?:` non-capturing, `(?flags:` inline-flags, `(?P<name>`
+    named; lookaround / comment groups have no real repeatable body (and a genuinely
+    nested quantifier inside them is still caught by the >=2-quantifier count rule)."""
+    if not body.startswith("?"):
+        return body
+    if body.startswith("?:"):
+        return body[2:]
+    if body.startswith("?P<") or body.startswith("?<"):  # named (?P<n>) — (?<= / (?<! handled below
+        if body.startswith(("?<=", "?<!")):
+            return ""  # lookbehind: no repeatable body
+        gt = body.find(">")
+        return body[gt + 1:] if gt != -1 else ""
+    colon = body.find(":")
+    if colon != -1 and all(c in "aiLmsux" for c in body[1:colon]):  # (?ims: inline flags
+        return body[colon + 1:]
+    return ""  # lookahead (?= (?!, comment (?#, or unknown — no repeatable body
+
+
+def _scan_quantified_group_bodies(pattern: str) -> list[str]:
+    """Inner body of each group `(...)` immediately followed by an unbounded or
+    braced quantifier (`+`, `*`, `{...}`). Honors escapes, char classes, and
+    nesting. A group followed by `?` (or nothing) is NOT returned — `(...)?` alone
+    cannot drive catastrophic backtracking."""
+    bodies: list[str] = []
+    stack: list[int] = []
+    i, n, in_class = 0, len(pattern), False
+    while i < n:
+        c = pattern[i]
+        if c == "\\":
+            i += 2
+            continue
+        if in_class:
+            if c == "]":
+                in_class = False
+            i += 1
+            continue
+        if c == "[":
+            in_class = True
+            i += 1
+            continue
+        if c == "(":
+            stack.append(i)
+            i += 1
+            continue
+        if c == ")":
+            if stack:
+                start = stack.pop()
+                nxt = pattern[i + 1] if i + 1 < n else ""
+                if nxt in ("+", "*", "{"):  # NOT `in "+*{"` — "" is a substring of every str
+                    bodies.append(_strip_group_prefix(pattern[start + 1:i]))
+            i += 1
+            continue
+        i += 1
+    return bodies
+
+
+def _body_has_inner_quantifier(body: str) -> bool:
+    """True if BODY contains a VARIABLE-WIDTH inner quantifier outside a char class /
+    escape. A quantified group whose body is itself variable-width — `(a+)+`, `(a?)+`,
+    `(.*X){8}`, `(x+){10}`, `(\\d{1,3}){2,}` — is a classic exponential/polynomial
+    ReDoS (the inner can match different widths, so the outer quantifier has many
+    ways to split the input). A FIXED-count inner `{n}` (e.g. `(\\d{4})+`) is NOT
+    variable-width — the partition is unique, so it is linear and must NOT be flagged
+    (R5 P3 over-rejection of bounded protect patterns)."""
+    i, n, in_class = 0, len(body), False
+    while i < n:
+        c = body[i]
+        if c == "\\":
+            i += 2
+            continue
+        if in_class:
+            if c == "]":
+                in_class = False
+            i += 1
+            continue
+        if c == "[":
+            in_class = True
+            i += 1
+            continue
+        if c in "*+?":
+            return True
+        if c == "{":
+            j = body.find("}", i)
+            if j == -1:
+                i += 1
+                continue
+            # variable-width only if the brace spec carries a comma ({n,} / {n,m});
+            # a bare {n} is fixed-width and unambiguous.
+            if "," in body[i + 1:j]:
+                return True
+            i = j + 1
+            continue
+        i += 1
+    return False
+
+
+def _split_top_level_alts(body: str) -> list[str]:
+    """Split BODY on top-level `|` only (not inside nested groups / char classes)."""
+    alts: list[str] = []
+    cur: list[str] = []
+    depth, in_class = 0, False
+    i, n = 0, len(body)
+    while i < n:
+        c = body[i]
+        if c == "\\":
+            cur.append(body[i:i + 2])
+            i += 2
+            continue
+        if in_class:
+            cur.append(c)
+            if c == "]":
+                in_class = False
+            i += 1
+            continue
+        if c == "[":
+            in_class = True
+            cur.append(c)
+            i += 1
+            continue
+        if c == "(":
+            depth += 1
+            cur.append(c)
+            i += 1
+            continue
+        if c == ")":
+            depth -= 1
+            cur.append(c)
+            i += 1
+            continue
+        if c == "|" and depth == 0:
+            alts.append("".join(cur))
+            cur = []
+            i += 1
+            continue
+        cur.append(c)
+        i += 1
+    alts.append("".join(cur))
+    return alts
+
+
+def _ambiguous_alternation(body: str) -> bool:
+    """True if BODY is an alternation whose branches can match a common first
+    character — `(a|a)+`, `((a)|(a))+` backtrack catastrophically. A DISJOINT
+    alternation like `(TODO|FIXME)+` (T vs F) is unambiguous and SAFE, so it is
+    NOT flagged (the R4 over-rejection complaint)."""
+    if "|" not in body:
+        return False
+    alts = _split_top_level_alts(body)
+    if len(alts) < 2:
+        return False
+
+    def _first(alt: str) -> str | None:
+        j = 0
+        while j < len(alt) and alt[j] == "(":
+            j += 1
+        if j >= len(alt):
+            return None  # empty branch → group is optional+ambiguous
+        ch = alt[j]
+        return "*WILD*" if ch in r".[\\" else ch  # dot/class/escape overlaps anything
+
+    firsts = [_first(a) for a in alts]
+    if any(f is None or f == "*WILD*" for f in firsts):
+        return True
+    return len(set(firsts)) < len(firsts)  # two branches share a first char
+
+
+def _pattern_is_redos_risky(pattern: str) -> bool:
+    """Heuristic: True if PATTERN can backtrack catastrophically. Used ONLY to fail
+    CLOSED where no wall-clock budget exists (Windows / non-main thread), where a
+    pure-Python thread cannot interrupt a CPU-bound `re` match.
+
+    Four CATEGORICAL fail-CLOSED rules (never under-reject → never let a freeze
+    through), at the cost of safe-direction over-rejection on this niche path. The
+    three backtracking sources — repetition interaction, quantifier-over-ambiguity,
+    and alternation — are each closed CATEGORICALLY rather than by precise detection
+    (rounds 8-12 proved precise heuristics leak); backreferences with < 2 quantifiers
+    and no alternation are empirically freeze-free:
+      1. >= 2 variable-width quantifiers anywhere (`.*.*`, `a*a*`, `.{1,500}.{1,500}`,
+         the optional chain `a?a?...`, `.*X.*X`, ...). Conservatively also flags linear
+         literal-separated ranges — accepted, fail-open (see _count_variable_quantifiers).
+      2. a quantified group whose body is itself variable-width (`(a?)+`, `(.*X){8}`).
+      3. ANY alternation `|` (R12): closes nested `((a|a))+`, unquantified chains
+         `(a|a)(a|a)...`, overlapping `(aa|a)...` — and conservatively benign `foo|bar`
+         too (fail-open; see _has_alternation for why categorical, not precise).
+      4. (subsumed by 3, kept defensively) a quantified group with an ambiguous
+         alternation."""
+    if _count_variable_quantifiers(pattern) >= 2:
+        return True
+    if _has_alternation(pattern):
+        return True
+    for body in _scan_quantified_group_bodies(pattern):
+        if _body_has_inner_quantifier(body) or _ambiguous_alternation(body):
+            return True
+    return False
+
+
 def _match_time_budget(seconds: float):
     """Best-effort wall-clock budget for regex matching via SIGALRM (POSIX main
-    thread only). On Windows or a non-main thread it yields WITHOUT a timeout — the
-    pattern-length + per-surface input caps remain the only bound there (documented).
+    thread only). On Windows or a non-main thread it yields WITHOUT a timeout —
+    tag_pattern_matches compensates there by REFUSING redos-shaped patterns up
+    front (fail closed), so the daemon can't be frozen by a poisoned pattern.
     Returns a context manager."""
     import signal
     from contextlib import contextmanager
@@ -489,10 +917,27 @@ def tag_pattern_matches(messages: list, patterns: list) -> int:
     is flagged even when unmatchable carriers/singletons dilute the total."""
     if not patterns:
         return 0
+    # Windows / non-main-thread fail-closed: when the budget is enabled but no
+    # real SIGALRM timer can be armed, a redos-shaped pattern could freeze the
+    # daemon with no interrupt. Refuse such a pattern up front (skip protection
+    # this cycle, warn) — the same OUTCOME as the POSIX fail-open, delivered
+    # before the match instead of via a timer. Safe-shaped patterns proceed.
+    _budget = _protect_match_budget()
+    _no_budget = _budget > 0 and not _have_sigalrm()
+    if _no_budget:
+        risky = [p for p in patterns if _pattern_is_redos_risky(getattr(p, "pattern", str(p)))]
+        if risky:
+            import sys
+            print("  Cozempic: --protect-pattern matching has no time budget on this "
+                  "platform (no SIGALRM) and a supplied pattern can backtrack "
+                  "catastrophically; skipping pattern protection this cycle. Simplify "
+                  "the pattern or set COZEMPIC_PROTECT_MATCH_SECONDS=0 to opt out.",
+                  file=sys.stderr)
+            return 0
     count = 0
     matchable = 0
     try:
-        with _match_time_budget(_protect_match_budget()):
+        with _match_time_budget(_budget):
             for _, msg_dict, _ in messages:
                 if not isinstance(msg_dict, dict):
                     continue
@@ -501,6 +946,14 @@ def tag_pattern_matches(messages: list, patterns: list) -> int:
                     matchable += 1
                 if msg_dict.get(_PATTERN_PROTECTED_KEY):
                     continue
+                # DEFINITIVE no-budget bound (independent of the shape detector's
+                # completeness): with no real timer, cap each surface to
+                # _NO_BUDGET_MATCH_CAP chars so even a catastrophic pattern the
+                # detector MISSED backtracks over a few KB (bounded ms), never the
+                # full 256KB surface (effectively infinite). On POSIX the SIGALRM
+                # timer is the bound, so no cap there.
+                if _no_budget:
+                    texts = [t[:_NO_BUDGET_MATCH_CAP] for t in texts]
                 if any(p.search(t) for t in texts for p in patterns):
                     msg_dict[_PATTERN_PROTECTED_KEY] = True
                     count += 1
@@ -539,16 +992,20 @@ def find_active_background_tasks(messages: list) -> list[dict]:
 
     for _, msg, _ in messages:
         inner = msg.get("message", {})
-        content = inner.get("content", [])
+        content = inner.get("content", []) if isinstance(inner, dict) else []
         if isinstance(content, list):
             for block in content:
                 if isinstance(block, dict):
                     if block.get("type") == "tool_use" and block.get("name") == "Task":
                         inp = block.get("input", {})
-                        if inp.get("run_in_background"):
-                            spawns[block.get("id", "")] = inp.get("description", "")
+                        if isinstance(inp, dict) and inp.get("run_in_background"):
+                            sid = hashable_str(block.get("id"))  # unhashable -> "" (R6)
+                            if sid:
+                                spawns[sid] = inp.get("description", "")
                     if block.get("type") == "tool_result":
-                        completions.add(block.get("tool_use_id", ""))
+                        cid = hashable_str(block.get("tool_use_id"))
+                        if cid:
+                            completions.add(cid)
 
         # Check queue-operation for completed tasks
         if msg.get("type") == "queue-operation":
@@ -566,11 +1023,19 @@ def find_active_background_tasks(messages: list) -> list[dict]:
 
 
 def text_of(block: dict) -> str:
-    """Get the text content of a content block, handling all block types."""
+    """Get the text content of a content block, handling all block types.
+
+    Non-string-safe: a block's text/thinking/content field — or a nested sub-block's
+    text — can legally be a non-string in untrusted JSONL. Used by the token
+    estimator (doctor / `current` / nudge), which is OUTSIDE the executor's
+    per-strategy isolation, so it must never raise."""
+    if not isinstance(block, dict):
+        return ""
     result = block.get("text", "") or block.get("thinking", "") or block.get("content", "")
     if isinstance(result, list):
         return " ".join(
-            sub.get("text", "") for sub in result if isinstance(sub, dict)
+            sub["text"] for sub in result
+            if isinstance(sub, dict) and isinstance(sub.get("text"), str)
         )
     if not isinstance(result, str):
         return ""

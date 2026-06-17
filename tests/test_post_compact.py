@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import shutil
 import sys
 import tempfile
 import time
@@ -12,8 +13,23 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from cozempic.session import cwd_to_project_slug, get_claude_dir
 from cozempic.team import read_team_checkpoint
 from cozempic.init import COZEMPIC_HOOKS
+
+
+def _run_post_compact(cwd: str) -> str:
+    """Capture cmd_post_compact stdout for the given cwd."""
+    from cozempic.cli import cmd_post_compact
+    args = argparse.Namespace(cwd=cwd)
+    captured = io.StringIO()
+    old_stdout = sys.stdout
+    sys.stdout = captured
+    try:
+        cmd_post_compact(args)
+    finally:
+        sys.stdout = old_stdout
+    return captured.getvalue()
 
 
 def _write_session_file(proj_dir: Path, session_id: str, content: str = "") -> Path:
@@ -34,39 +50,19 @@ def _write_session_file(proj_dir: Path, session_id: str, content: str = "") -> P
 class TestCmdPostCompactCrossProjectIsolation(unittest.TestCase):
     """cmd_post_compact must NEVER inject another project's checkpoint."""
 
-    def _run_post_compact(self, cwd: str) -> str:
-        from cozempic.cli import cmd_post_compact
-        args = argparse.Namespace(cwd=cwd)
-        captured = io.StringIO()
-        old_stdout = sys.stdout
-        sys.stdout = captured
-        try:
-            cmd_post_compact(args)
-        finally:
-            sys.stdout = old_stdout
-        return captured.getvalue()
-
-    def test_does_not_return_other_projects_checkpoint_when_other_is_newer(self, tmp_path=None):
-        """Core bug: Strategy 4 picks a newer OTHER project's session → wrong checkpoint.
+    def test_does_not_return_other_projects_checkpoint_when_other_is_newer(self):
+        """Core bug: Strategy 5 picks a newer OTHER project's session → wrong checkpoint.
 
         Fixture uses the CORRECT dir names (as Claude Code actually creates them, with dashes
-        for underscores). Old code computes broken slug with '_', so Strategy 3 misses project A
-        and Strategy 4 returns project B's (newer) session → contamination.
+        for underscores). Old code computes broken slug with '_', so Strategy 4 misses project A
+        and Strategy 5 returns project B's (newer) session → contamination.
         """
-        import tempfile
-        import re as _re
-        # Use explicit tmp_path if provided by pytest, otherwise create our own
-        if tmp_path is None:
-            tmp_path = Path(tempfile.mkdtemp())
-
-        # The CORRECT (fixed) slug formula — what Claude Code actually stores on disk
-        def _correct_slug(cwd: str) -> str:
-            return _re.sub(r"[^a-zA-Z0-9]", "-", cwd)
+        tmp_path = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp_path, ignore_errors=True)
 
         # Project A: topstep_automation — dir name uses dashes (Claude's real format)
         cwd_a = "/Users/x/topstep_automation"
-        slug_a_correct = _correct_slug(cwd_a)   # "-Users-x-topstep-automation"
-        proj_a = tmp_path / "projects" / slug_a_correct
+        proj_a = tmp_path / "projects" / cwd_to_project_slug(cwd_a)   # "-Users-x-topstep-automation"
         _write_session_file(proj_a, "aaaa1111-0000-0000-0000-000000000001")
         # Write a checkpoint for project A
         (proj_a / "team-checkpoint.md").write_text("TOPSTEP", encoding="utf-8")
@@ -74,9 +70,9 @@ class TestCmdPostCompactCrossProjectIsolation(unittest.TestCase):
         # Small sleep ensures project B mtime is strictly newer
         time.sleep(0.01)
 
-        # Project B: fanugugc (no underscore → still returned by Strategy 4 when A is missed)
+        # Project B: fanugugc (no underscore → still returned by Strategy 5 when A is missed)
         cwd_b = "/Users/x/fanugugc"
-        slug_b_correct = _correct_slug(cwd_b)   # "-Users-x-fanugugc"
+        slug_b_correct = cwd_to_project_slug(cwd_b)   # "-Users-x-fanugugc"
         proj_b = tmp_path / "projects" / slug_b_correct
         _write_session_file(proj_b, "bbbb2222-0000-0000-0000-000000000002")
         # Give project B a team-checkpoint too (the one that must NOT appear)
@@ -85,8 +81,11 @@ class TestCmdPostCompactCrossProjectIsolation(unittest.TestCase):
         with (
             patch("cozempic.session.get_projects_dir", return_value=tmp_path / "projects"),
             patch("cozempic.session._session_id_from_process", return_value=None),
+            # Block Strategy 1 (active-transcript keyed by live Claude PID)
+            # so a real running session in the developer's home cannot bypass strict.
+            patch("cozempic.session.find_claude_pid", return_value=None),
         ):
-            output = self._run_post_compact(cwd=cwd_a)
+            output = _run_post_compact(cwd=cwd_a)
 
         self.assertNotIn(
             "FANNU", output,
@@ -102,8 +101,8 @@ class TestCmdPostCompactCrossProjectIsolation(unittest.TestCase):
 
     def test_falls_back_safely_when_no_session_found(self):
         """strict→None→Path(cwd) fallback must not crash and produce no output."""
-        import tempfile
         tmp_path = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp_path, ignore_errors=True)
         # Empty projects dir — no sessions at all
         (tmp_path / "projects").mkdir(parents=True, exist_ok=True)
 
@@ -114,8 +113,11 @@ class TestCmdPostCompactCrossProjectIsolation(unittest.TestCase):
         with (
             patch("cozempic.session.get_projects_dir", return_value=tmp_path / "projects"),
             patch("cozempic.session._session_id_from_process", return_value=None),
+            # Explicit isolation: block Strategy 1 so a real live Claude session
+            # on the host cannot inject an active-transcript record.
+            patch("cozempic.session.find_claude_pid", return_value=None),
         ):
-            output = self._run_post_compact(cwd=cwd)
+            output = _run_post_compact(cwd=cwd)
 
         self.assertEqual(output, "", "cmd_post_compact must be silent when no checkpoint exists.")
 
@@ -128,10 +130,8 @@ class TestCmdPostCompactCrossProjectIsolation(unittest.TestCase):
 
         This tests the include_global=False guard added to the read_team_checkpoint call.
         """
-        import tempfile
-        from cozempic.session import get_claude_dir
-
         tmp_path = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp_path, ignore_errors=True)
         (tmp_path / "projects").mkdir(parents=True, exist_ok=True)
 
         cwd = str(tmp_path / "my_project")
@@ -146,11 +146,14 @@ class TestCmdPostCompactCrossProjectIsolation(unittest.TestCase):
         with (
             patch("cozempic.session.get_projects_dir", return_value=tmp_path / "projects"),
             patch("cozempic.session._session_id_from_process", return_value=None),
+            # Explicit isolation: block Strategy 1 so a real live Claude session
+            # on the host cannot inject an active-transcript record.
+            patch("cozempic.session.find_claude_pid", return_value=None),
             # get_claude_dir is imported inside read_team_checkpoint via `from .session import`
             # so we patch it at the source module level.
             patch("cozempic.session.get_claude_dir", return_value=tmp_path / "claude_dir"),
         ):
-            output = self._run_post_compact(cwd=cwd)
+            output = _run_post_compact(cwd=cwd)
 
         self.assertNotIn(
             "GLOBAL_CHECKPOINT", output,
@@ -160,6 +163,105 @@ class TestCmdPostCompactCrossProjectIsolation(unittest.TestCase):
         self.assertEqual(
             output, "",
             "cmd_post_compact must be silent when only global checkpoint present."
+        )
+
+
+class TestPostCompactStrategy1Isolation(unittest.TestCase):
+    """R-1: cmd_post_compact must be hermetic when find_claude_pid is blocked.
+
+    Without an explicit find_claude_pid → None patch, a live Claude session on the
+    host can make Strategy 1 fire and return a wrong-project checkpoint.
+
+    RED at HEAD `ae7fe54`: find_claude_pid → None was absent from test_falls_back_safely
+    and test_global_checkpoint_not_read → those tests were incidentally safe only because
+    their empty projects dir triggered an early return before Strategy 1 ran.
+    GREEN after fix: both tests gain find_claude_pid → None; this guard also patches it.
+    """
+
+    def test_strategy1_blocked_when_find_claude_pid_is_none(self):
+        """R-1 guard: with find_claude_pid → None, Strategy 1 is explicitly blocked
+        and a cross-project session cannot contaminate cmd_post_compact output.
+
+        RED at HEAD `ae7fe54`: the existing test_falls_back_safely and
+        test_global_checkpoint_not_read do NOT patch find_claude_pid → None.
+        A real live session on the host could make lookup_active_transcript return a
+        record pointing at another project's session, injecting its checkpoint.
+
+        This test explicitly patches find_claude_pid → None and asserts that even
+        when a cross-project session file + checkpoint exist in the projects dir,
+        cmd_post_compact output is "" for a different cwd.
+
+        GREEN after fix: both production tests gain find_claude_pid → None.
+        """
+        tmp_path = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp_path, ignore_errors=True)
+
+        # Non-empty projects dir: project B has a session + checkpoint.
+        # Strategy 1 CAN fire here (find_sessions returns non-empty).
+        proj_b = tmp_path / "projects" / "-proj-b"
+        sess_b = "bbbb2222-0000-0000-0000-000000000002"
+        _write_session_file(proj_b, sess_b)
+        (proj_b / "team-checkpoint.md").write_text("PROJ_B_STATE", encoding="utf-8")
+
+        # cwd=project_a — no local session, no checkpoint
+        cwd_a_path = tmp_path / "project_a"
+        cwd_a_path.mkdir(exist_ok=True)
+        cwd_a = str(cwd_a_path)
+
+        with (
+            patch("cozempic.session.get_projects_dir", return_value=tmp_path / "projects"),
+            patch("cozempic.session._session_id_from_process", return_value=None),
+            # Explicit isolation: find_claude_pid → None blocks Strategy 1
+            # so lookup_active_transcript returns None → no cross-project leak.
+            patch("cozempic.session.find_claude_pid", return_value=None),
+        ):
+            output = _run_post_compact(cwd=cwd_a)
+
+        self.assertEqual(
+            output, "",
+            "cmd_post_compact must be silent for project_a even when project_b has "
+            "a session and checkpoint in the projects dir. Strategy 1 must be blocked "
+            "via find_claude_pid → None."
+        )
+
+class TestCorrectSlugUsesCwdToProjectSlug(unittest.TestCase):
+    """Characterization of cwd_to_project_slug normpath behavior (post-P0-C).
+
+    P0-C replaced 3 inline `re.sub(r"[^a-zA-Z0-9]", "-", cwd)` helpers with
+    direct cwd_to_project_slug calls.  The canonical function applies normpath
+    before slug-ifying, so trailing-slash inputs are normalized correctly.
+
+    This class holds a characterization test (not a behavioral RED/GREEN guard)
+    documenting the normpath contract the helpers now rely on.
+    """
+
+    def test_cwd_to_project_slug_normalizes_trailing_slash(self):
+        """Characterization: cwd_to_project_slug strips trailing slashes via normpath.
+
+        P0-C replaced the 3 inline `re.sub(r"[^a-zA-Z0-9]", "-", cwd)` helpers with
+        direct calls to cwd_to_project_slug.  The value of that swap is DRY + normpath-
+        correctness: the old inline formula produced "-Users-x-proj-" for trailing-slash
+        inputs (normpath not applied), while cwd_to_project_slug applies normpath first
+        and returns "-Users-x-proj".
+
+        This test characterizes the canonical behavior the helpers now rely on.  It is
+        NOT a behavioral RED/GREEN guard for the swap itself — cwd_to_project_slug is
+        production code that was already correct before P0-C; the swap's correctness is
+        verified by the diff (3 `re.sub` sites → `cwd_to_project_slug`), not by this test.
+
+        Canonical behavior:
+        - re.sub(r"[^a-zA-Z0-9]", "-", "/Users/x/proj/") → "-Users-x-proj-" (old inline, wrong)
+        - cwd_to_project_slug("/Users/x/proj/")           → "-Users-x-proj"  (canonical)
+        """
+        slug = cwd_to_project_slug("/Users/x/proj/")
+        self.assertEqual(
+            slug, "-Users-x-proj",
+            f"cwd_to_project_slug must strip trailing slash via normpath. Got {slug!r}."
+        )
+        self.assertFalse(
+            slug.endswith("-"),
+            f"cwd_to_project_slug must not produce a trailing '-' for trailing-slash inputs. "
+            f"Got {slug!r}."
         )
 
 

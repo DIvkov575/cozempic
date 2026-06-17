@@ -5,9 +5,11 @@ from __future__ import annotations
 from .helpers import (
     _METADATA_SINGLETON_KEY,
     get_content_blocks,
+    hashable_str,
     msg_bytes,
     set_content_blocks,
 )
+from ._validation import ConfigError
 from .registry import STRATEGIES
 from .types import Message, PruneAction, StrategyResult
 
@@ -70,8 +72,10 @@ def execute_actions(
         if idx in removals:
             continue
         for block in get_content_blocks(msg):
+            if not isinstance(block, dict):
+                continue
             if block.get("type") == "tool_result":
-                use_id = block.get("tool_use_id", "")
+                use_id = hashable_str(block.get("tool_use_id"))  # unhashable -> "" (R6)
                 if use_id:
                     tool_result_refs.add(use_id)
 
@@ -79,7 +83,9 @@ def execute_actions(
         if idx not in removals:
             continue
         for block in get_content_blocks(msg):
-            if block.get("type") == "tool_use" and block.get("id", "") in tool_result_refs:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use" and hashable_str(block.get("id")) in tool_result_refs:
                 removals.discard(idx)
                 break
 
@@ -115,12 +121,15 @@ def _relink_parent_chain(
     removed_uuids: set[str] = set()
 
     for idx, msg, _ in messages_before:
-        u = msg.get("uuid", "")
+        # hashable_str: uuid/parentUuid are top-level fields used as dict keys / set
+        # members; an unhashable value (poisoned JSONL) would crash the parent-relink
+        # (which runs on EVERY prune, OUTSIDE per-strategy isolation) (R6 crash class).
+        u = hashable_str(msg.get("uuid"))
         if u:
             if "parentUuid" in msg:
-                uuid_to_parent[u] = msg.get("parentUuid") or ""
+                uuid_to_parent[u] = hashable_str(msg.get("parentUuid"))
             if "logicalParentUuid" in msg:
-                uuid_to_logical[u] = msg.get("logicalParentUuid") or ""
+                uuid_to_logical[u] = hashable_str(msg.get("logicalParentUuid"))
         if idx in removals and u:
             removed_uuids.add(u)
 
@@ -143,15 +152,15 @@ def _relink_parent_chain(
         changed = False
         new_msg = msg
 
-        if msg.get("parentUuid") in removed_uuids:
+        if hashable_str(msg.get("parentUuid")) in removed_uuids:
             new_msg = dict(new_msg)
-            new_msg["parentUuid"] = resolve(msg["parentUuid"], uuid_to_parent)
+            new_msg["parentUuid"] = resolve(hashable_str(msg.get("parentUuid")), uuid_to_parent)
             changed = True
 
-        if msg.get("logicalParentUuid") in removed_uuids:
+        if hashable_str(msg.get("logicalParentUuid")) in removed_uuids:
             if new_msg is msg:
                 new_msg = dict(msg)
-            new_msg["logicalParentUuid"] = resolve(msg["logicalParentUuid"], uuid_to_logical)
+            new_msg["logicalParentUuid"] = resolve(hashable_str(msg.get("logicalParentUuid")), uuid_to_logical)
             changed = True
 
         if changed:
@@ -176,8 +185,10 @@ def fix_orphaned_tool_results(messages: list[Message]) -> tuple[list[Message], i
     tool_use_ids: set[str] = set()
     for _, msg, _ in messages:
         for block in get_content_blocks(msg):
+            if not isinstance(block, dict):
+                continue
             if block.get("type") == "tool_use":
-                use_id = block.get("id", "")
+                use_id = hashable_str(block.get("id"))  # unhashable -> "" (R6 crash class)
                 if use_id:
                     tool_use_ids.add(use_id)
 
@@ -193,8 +204,8 @@ def fix_orphaned_tool_results(messages: list[Message]) -> tuple[list[Message], i
 
         has_orphan = False
         for block in blocks:
-            if block.get("type") == "tool_result":
-                use_id = block.get("tool_use_id", "")
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                use_id = hashable_str(block.get("tool_use_id"))
                 if use_id and use_id not in tool_use_ids:
                     has_orphan = True
                     break
@@ -206,8 +217,11 @@ def fix_orphaned_tool_results(messages: list[Message]) -> tuple[list[Message], i
         # Filter out orphaned tool_result blocks, keep everything else
         new_blocks = []
         for block in blocks:
-            if block.get("type") == "tool_result":
-                use_id = block.get("tool_use_id", "")
+            # Non-dict elements are PRESERVED (append unchanged) — never dropped
+            # (that would be data loss); only a genuine orphaned tool_result dict
+            # is filtered.
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                use_id = hashable_str(block.get("tool_use_id"))
                 if use_id and use_id not in tool_use_ids:
                     orphans_fixed += 1
                     continue
@@ -265,11 +279,31 @@ def run_prescription(
     # __cozempic_metadata_singleton__ flag, which would leak to disk on the next
     # successful save_messages call (REVIEW-max A.3).
     try:
-        # Step 1: run strategies
+        # Step 1: run strategies. Each strategy is ISOLATED — a crash on a
+        # malformed/poisoned message (an unexpected non-dict/non-string field deep
+        # in untrusted JSONL) skips THAT strategy and continues with the rest,
+        # rather than aborting the whole prune. This is the systemic defense for the
+        # large untrusted-field surface: one bad message can no longer (a) abort
+        # `treat`/`reload`, or (b) crash the guard cycle into a respawn storm.
+        # KeyboardInterrupt/SystemExit (and the structural PruneValidationError from
+        # later steps) still propagate; only a strategy-internal error is contained.
         for sname in strategy_names:
             if sname not in STRATEGIES:
                 continue
-            sr = STRATEGIES[sname].func(current, config)
+            try:
+                sr = STRATEGIES[sname].func(current, config)
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except ConfigError:
+                # A user CONFIG error (bad coerce_non_negative_int value) must NOT be
+                # swallowed and mislabeled as a "malformed message" — that hides the
+                # very validation this layer adds. Propagate it (ynaamane review #6).
+                raise
+            except Exception as _strat_exc:
+                import sys as _sys
+                print(f"  Cozempic: strategy '{sname}' skipped after an unexpected error "
+                      f"(malformed message?): {_strat_exc!r}", file=_sys.stderr)
+                continue
             results.append(sr)
             if sr.actions:
                 old_current = current

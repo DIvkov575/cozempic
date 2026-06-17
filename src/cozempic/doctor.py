@@ -491,11 +491,28 @@ def check_corrupted_tool_use() -> CheckResult:
     )
 
 
+def _raw_content_blocks(obj) -> list:
+    """Content blocks of a RAW-parsed (json.loads, not session._parse_one_line)
+    JSONL line, defended against the non-dict shapes the session loader wraps but
+    doctor's own scanners see raw: a non-dict top-level line, a non-dict inner
+    "message", or a non-list content. Returns [] for any non-conforming shape so
+    one poisoned session can't abort the whole doctor run with an AttributeError
+    (R4 findings doctor-nondict-*). Callers still isinstance-guard each element.
+    """
+    if not isinstance(obj, dict):
+        return []
+    msg = obj.get("message")
+    if not isinstance(msg, dict):
+        return []
+    content = msg.get("content", [])
+    return content if isinstance(content, list) else []
+
+
 def _count_corrupted_tool_use(path: Path) -> int:
     """Count corrupted tool_use blocks in a session file."""
     import json as _json
     count = 0
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, "r", encoding="utf-8", errors="surrogateescape") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -504,11 +521,11 @@ def _count_corrupted_tool_use(path: Path) -> int:
                 obj = _json.loads(line)
             except _json.JSONDecodeError:
                 continue
-            content = obj.get("message", {}).get("content", [])
-            if not isinstance(content, list):
-                continue
-            for block in content:
-                if block.get("type") == "tool_use" and len(block.get("name", "")) > 200:
+            for block in _raw_content_blocks(obj):
+                if not isinstance(block, dict):
+                    continue
+                name = block.get("name", "")
+                if block.get("type") == "tool_use" and isinstance(name, str) and len(name) > 200:
                     count += 1
     return count
 
@@ -523,7 +540,7 @@ def fix_corrupted_tool_use() -> str:
     import re
     import shutil
 
-    from .session import _PruneLock, PruneLockError
+    from .session import _PruneLock, PruneLockError, _FileSnapshot, _parse_delta_lines, _split_physical_lines
 
     sessions = find_sessions()
     total_fixed = 0
@@ -555,7 +572,35 @@ def fix_corrupted_tool_use() -> str:
         backup = path.with_suffix(f".{ts}.jsonl.bak")
         shutil.copy2(path, backup)
 
-        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+        # Read the file ONCE and derive both the working buffer AND the snapshot
+        # from the SAME bytes (snapshot.from_bytes) — so a line Claude appends in
+        # the window cannot land in both `lines` and the append-delta (the TOCTOU
+        # duplication audit P1). Recovers concurrent appends without clobbering;
+        # this function previously read_text→atomic_write with no snapshot at all.
+        _raw = path.read_bytes()
+        snapshot = _FileSnapshot.from_bytes(path, _raw)
+        # STRICT decode — doctor WRITES the buffer back. A non-UTF-8 byte must skip
+        # the session (can't safely repair), never be rewritten to U+FFFD.
+        try:
+            _text = _raw.decode("utf-8")
+        except UnicodeDecodeError:
+            skipped_sessions.append(sess["session_id"])
+            try:
+                _prune_lock_ctx.__exit__(None, None, None)
+            except Exception:
+                pass
+            continue
+        # _split_physical_lines (not str.splitlines) so a corrupt tool_use on a
+        # line that ALSO carries a raw U+2028/U+2029/U+0085 isn't torn into
+        # unparseable fragments and silently skipped (4th sibling of the class).
+        # Re-append "\n" to keep the keepends "".join(lines) reconstruction, BUT
+        # only re-terminate the FINAL line if the original had a trailing newline —
+        # otherwise a mid-write partial last line gets a spurious "\n" that splits
+        # it into two broken fragments when Claude completes it (confirmed P2).
+        _parts = _split_physical_lines(_text)
+        lines = [p + "\n" for p in _parts]
+        if lines and not _text.endswith(("\n", "\r")):
+            lines[-1] = _parts[-1]  # preserve the un-terminated partial last line
         fixed_in_session = 0
 
         for idx, line in enumerate(lines):
@@ -567,16 +612,14 @@ def fix_corrupted_tool_use() -> str:
             except json.JSONDecodeError:
                 continue
 
-            content = obj.get("message", {}).get("content", [])
-            if not isinstance(content, list):
-                continue
-
             changed = False
-            for block in content:
+            for block in _raw_content_blocks(obj):
+                if not isinstance(block, dict):
+                    continue
                 if block.get("type") != "tool_use":
                     continue
                 name = block.get("name", "")
-                if len(name) <= 200:
+                if not isinstance(name, str) or len(name) <= 200:
                     continue
 
                 # Parse corrupted name: 'ToolName" key1="val1" key2="val2"...'
@@ -600,17 +643,46 @@ def fix_corrupted_tool_use() -> str:
                 changed = True
 
             if changed:
-                lines[idx] = json.dumps(obj, ensure_ascii=False) + "\n"
+                # ensure_ascii=True (NOT False): a repaired line may carry a lone
+                # surrogate (a \udXXX escape CC emits for a sliced astral char) which
+                # json.loads turned into a real surrogate char. ensure_ascii=False would
+                # re-emit it raw -> atomic_write_text's strict utf-8 write raises
+                # UnicodeEncodeError, aborting the whole `doctor --fix` run (R7: the
+                # un-swept sibling of the save_messages surrogate fix). ensure_ascii=True
+                # re-escapes every surrogate to ASCII \uXXXX (always encodable; the file
+                # was strict-decoded above so no real-byte/in-band surrogate is present).
+                lines[idx] = json.dumps(obj) + "\n"
 
         try:
             if fixed_in_session > 0:
-                # Atomic write via mkstemp — collision-safe if a parallel
-                # writer (shouldn't happen since we hold _PruneLock, but
-                # belt-and-suspenders) targets the same session.
-                from .helpers import atomic_write_text
-                atomic_write_text(path, "".join(lines))
-                total_fixed += fixed_in_session
-                sessions_fixed += 1
+                # Single read for both the prefix-check and the delta (no TOCTOU
+                # window between classify() and read_delta()).
+                kind, _delta_bytes = snapshot.classify_and_delta(path)
+                if kind == "conflict":
+                    # Claude rewrote/truncated the prefix — our repaired buffer is
+                    # stale. Refuse to write (the .bak preserves the pre-fix state);
+                    # the user can re-run doctor once the session is idle.
+                    skipped_sessions.append(sess["session_id"])
+                elif kind == "appended":
+                    # Claude appended new lines after our read — keep them so the
+                    # repair never drops live turns. Validate the delta (raises if
+                    # Claude is mid-write / corrupt → treat as conflict, skip).
+                    try:
+                        delta = [ln + "\n" for ln in _parse_delta_lines(_delta_bytes)]
+                    except Exception:
+                        # mid-write (no newline boundary) or corrupt delta — don't risk it
+                        skipped_sessions.append(sess["session_id"])
+                        delta = None
+                    if delta is not None:
+                        from .helpers import atomic_write_text
+                        atomic_write_text(path, "".join(lines) + "".join(delta))
+                        total_fixed += fixed_in_session
+                        sessions_fixed += 1
+                else:  # "unchanged" — safe to write our repaired buffer
+                    from .helpers import atomic_write_text
+                    atomic_write_text(path, "".join(lines))
+                    total_fixed += fixed_in_session
+                    sessions_fixed += 1
         finally:
             try:
                 _prune_lock_ctx.__exit__(None, None, None)
@@ -682,7 +754,7 @@ def _count_orphaned_tool_results(path: Path) -> int:
     tool_use_ids: set[str] = set()
     all_results: list[str] = []
 
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, "r", encoding="utf-8", errors="surrogateescape") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -691,17 +763,16 @@ def _count_orphaned_tool_results(path: Path) -> int:
                 obj = _json.loads(line)
             except _json.JSONDecodeError:
                 continue
-            content = obj.get("message", {}).get("content", [])
-            if not isinstance(content, list):
-                continue
-            for block in content:
+            for block in _raw_content_blocks(obj):
+                if not isinstance(block, dict):
+                    continue
                 if block.get("type") == "tool_use":
                     use_id = block.get("id", "")
-                    if use_id:
+                    if isinstance(use_id, str) and use_id:  # unhashable id -> skip (R6 crash class)
                         tool_use_ids.add(use_id)
                 elif block.get("type") == "tool_result":
                     use_id = block.get("tool_use_id", "")
-                    if use_id:
+                    if isinstance(use_id, str) and use_id:  # kept str-only: `r not in <set>` below
                         all_results.append(use_id)
 
     return sum(1 for r in all_results if r not in tool_use_ids)
@@ -717,7 +788,7 @@ def fix_orphaned_tool_results() -> str:
     """
     from .session import (
         _PruneLock, PruneConflictError, PruneLockError,
-        load_messages, save_messages, snapshot_session,
+        load_messages_and_snapshot, save_messages,
     )
 
     sessions = find_sessions()
@@ -735,11 +806,9 @@ def fix_orphaned_tool_results() -> str:
 
         from .executor import fix_orphaned_tool_results as _fix
         path = sess["path"]
-        # Take snapshot BEFORE load_messages so append-conflict detection
-        # in save_messages can correctly identify if Claude wrote new lines
-        # between our load and save.
-        snapshot = snapshot_session(path)
-        messages = load_messages(path)
+        # Read once: messages + snapshot from the SAME bytes so a concurrent
+        # append can't be both loaded AND counted in the delta (TOCTOU dup).
+        messages, snapshot = load_messages_and_snapshot(path)
         fixed_messages, orphans = _fix(messages)
 
         if orphans > 0:
@@ -1350,10 +1419,36 @@ def run_doctor(fix: bool = False) -> list[CheckResult]:
     """Run all health checks. If fix=True, apply available fixes for issues."""
     results = []
     for name, check_fn, fix_fn in ALL_CHECKS:
-        result = check_fn()
+        # Defense in depth (R7): one poisoned session must NOT abort the whole doctor
+        # run. A check/fix that raises is reported as an error for THAT check and the
+        # remaining checks/fixes still run.
+        try:
+            result = check_fn()
+        except Exception as _check_exc:
+            results.append(CheckResult(name=name, status="error",
+                message=f"check raised an unexpected error: {_check_exc!r}"))
+            continue
         results.append(result)
         if fix and result.status in ("issue", "warning") and result.fix_description and fix_fn:
-            fix_msg = fix_fn()
-            result.message += f"\n      Fixed: {fix_msg}"
-            result.status = "fixed"
+            try:
+                fix_msg = fix_fn()
+            except Exception as _fix_exc:
+                result.message += f"\n      Fix raised an unexpected error (skipped): {_fix_exc!r}"
+                continue
+            # Only claim "fixed" if the issue is actually gone — re-run the check
+            # and verify. A no-op fix ("nothing found", "skipped N sessions") or a
+            # partial/failed fix previously reported false success (audit P1).
+            try:
+                recheck = check_fn()
+            except Exception:
+                recheck = None
+            if recheck is not None and recheck.status == "ok":
+                result.status = "fixed"
+                result.message += f"\n      Fixed: {fix_msg}"
+            else:
+                # Still not clean — surface the real post-fix state, don't lie.
+                if recheck is not None:
+                    result.status = recheck.status
+                    result.message = recheck.message
+                result.message += f"\n      Fix attempted (not fully resolved): {fix_msg}"
     return results

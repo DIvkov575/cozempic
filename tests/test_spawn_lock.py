@@ -34,16 +34,33 @@ def _race_worker(
     on the spawn-lock contract, not the daemon lifecycle."""
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
+    import subprocess as _subprocess
     from unittest.mock import patch as _patch
 
     from cozempic.guard import start_guard_daemon
+
+    _real_popen = _subprocess.Popen
 
     class _DummyProc:
         def __init__(self, pid):
             self.pid = pid
 
     def _fake_popen(cmd_parts, **kwargs):
-        return _DummyProc(900_000 + worker_index)
+        # Fake ONLY the daemon-spawn Popen (python -m cozempic.cli guard).
+        # Every other subprocess use — notably the `ps` identity probe inside
+        # _is_cozempic_guard_process, which subprocess.run drives via
+        # `with Popen(...) as p: p.communicate()` — must run for real; the
+        # global Popen patch otherwise hands `ps` a _DummyProc with no
+        # __enter__/communicate, raising AttributeError and turning every
+        # loser worker into an 'undefined' outcome (the deterministically-dead
+        # gate this test is supposed to be).
+        parts = cmd_parts if isinstance(cmd_parts, (list, tuple)) else [cmd_parts]
+        is_daemon_spawn = any("cozempic.cli" in str(p) for p in parts) or (
+            any("cozempic" in str(p) for p in parts) and any(str(p) == "guard" for p in parts)
+        )
+        if is_daemon_spawn:
+            return _DummyProc(900_000 + worker_index)
+        return _real_popen(cmd_parts, **kwargs)
 
     with (
         _patch("cozempic.guard.subprocess.Popen", side_effect=_fake_popen),

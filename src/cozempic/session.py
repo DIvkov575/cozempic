@@ -16,6 +16,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
+from .helpers import _pid_is_alive as _pid_alive
 from .types import Message
 
 
@@ -55,6 +56,22 @@ class _FileSnapshot:
         self.size: int = st.st_size
         self.content_hash: str = hashlib.md5(path.read_bytes()).hexdigest()
 
+    @classmethod
+    def from_bytes(cls, path: Path, raw: bytes) -> "_FileSnapshot":
+        """Build a snapshot whose size/hash describe `raw` exactly (the bytes the
+        caller actually loaded), with the inode from `path`. Pairing this with a
+        SINGLE read of the file (see load_messages_and_snapshot) closes the TOCTOU
+        where a line appended between snapshot() and a later load() landed in BOTH
+        the loaded messages AND the delta — duplicating it on append-merge."""
+        self = cls.__new__(cls)
+        try:
+            self.inode = path.stat().st_ino
+        except OSError:
+            self.inode = -1
+        self.size = len(raw)
+        self.content_hash = hashlib.md5(raw).hexdigest()
+        return self
+
     def classify(self, path: Path) -> Literal["unchanged", "appended", "conflict"]:
         """Classify what happened to the file since this snapshot was taken."""
         try:
@@ -64,7 +81,17 @@ class _FileSnapshot:
         if st.st_ino != self.inode:
             return "conflict"
         if st.st_size == self.size:
-            return "unchanged"
+            # Equal SIZE is not equal CONTENT: Claude Code can rewrite a line in
+            # place to an equal-length value (e.g. an edited JSONL field, an
+            # injected equal-size marker). Re-hash before declaring "unchanged" —
+            # otherwise save_messages() would os.replace() over a live rewrite and
+            # silently lose it (data loss). A same-size content change is a conflict.
+            try:
+                if hashlib.md5(path.read_bytes()).hexdigest() == self.content_hash:
+                    return "unchanged"
+            except OSError:
+                return "conflict"
+            return "conflict"
         if st.st_size > self.size:
             data = path.read_bytes()
             if hashlib.md5(data[: self.size]).hexdigest() == self.content_hash:
@@ -74,6 +101,32 @@ class _FileSnapshot:
     def read_delta(self, path: Path) -> bytes:
         """Return bytes appended since snapshot. Caller must verify 'appended' first."""
         return path.read_bytes()[self.size :]
+
+    def classify_and_delta(self, path: Path) -> tuple[Literal["unchanged", "appended", "conflict"], bytes]:
+        """Classify AND return the append-delta from a SINGLE read of the file.
+
+        classify() + read_delta() are two separate reads, so a concurrent rewrite
+        landing between them could merge a tail the prefix-check never validated
+        (TOCTOU; Claude Code is not under our _PruneLock). Reading once and deriving
+        both the prefix-hash decision and the delta from the same bytes closes that
+        window. Returns (state, delta_bytes); delta is non-empty only for "appended".
+        """
+        try:
+            st = path.stat()
+            if st.st_ino != self.inode:
+                return "conflict", b""
+            data = path.read_bytes()
+        except OSError:
+            return "conflict", b""
+        cur = len(data)
+        if cur == self.size:
+            return ("unchanged" if hashlib.md5(data).hexdigest() == self.content_hash
+                    else "conflict"), b""
+        if cur > self.size:
+            if hashlib.md5(data[: self.size]).hexdigest() == self.content_hash:
+                return "appended", data[self.size:]
+            return "conflict", b""
+        return "conflict", b""
 
 
 def snapshot_session(path: Path) -> _FileSnapshot:
@@ -85,14 +138,23 @@ def _parse_delta_lines(delta: bytes) -> list[str]:
     """Parse appended bytes into validated JSONL lines.
 
     Raises ValueError if the delta does not end on a newline boundary (Claude
-    mid-write) or json.JSONDecodeError if any line is not valid JSON.
+    mid-write), if the bytes are not valid UTF-8 (UnicodeDecodeError, a ValueError
+    subclass), or json.JSONDecodeError if any line is not valid JSON.
     Returns a list of raw JSON line strings (no trailing newline per element).
     """
-    text = delta.decode("utf-8", errors="replace")
+    # errors="surrogateescape" mirrors the load/save decode: an appended line whose
+    # bytes are not valid UTF-8 (a binary tool_result Claude wrote in the prune
+    # window) maps to reversible surrogates and is re-encoded to the EXACT bytes by
+    # the surrogateescape-opened append file — lossless, never U+FFFD. A
+    # STRUCTURALLY invalid byte still fails the per-line json.loads below and is
+    # handled as "incomplete/conflict — defer", not a corrupting merge.
+    text = delta.decode("utf-8", "surrogateescape")
     if not text.endswith("\n"):
         raise ValueError("delta does not end on newline boundary — Claude may be mid-write")
     lines = []
-    for raw in text.splitlines():
+    # _split_physical_lines (not str.splitlines) so an appended JSONL line carrying
+    # a raw U+2028/U+2029/U+0085 isn't torn into invalid fragments on append-merge.
+    for raw in _split_physical_lines(text):
         raw = raw.strip()
         if not raw:
             continue
@@ -190,7 +252,12 @@ def find_sessions(project_filter: str | None = None) -> list[dict]:
             mtime = datetime.fromtimestamp(f.stat().st_mtime)
             session_id = f.stem
             line_count = 0
-            with open(f, "r", encoding="utf-8") as fh:
+            # errors="surrogateescape": this only COUNTS lines, but a single stray
+            # non-UTF-8 byte in ANY session file must not crash enumeration for ALL
+            # sessions (R5 completeness finding). load_messages now tolerates such
+            # bytes; the enumerator every CLI command + the guard hot path hits first
+            # must too.
+            with open(f, "r", encoding="utf-8", errors="surrogateescape") as fh:
                 for _ in fh:
                     line_count += 1
             sessions.append({
@@ -294,14 +361,18 @@ def _match_session_by_text(sessions: list[dict], match_text: str) -> dict | None
     """
     for sess in sorted(sessions, key=lambda s: s["mtime"], reverse=True):
         try:
-            with open(sess["path"], "r", encoding="utf-8") as f:
+            # errors="surrogateescape": a stray byte must not make a session with the
+            # marker INVISIBLE to text resolution (it would fall through to weaker
+            # cwd/mtime strategies and risk resolving the WRONG session). The old strict
+            # open + catch-and-skip silently dropped the whole session (R6).
+            with open(sess["path"], "r", encoding="utf-8", errors="surrogateescape") as f:
                 # Read last 50 lines efficiently
                 lines = f.readlines()
                 tail = lines[-50:] if len(lines) > 50 else lines
                 tail_text = "".join(tail)
                 if match_text in tail_text:
                     return sess
-        except (OSError, UnicodeDecodeError):
+        except OSError:
             continue
     return None
 
@@ -353,7 +424,10 @@ def find_current_session(
                     "session_id": p.stem,
                     "size": st.st_size,
                     "mtime": datetime.fromtimestamp(st.st_mtime),
-                    "lines": sum(1 for _ in open(p, "r", encoding="utf-8")),
+                    # surrogateescape (R5): a stray byte must not crash resolution of
+                    # the live session (UnicodeDecodeError is a ValueError, NOT caught
+                    # by `except OSError` below) — matches _match_session_by_text.
+                    "lines": sum(1 for _ in open(p, "r", encoding="utf-8", errors="surrogateescape")),
                 }
             except OSError:
                 pass
@@ -549,20 +623,6 @@ def _active_sessions_path() -> Path:
     return get_claude_dir() / _ACTIVE_SESSIONS_FILENAME
 
 
-def _pid_alive(pid: int) -> bool:
-    """True if `pid` is a live process. Signal 0 probes without delivering."""
-    try:
-        os.kill(int(pid), 0)
-        return True
-    except (ProcessLookupError, OverflowError, ValueError):
-        return False
-    except PermissionError:
-        # Exists but owned by another user — still alive.
-        return True
-    except OSError:
-        return False
-
-
 def record_active_transcript(transcript_path: str, claude_pid: int | None = None) -> None:
     """Record the active session's transcript keyed by the live Claude PID.
 
@@ -675,22 +735,159 @@ def _parse_one_line(raw: str, idx: int) -> Message | None:
             file=sys.stderr,
         )
         return None
-    byte_len = len(stripped.encode("utf-8"))
+    # surrogateescape: a line decoded with surrogateescape (non-UTF-8 bytes mapped
+    # to surrogates) must re-encode with the SAME handler to recover the true byte
+    # length — strict encode would raise on the surrogate.
+    byte_len = len(stripped.encode("utf-8", "surrogateescape"))
     try:
-        return (idx, json.loads(stripped), byte_len)
+        obj = json.loads(stripped)
     except json.JSONDecodeError:
         return (idx, {"_raw": stripped, "_parse_error": True}, byte_len)
+    # ROOT GUARD (mission-critical C4): a line can be VALID JSON yet not an object
+    # — a bare "string", number, true/null, or [array]. Every downstream consumer
+    # (get_msg_type, get_content_blocks, the prune strategies, safety.enforce_floor,
+    # the token estimators) assumes the message element is a dict and would crash
+    # on a non-dict. Wrap it as a _parse_error so it round-trips losslessly on save
+    # (save_messages writes _raw) but no consumer ever sees a non-dict message.
+    if not isinstance(obj, dict):
+        return (idx, {"_raw": stripped, "_parse_error": True}, byte_len)
+    # Also wrap a dict line whose inner "message" is PRESENT but NON-dict (a bare
+    # string/number/array) — many consumers do msg["message"].get(...) / {**inner}
+    # and would crash. Treat it as opaque (preserve verbatim via _raw on save,
+    # never pruned). A line with NO "message" key (summary, file-history-snapshot,
+    # etc.) is normal and left as-is.
+    if "message" in obj and not isinstance(obj["message"], dict):
+        return (idx, {"_raw": stripped, "_parse_error": True}, byte_len)
+    # ROOT GUARD (mission-critical R4 P0): `_raw`/`_parse_error` are RESERVED
+    # loader-internal sentinel keys — the ONLY messages that may legitimately carry
+    # them are the wrappers produced ABOVE (which return before reaching here). A
+    # genuine on-disk dict carrying them is forged/colliding (no real CC message
+    # uses these keys). If we passed it through, save_messages would trust
+    # msg.get("_parse_error") as a control flag and write msg["_raw"] VERBATIM in
+    # place of the real line — silently substituting attacker/tool-authored bytes
+    # for genuine content (data loss + injection), or KeyError/TypeError on a
+    # missing/non-str _raw (crash). Strip the sentinel keys so the save side can
+    # only ever honor a wrapper the loader itself created.
+    if "_raw" in obj or "_parse_error" in obj:
+        obj = {k: v for k, v in obj.items() if k not in ("_raw", "_parse_error")}
+    # ROOT GUARD (R6 unhashable-uuid class): uuid / parentUuid / logicalParentUuid are
+    # STRUCTURAL DAG fields used as set members / dict keys at ~12 sites across
+    # safety.enforce_floor / validate_post_prune, executor._relink_parent_chain, and the
+    # guard — an unhashable (list/dict) value crashes the prune EVERY cycle (respawn
+    # storm). A real CC transcript ALWAYS writes these as a str (or null for a root
+    # parent); a present non-str is malformed. Wrap the whole line as opaque _parse_error
+    # (preserved verbatim via _raw on save, never DAG-linked or pruned) so NO consumer
+    # ever sees a non-str DAG field — the systemic fix, vs per-site coercion.
+    for _dag_key in ("uuid", "parentUuid", "logicalParentUuid"):
+        _dag_val = obj.get(_dag_key)
+        if _dag_val is not None and not isinstance(_dag_val, str):
+            return (idx, {"_raw": stripped, "_parse_error": True}, byte_len)
+    return (idx, obj, byte_len)
+
+
+def _jsonl_line(msg: dict) -> str:
+    """Serialize a message dict to its JSONL line, encodable by the surrogateescape
+    save file in ALL cases.
+
+    ensure_ascii=False is preferred: a non-UTF-8 byte INSIDE a string value decoded
+    to a U+DC80..U+DCFF surrogate re-encodes to the EXACT original byte (byte-exact
+    round-trip), and normal Unicode is written as raw UTF-8 matching CC's own
+    JSON.stringify. BUT a LONE surrogate OUTSIDE U+DC80..U+DCFF — e.g. a JSON-escaped
+    high surrogate `\\ud83d` that CC emits for a sliced astral char — cannot be encoded
+    by the surrogateescape file handler and would raise UnicodeEncodeError mid-save. On
+    the guard path that crash lands AFTER Claude is SIGTERM'd but BEFORE resume = Claude
+    killed-but-not-resumed + daemon death (R6 P0). For such a line, fall back to
+    ensure_ascii=True so every surrogate becomes an ASCII `\\uXXXX` escape (always
+    encodable; still round-trips losslessly on reload). The scan is gated on isascii()
+    so the common path pays nothing."""
+    s = json.dumps(msg, separators=(",", ":"), ensure_ascii=False)
+    if s.isascii():
+        return s
+    # Escape ONLY the out-of-band lone surrogates (anything the surrogateescape file
+    # CAN'T encode), leaving in-band U+DC80..U+DCFF raw so a real non-UTF-8 byte stays
+    # BYTE-EXACT even when it shares a line with a sliced-astral \udXXX escape (R7:
+    # the whole-line ensure_ascii=True fallback drifted the real byte to literal text).
+    # A surrogate char inside a JSON string and its \uXXXX escaped form decode
+    # identically, so this rewrite is JSON-safe and round-trips losslessly.
+    out = []
+    rewrote = False
+    for c in s:
+        o = ord(c)
+        if 0xD800 <= o <= 0xDFFF and not (0xDC80 <= o <= 0xDCFF):
+            out.append("\\u%04x" % o)
+            rewrote = True
+        else:
+            out.append(c)
+    return "".join(out) if rewrote else s
+
+
+def _split_physical_lines(text: str) -> list[str]:
+    """Split JSONL text into physical lines EXACTLY as text-mode open() iterates.
+
+    Critically NOT ``str.splitlines()``: that also breaks on Unicode line
+    separators (U+2028 / U+2029 / U+0085 and the C0 VT/FF/FS/GS/RS) which are
+    LEGAL raw inside JSON strings — JS ``JSON.stringify`` (CC's transcript writer)
+    emits U+2028/U+2029 unescaped — so splitlines() would tear a single valid JSON
+    line into multiple un-parseable fragments and corrupt it on save. open() text
+    mode only universal-newline-splits on \\n / \\r / \\r\\n, which we replicate:
+    normalize \\r\\n and \\r to \\n, split on \\n, drop the trailing-newline artifact.
+    """
+    # Only pay the two full-buffer normalization copies when a CR is actually
+    # present — JSONL is overwhelmingly \n-only, so the common path is a single
+    # split() with no extra copy (C9: cuts the read-once peak-memory multiplier).
+    if "\r" in text:
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()  # final newline does not start a new physical line
+    return lines
 
 
 def load_messages(path: Path) -> list[Message]:
     """Load JSONL file. Returns list of (line_index, message_dict, byte_size)."""
     messages: list[Message] = []
-    with open(path, "r", encoding="utf-8") as f:
+    # errors="surrogateescape": a non-UTF-8 byte (binary tool_result, truncated
+    # multibyte) is mapped to a reversible surrogate, NOT silently replaced with
+    # U+FFFD. save_messages re-encodes with the same handler so the exact original
+    # bytes round-trip — lossless, unlike "replace" (corrupts) and unlike strict
+    # (aborts → permanently inert guard, R4 finding non-utf8-inert-forever).
+    with open(path, "r", encoding="utf-8", errors="surrogateescape") as f:
         for i, line in enumerate(f):
             parsed = _parse_one_line(line, i)
             if parsed is not None:
                 messages.append(parsed)
     return messages
+
+
+def load_messages_and_snapshot(path: Path) -> tuple[list[Message], "_FileSnapshot"]:
+    """Read the file ONCE and return (messages, snapshot) derived from the SAME
+    bytes — so the snapshot's size/hash exactly describe the loaded messages.
+
+    Use this on mutate-then-save paths instead of the two-step
+    ``snapshot_session(path)`` + ``load_messages(path)``: those took the snapshot
+    and then re-read the file, and any line appended in that window was both
+    loaded AND counted in the append delta, duplicating it on save (the TOCTOU
+    audit P1). Reading once eliminates the window entirely."""
+    raw = path.read_bytes()
+    snapshot = _FileSnapshot.from_bytes(path, raw)
+    messages: list[Message] = []
+    # errors="surrogateescape" (R4 fix, supersedes the round-3 strict abort): a
+    # non-UTF-8 byte must NOT be rewritten to U+FFFD and os.replace()'d over the
+    # live transcript (corruption — the reason strict was chosen). But strict ABORTED
+    # the prune every cycle, so the guard went permanently inert on any session that
+    # picked up one stray byte and the user sailed into auto-compaction
+    # (R4 finding non-utf8-inert-forever). surrogateescape resolves the tension: bad
+    # bytes map to reversible surrogates and save_messages re-encodes with the SAME
+    # handler, so the exact original bytes round-trip losslessly AND the prune can
+    # proceed. Verified: in-string bytes survive via json escaping, structural bytes
+    # via the _raw passthrough written through the surrogateescape-opened tmp file.
+    text = raw.decode("utf-8", "surrogateescape")
+    del raw  # C9: free the bytes copy before line processing to cap peak memory
+    for i, line in enumerate(_split_physical_lines(text)):
+        parsed = _parse_one_line(line, i)
+        if parsed is not None:
+            messages.append(parsed)
+    return messages, snapshot
 
 
 # ─── Incremental JSONL read (read-only scan path) ───────────────────────────
@@ -742,7 +939,10 @@ def _parse_jsonl_chunk(
     """
     out: list[Message] = []
     lines_consumed = 0
-    for offset, raw in enumerate(chunk.splitlines()):
+    # _split_physical_lines (not str.splitlines) so a raw U+2028/U+2029/U+0085
+    # inside a JSON string doesn't tear one line into invalid fragments — keeps
+    # this read-only incremental path consistent with load_messages().
+    for offset, raw in enumerate(_split_physical_lines(chunk)):
         lines_consumed += 1
         parsed = _parse_one_line(raw, start_line_index + offset)
         if parsed is not None:
@@ -809,10 +1009,11 @@ def load_messages_incremental(path: Path) -> list[Message]:
             return list(entry.messages)
 
         complete = raw_bytes[: last_newline + 1]
-        try:
-            chunk = complete.decode("utf-8")
-        except UnicodeDecodeError:
-            chunk = complete.decode("utf-8", errors="replace")
+        # surrogateescape (ynaamane review, LOW): mirror load_messages /
+        # load_messages_and_snapshot rather than the lossy U+FFFD "replace". This is
+        # the read-only incremental path so the only effect is correct byte_len
+        # accounting on non-UTF-8 lines, but it keeps every decode path consistent.
+        chunk = complete.decode("utf-8", "surrogateescape")
 
         new_messages, lines_consumed = _parse_jsonl_chunk(
             chunk, entry.next_line_index
@@ -868,25 +1069,38 @@ def save_messages(
     )
     tmp_path = Path(tmp_name)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+        # errors="surrogateescape" mirrors the load decode so a _raw passthrough
+        # carrying surrogate-mapped bytes (a structurally-invalid-UTF-8 line) is
+        # re-encoded to its EXACT original bytes rather than raising UnicodeEncodeError.
+        with os.fdopen(fd, "w", encoding="utf-8", errors="surrogateescape") as f:
             for _, msg, _ in messages:
-                if msg.get("_parse_error"):
+                # Honor the loader's _raw passthrough ONLY for a well-formed wrapper:
+                # _parse_error is True AND _raw is a str. The loader strips these
+                # reserved keys from genuine on-disk dicts (so a forged content key
+                # can't reach here), but defend anyway — a missing/non-str _raw must
+                # re-serialize, never KeyError/TypeError mid-save (which on the guard
+                # path aborts AFTER Claude is SIGTERM'd but BEFORE resume).
+                if msg.get("_parse_error") is True and isinstance(msg.get("_raw"), str):
+                    # _raw came from a surrogateescape decode of a structurally-invalid
+                    # line, so any surrogates it carries are in U+DC80..U+DCFF (real
+                    # bytes) — always encodable by the surrogateescape file. Write verbatim.
                     f.write(msg["_raw"] + "\n")
                 else:
-                    f.write(json.dumps(msg, separators=(",", ":")) + "\n")
+                    f.write(_jsonl_line(msg) + "\n")
             f.flush()
             os.fsync(f.fileno())
 
         # ── Append-aware conflict detection ──────────────────────────────────
         if snapshot is not None:
-            state = snapshot.classify(path)
+            # Single read for BOTH the prefix-hash check and the delta — classify()
+            # then read_delta() was two reads with a TOCTOU window between them.
+            state, delta = snapshot.classify_and_delta(path)
             if state == "conflict":
                 tmp_path.unlink(missing_ok=True)
                 raise PruneConflictError(
                     f"Session file was modified (prefix changed) while pruning: {path}"
                 )
             if state == "appended":
-                delta = snapshot.read_delta(path)
                 try:
                     extra_lines = _parse_delta_lines(delta)
                 except (ValueError, json.JSONDecodeError) as exc:
@@ -896,7 +1110,7 @@ def save_messages(
                         f"Session file has an incomplete append — deferring prune: {path}"
                     ) from exc
                 if extra_lines:
-                    with open(tmp_path, "a", encoding="utf-8") as fa:
+                    with open(tmp_path, "a", encoding="utf-8", errors="surrogateescape") as fa:
                         for line in extra_lines:
                             fa.write(line + "\n")
                         fa.flush()

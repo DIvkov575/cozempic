@@ -188,10 +188,20 @@ def parse_env_positive_int(name: str, *, maximum: int | None = None) -> int | No
     ``pct = total / window`` rounds toward 0 when window is huge).
     """
     raw = os.environ.get(name)
-    if raw is None or raw == "":
+    if raw is None:
+        return None
+    stripped = raw.strip()
+    if stripped == "":
+        # Whitespace-only (raw non-empty) is set but carries no integer — warn
+        # so the user knows their override was ignored.  Genuine empty string
+        # (export VAR=) is unset-equivalent; silently ignore it.
+        # (Regression fix: ae85bcc dropped whitespace-only silently; origin/main
+        # let int(raw) raise ValueError → same "must be an integer" warn path.)
+        if raw:  # whitespace-only; raw=="" is the silent empty-string case
+            _env_warn(name, raw, "must be an integer")
         return None
     try:
-        value = int(raw)
+        value = int(stripped)
     except ValueError:
         _env_warn(name, raw, "must be an integer")
         return None
@@ -217,10 +227,15 @@ def parse_env_non_negative_int(name: str, *, maximum: int | None = None) -> int 
     context window would zero out usable context — cap at the default window.
     """
     raw = os.environ.get(name)
-    if raw is None or raw == "":
+    if raw is None:
+        return None
+    stripped = raw.strip()
+    if stripped == "":
+        if raw:  # whitespace-only; raw=="" is the silent empty-string case
+            _env_warn(name, raw, "must be an integer")
         return None
     try:
-        value = int(raw)
+        value = int(stripped)
     except ValueError:
         _env_warn(name, raw, "must be an integer")
         return None
@@ -252,8 +267,13 @@ def parse_env_bool(name: str, default: bool = False, warn: bool = True) -> bool:
     returns `default`.  Empty / absent / whitespace-only: returns `default`
     silently.
 
-    Follows the warn+fallback contract of parse_env_positive_int:
-    env vars are ambient config; an unrecognized value must not crash.
+    Follows the warn+fallback contract of parse_env_positive_int for
+    unrecognized non-empty values: emits a warning and returns `default`.
+    Deliberate divergence: whitespace-only input is treated as absent and
+    returns `default` silently (no warning), unlike parse_env_positive_int
+    which warns on whitespace-only.  Bool knobs have no numeric parse step
+    where whitespace ambiguity is meaningful, so the silent-absent treatment
+    is more appropriate.
 
     The `warn` parameter suppresses the warning when set to False — useful
     for in-body re-reads that run on every call (e.g. _debug()) where a

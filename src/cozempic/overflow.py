@@ -96,7 +96,25 @@ class CircuitBreaker:
 
 # ─── Overflow Recovery ────────────────────────────────────────────────────────
 
-OVERFLOW_PATTERN = "Conversation too long"
+# Substrings that signal Claude Code hit a context-overflow / prompt-too-long
+# error in the transcript tail. Kept as a LIST (was a single hardcoded
+# "Conversation too long") because that exact string may be TUI-only and not the
+# form persisted to the JSONL — if so, single-string detection left the reactive
+# overflow path silently INERT. Widening is strictly broader (more markers caught,
+# never fewer), so it cannot regress. ⚠ ARTIFACT-BLOCKED for full confidence: we
+# still lack a captured REAL overflowed-CC JSONL tail to pin the exact persisted
+# field/text — capture one and tighten/confirm against it (the recurring "capture
+# the real artifact before trusting the detector" lesson).
+OVERFLOW_MARKERS = (
+    "Conversation too long",
+    "Prompt is too long",
+    "prompt is too long",
+    "exceed the context",            # "...exceeds/exceed the context window/limit"
+    "context_length_exceeded",       # API error code form
+    "maximum context length",
+)
+# Back-compat alias (older imports / tests referenced the singular constant).
+OVERFLOW_PATTERN = OVERFLOW_MARKERS[0]
 
 
 class OverflowRecovery:
@@ -106,6 +124,10 @@ class OverflowRecovery:
     Fast-path exits immediately for normal growth. Only does work when
     size is concerning or overflow is detected.
     """
+
+    # After a safe-point defer (in-flight work / gate error), suppress re-running a
+    # full prune cycle on every subsequent growth event for this long (ynaamane #3c).
+    _DEFER_COOLDOWN_S: float = 60.0
 
     def __init__(
         self,
@@ -125,6 +147,7 @@ class OverflowRecovery:
         self.danger_threshold_tokens = danger_threshold_tokens
         self.claude_pid = claude_pid
         self._recovering = False  # Prevent re-entrant recovery
+        self._defer_until = 0.0   # monotonic deadline; suppress re-run after a safe-point defer
 
     def detect_overflow(self) -> bool:
         """Check last 20 lines of the JSONL for overflow markers."""
@@ -133,15 +156,52 @@ class OverflowRecovery:
                 # Seek to last ~100KB to read tail efficiently
                 f.seek(0, 2)
                 size = f.tell()
-                f.seek(max(0, size - 102400))
+                seek_to = max(0, size - 102400)
+                f.seek(seek_to)
                 tail = f.read().decode("utf-8", errors="replace")
         except OSError:
             return False
 
-        # Check last 20 lines
-        lines = tail.strip().split("\n")
-        for line in lines[-20:]:
-            if OVERFLOW_PATTERN in line:
+        truncated_head = seek_to > 0  # the first tail line is a partial fragment
+
+        # A marker counts ONLY in an actual API-ERROR line — NOT a user turn that
+        # merely discusses context limits ("my prompt is too long..."). The bare
+        # substring scan false-fired on normal user text and triggered an
+        # unsolicited kill+resume (mission-critical C6). Structural rule: parse the
+        # line and require either isApiErrorMessage:true, or a non-user message
+        # whose serialized content carries the marker.
+        import json as _json
+        lines = tail.split("\n")
+        # The 100KB seek lands MID-LINE, so the first element is a truncated JSON
+        # fragment. If it happens to contain a marker substring it fails json.loads —
+        # and the old `except → return True` then false-fired an unsolicited
+        # kill+resume on a perfectly benign large session whose tail merely DISCUSSED
+        # overflow phrasing (R4 finding overflow-falsefire-unparseable-tail). Drop
+        # that partial fragment, and NEVER infer overflow from an unparseable line:
+        # a real overflow is a structurally-valid API-error entry (below).
+        if truncated_head and lines:
+            lines = lines[1:]
+        for line in [ln.strip() for ln in lines[-20:]]:
+            if not line or not any(m in line for m in OVERFLOW_MARKERS):
+                continue
+            try:
+                obj = _json.loads(line)
+            except (ValueError, _json.JSONDecodeError):
+                # Unparseable marker-bearing line — cannot confirm it is a genuine
+                # API error, so do NOT treat it as overflow (the structural gate
+                # below is the only trigger). Prevents the truncated-tail false-kill.
+                continue
+            if not isinstance(obj, dict):
+                continue
+            # ONLY a genuine API-ERROR entry counts. Requiring isApiErrorMessage (or
+            # an explicit error type/level) — NOT merely "any non-user line" — is
+            # what stops the false-kill: the assistant, a `type:summary`
+            # auto-compaction line, or a system meta line routinely DISCUSS overflow
+            # phrasing ("maximum context length", "prompt is too long") without it
+            # being a real overflow. Those must never trigger a kill+resume (C6).
+            if obj.get("isApiErrorMessage") is True:
+                return True
+            if obj.get("type") == "error" or obj.get("level") == "error" or obj.get("isError") is True:
                 return True
         return False
 
@@ -163,6 +223,13 @@ class OverflowRecovery:
 
         # Prevent re-entrant recovery
         if self._recovering:
+            return
+
+        # Re-entry throttle (ynaamane #3c): after a safe-point defer we deliberately
+        # did NOT count a breaker slot, so the breaker won't auto-halt a busy in-flight
+        # session — instead suppress re-running a full prune cycle until the cooldown
+        # elapses, so frequent growth events don't hammer guard_prune_cycle.
+        if time.monotonic() < self._defer_until:
             return
 
         # Slow path: check for actual overflow
@@ -233,8 +300,20 @@ class OverflowRecovery:
             # Futile / no-change prune (nothing to write) — file is unchanged.
             after_mb = self.session_path.stat().st_size / 1024 / 1024
 
-        # 4. Pre-flight: if still dangerously large, don't resume
-        if after_mb * 1024 * 1024 > self.danger_threshold_bytes * 0.95:
+        # 4. Pre-flight: if still dangerously large, don't resume.
+        # Byte axis:
+        still_dangerous = after_mb * 1024 * 1024 > self.danger_threshold_bytes * 0.95
+        # Token axis (symmetry fix): a TOKEN-triggered overflow must also re-check
+        # tokens post-prune — the byte-only preflight left the "don't resume if
+        # still dangerous" guard INERT for the token path (audit P1). Use the
+        # projected post-prune token count when present.
+        if not still_dangerous and self.danger_threshold_tokens is not None:
+            _proj = result.get("projected_final_tokens")
+            if _proj is None:
+                _proj = result.get("final_tokens")
+            if isinstance(_proj, (int, float)) and _proj > self.danger_threshold_tokens * 0.95:
+                still_dangerous = True
+        if still_dangerous:
             print(
                 f"  [{now}] Post-prune size {after_mb:.1f}MB still too large. "
                 f"Skipping resume.",
@@ -244,8 +323,10 @@ class OverflowRecovery:
             checkpoint_team(session_path=self.session_path, quiet=False)
             return
 
-        # 5. Record in breaker
-        self.breaker.record_recovery(rx, before_mb, after_mb)
+        # 5. (breaker recording moved BELOW the 5b safe-point gate — a benign
+        # in-flight defer must NOT consume a circuit-breaker slot, else 3 benign
+        # defers silently disable the reactive net; mirrors the proactive path
+        # which does not count a safe-point defer. ynaamane review #3.)
         orig_tok = result.get("original_tokens")
         final_tok = result.get("final_tokens")
         saved_tok = (orig_tok - final_tok) if (orig_tok and final_tok) else -1
@@ -265,6 +346,42 @@ class OverflowRecovery:
                 f"(saved {result['saved_mb']:.1f}MB)",
                 file=sys.stderr,
             )
+
+        # 5b. SAFE-POINT GATE before any kill (mission-critical C6): reactive
+        # recovery must NOT terminate a live Claude that has in-flight work
+        # (running subagents / agent team / open tool call) — the prune output is
+        # already saved, so on an unsafe point we defer the kill rather than
+        # destroy in-flight state. Mirrors guard_prune_cycle's safe_to_reload gate,
+        # which the reactive path was missing.
+        try:
+            from .guard import safe_to_reload as _safe_to_reload
+            from .session import load_messages as _load_messages
+            from .team import extract_team_state as _extract_team_state
+            _msgs = _load_messages(self.session_path)
+            _safe, _reason = _safe_to_reload(_extract_team_state(_msgs), _msgs, self.session_path)
+        except Exception as _gate_exc:
+            # FAIL-CLOSED (ynaamane review #1): the daemon's asymmetry is "over-defer
+            # is recoverable; wrongly SIGKILLing live Claude work is catastrophic." So
+            # if the safety gate ITSELF throws (e.g. a malformed tool_result crashes
+            # extract_team_state), DEFER the kill — never proceed to terminate a session
+            # that may hold running subagents. The prune is recomputed next cycle.
+            _safe, _reason = False, f"safety-gate error: {_gate_exc!r}"
+        if not _safe:
+            # NOTE: the pruned output is NOT yet on disk here — guard_prune_cycle
+            # returns a DEFERRED writer that only fires inside _terminate_and_resume
+            # (post-kill). So on a defer NOTHING is persisted this cycle; we re-run on
+            # the next growth event (throttled below). (ynaamane review #3b.)
+            print(f"  [{now}] In-flight work / gate defer ({_reason}) — deferring kill; "
+                  f"prune NOT persisted this cycle, will retry.", file=sys.stderr)
+            checkpoint_team(session_path=self.session_path, quiet=True)
+            # Throttle re-entry: a busy in-flight session can fire many growth events;
+            # don't re-run a full prune cycle on each. (ynaamane review #3c.)
+            self._defer_until = time.monotonic() + self._DEFER_COOLDOWN_S
+            return
+
+        # Record the recovery only now that we are actually proceeding to kill+resume
+        # (a real recovery), so a benign defer above never burns a breaker slot.
+        self.breaker.record_recovery(rx, before_mb, after_mb)
 
         # 6. Terminate Claude + auto-resume
         # Wave 2: acquire single-flight reload lock. If another reload

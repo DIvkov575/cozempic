@@ -2353,14 +2353,14 @@ class TestCheckpointTeamWriteSideIsolation(unittest.TestCase):
 
     The write-side of the cross-project contamination chain:
       1. PreCompact hook calls cmd_checkpoint → checkpoint_team(cwd=cwd_a)
-      2. Old code: non-strict find_current_session → Strategy 4 → returns newer project B's session
+      2. Old code: non-strict find_current_session → Strategy 5 → returns newer project B's session
       3. Checkpoint extracted from B's JSONL → WRITTEN into project A's project dir
       4. PostCompact reads A's dir → finds B's team state → contamination
 
-    After fix (strict=True): checkpoint_team returns None when Strategy 3 can't match,
+    After fix (strict=True): checkpoint_team returns None when Strategy 4 can't match,
     and project B's checkpoint file is not created or modified.
 
-    RED-at-base proof (815485d): non-strict → Strategy 4 returns B's session →
+    RED-at-base proof (815485d, pre-renumber): non-strict → Strategy 5 returns B's session →
     extract_team_state([]) returns empty TeamState → checkpoint_team returns the empty
     state (not None) → `assertIsNone` FAILS.
     """
@@ -2372,14 +2372,14 @@ class TestCheckpointTeamWriteSideIsolation(unittest.TestCase):
                project B (newer, no underscore) has a session.
                _session_id_from_process → None (no process detection).
 
-        At base (broken slug + non-strict):
-          Strategy 3 computes broken slug '-Users-x-topstep_automation' ≠ any dir
-          → 0 matches → Strategy 4 picks B's session (newer)
+        At base (broken slug + non-strict, pre-renumber):
+          Strategy 4 computes broken slug '-Users-x-topstep_automation' ≠ any dir
+          → 0 matches → Strategy 5 picks B's session (newer)
           → extract_team_state returns empty TeamState → checkpoint_team returns it
           → result is not None → assertIsNone FAILS → RED.
 
         After fix (P0-A + P0-E):
-          Project A has no session file → Strategy 3 matches A's dir but finds
+          Project A has no session file → Strategy 4 matches A's dir but finds
           no JSONL → sessions list empty → strict returns None → checkpoint_team
           returns None → GREEN.
           OR: strict=True on broken slug → None → GREEN.
@@ -2387,12 +2387,9 @@ class TestCheckpointTeamWriteSideIsolation(unittest.TestCase):
         Either way the invariant holds: with only B's session present, B's
         checkpoint must NOT be written and result must be None.
         """
-        import re as _re
         import time
         from cozempic.guard import checkpoint_team
-
-        def _correct_slug(cwd: str) -> str:
-            return _re.sub(r"[^a-zA-Z0-9]", "-", cwd)
+        from cozempic.session import cwd_to_project_slug
 
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -2401,7 +2398,7 @@ class TestCheckpointTeamWriteSideIsolation(unittest.TestCase):
             # No session file: if Strategy 3 correctly finds this dir, find_sessions
             # finds no JSONL here → sessions list is empty for this project.
             cwd_a = "/Users/x/topstep_automation"
-            slug_a = _correct_slug(cwd_a)      # -Users-x-topstep-automation
+            slug_a = cwd_to_project_slug(cwd_a)      # -Users-x-topstep-automation
             proj_a = tmp_path / slug_a
             proj_a.mkdir(parents=True)
             # No .jsonl file in proj_a — so project A has no sessions.
@@ -2409,7 +2406,7 @@ class TestCheckpointTeamWriteSideIsolation(unittest.TestCase):
             time.sleep(0.02)  # ensure B is strictly newer
 
             # Project B: newer, no underscore — has a session (Strategy 4 returns this at base)
-            slug_b = _correct_slug("/Users/x/fanugugc")   # -Users-x-fanugugc
+            slug_b = cwd_to_project_slug("/Users/x/fanugugc")   # -Users-x-fanugugc
             proj_b = tmp_path / slug_b
             proj_b.mkdir(parents=True)
             sess_b_id = "bbbb2222-0000-0000-0000-200000000002"
@@ -2422,6 +2419,9 @@ class TestCheckpointTeamWriteSideIsolation(unittest.TestCase):
             with (
                 patch("cozempic.session.get_projects_dir", return_value=tmp_path),
                 patch("cozempic.session._session_id_from_process", return_value=None),
+                # Block Strategy 1 (active-transcript keyed by live Claude PID)
+                # so a real running session in the developer's home cannot bypass strict.
+                patch("cozempic.session.find_claude_pid", return_value=None),
             ):
                 result = checkpoint_team(cwd=cwd_a, quiet=True)
 
@@ -2431,7 +2431,7 @@ class TestCheckpointTeamWriteSideIsolation(unittest.TestCase):
                 result,
                 f"checkpoint_team(cwd=topstep_automation) returned {result!r} instead of None. "
                 "The cross-project session fallback is not being blocked. "
-                "At base: Strategy 4 returns B's session → empty TeamState returned (not None)."
+                "At base (pre-renumber): Strategy 5 returns B's session → empty TeamState returned (not None)."
             )
             # Belt-and-suspenders: B's checkpoint must be untouched.
             # Both assertions are inside the `with tempfile.TemporaryDirectory()` block
@@ -2447,20 +2447,18 @@ class TestCheckpointTeamWriteSideIsolation(unittest.TestCase):
         Setup: project A (underscore, correct dir name) with a JSONL containing a
         Task spawn (non-empty team state). Project B newer with DIFFERENT team state.
 
-        Contract: checkpoint_team(cwd=A) resolves A via Strategy 3, extracts A's
+        Contract: checkpoint_team(cwd=A) resolves A via Strategy 4, extracts A's
         state, writes A's checkpoint to A's dir. B's checkpoint is NOT written.
 
-        RED-at-base (815485d): broken slug → Strategy 3 misses A → Strategy 4 picks
-        B's session (newer) → extracts B's state → writes to B's project dir (NOT A's)
-        → A's checkpoint file never created → assertIsNotNone FAILS.
+        RED-at-base (815485d, pre-renumber): broken slug → Strategy 4 misses A →
+        Strategy 5 picks B's session (newer) → extracts B's state → writes to B's
+        project dir (NOT A's) → A's checkpoint file never created →
+        assertIsNotNone FAILS.
         """
         import json
-        import re as _re
         import time
         from cozempic.guard import checkpoint_team
-
-        def _correct_slug(cwd: str) -> str:
-            return _re.sub(r"[^a-zA-Z0-9]", "-", cwd)
+        from cozempic.session import cwd_to_project_slug
 
         # Minimal JSONL that produces a non-empty TeamState.
         # A 'Task' tool_use block in an assistant message → 1 subagent detected.
@@ -2487,7 +2485,7 @@ class TestCheckpointTeamWriteSideIsolation(unittest.TestCase):
 
             # Project A: underscore cwd — correct dir name
             cwd_a = "/Users/x/topstep_automation"
-            slug_a = _correct_slug(cwd_a)        # -Users-x-topstep-automation
+            slug_a = cwd_to_project_slug(cwd_a)        # -Users-x-topstep-automation
             proj_a = tmp_path / slug_a
             proj_a.mkdir(parents=True)
             sess_a_id = "aaaa1111-0000-0000-0000-aaa000000001"
@@ -2498,7 +2496,7 @@ class TestCheckpointTeamWriteSideIsolation(unittest.TestCase):
             time.sleep(0.02)  # ensure B is strictly newer
 
             # Project B: newer, no underscore — DIFFERENT team state
-            slug_b = _correct_slug("/Users/x/fanugugc")   # -Users-x-fanugugc
+            slug_b = cwd_to_project_slug("/Users/x/fanugugc")   # -Users-x-fanugugc
             proj_b = tmp_path / slug_b
             proj_b.mkdir(parents=True)
             sess_b_id = "bbbb2222-0000-0000-0000-bbb000000002"
@@ -2509,14 +2507,17 @@ class TestCheckpointTeamWriteSideIsolation(unittest.TestCase):
             with (
                 patch("cozempic.session.get_projects_dir", return_value=tmp_path),
                 patch("cozempic.session._session_id_from_process", return_value=None),
+                # Block Strategy 1 (active-transcript keyed by live Claude PID)
+                # so a real running session in the developer's home cannot bypass strict.
+                patch("cozempic.session.find_claude_pid", return_value=None),
             ):
                 result = checkpoint_team(cwd=cwd_a, quiet=True)
 
-            # After fix: Strategy 3 finds A's session → extracts TOPSTEP state → writes to A's dir
+            # After fix: Strategy 4 finds A's session → extracts TOPSTEP state → writes to A's dir
             self.assertIsNotNone(
                 result,
-                "checkpoint_team returned None — Strategy 3 did not find project A's session. "
-                "At base: broken slug misses A → Strategy 4 picks B → writes to B → A has no checkpoint."
+                "checkpoint_team returned None — Strategy 4 did not find project A's session. "
+                "At base: broken slug misses A → Strategy 5 picks B → writes to B → A has no checkpoint."
             )
             # A's checkpoint must exist and contain TOPSTEP (not FANNU)
             a_cp = proj_a / "team-checkpoint.md"
