@@ -1383,11 +1383,14 @@ def _reload_warn_grace() -> float:
     wait (reload as soon as idle)."""
     try:
         v = float(os.environ.get("COZEMPIC_RELOAD_WARN_GRACE", "120"))
-        # Reject NaN/inf: a non-finite grace makes `elapsed >= grace` always False,
-        # which permanently DISABLES this fallback (the exact gate-disable bug class
-        # as the CLI/config thresholds — IEEE-754: every NaN/inf comparison fails),
-        # silently wedging the interactive idle reload. Mirror _read_min_prune_ratio.
-        return v if math.isfinite(v) else 120.0
+        # Reject NaN/inf OR huge-finite (> 3600, 1h): both classes make
+        # `elapsed >= grace` permanently False, silently disabling the fallback.
+        # 1h is the meaningful ceiling for an interactive session grace period —
+        # same large-finite gate-disable class as COZEMPIC_RELOAD_WINDOW_S.
+        # (<=0 "disable" semantic is preserved — falls through to `return v`.)
+        if not math.isfinite(v) or v > 3600:
+            return 120.0
+        return v
     except (TypeError, ValueError):
         return 120.0
 
@@ -2499,18 +2502,27 @@ def _guard_tmp_root() -> Path:
 # respawn: if a session reloads too many times within a window, the guard stops
 # auto-reloading it (and accounts it to the breaker so the daemon exits) rather
 # than churning kill→resume→re-bloat forever. Window/cap are env-overridable.
+# INVARIANT: RELOAD_MAX ceiling MUST equal the hist write-cap.
+# A ceiling ABOVE the write-cap silently disables the storm-guard for the
+# (write-cap, ceiling] range: hist[-cap:] bounds len(hist) to write-cap, so
+# len(hist) >= max is always False for any max > write-cap. Tune both together.
+_RELOAD_LEDGER_HIST_CAP = 50
+
+
 def _reload_ledger_window_s() -> int:
-    try:
-        return max(60, int(os.environ.get("COZEMPIC_RELOAD_WINDOW_S", "600")))
-    except Exception:
-        return 600
+    from ._validation import parse_env_positive_int
+    v = parse_env_positive_int("COZEMPIC_RELOAD_WINDOW_S", maximum=86400)
+    return max(60, v) if v is not None else 600
 
 
 def _reload_ledger_max() -> int:
-    try:
-        return max(1, int(os.environ.get("COZEMPIC_RELOAD_MAX", "3")))
-    except Exception:
-        return 3
+    from ._validation import parse_env_positive_int
+    # Ceiling = _RELOAD_LEDGER_HIST_CAP: values above the write-cap make
+    # len(hist) >= max always False (hist[-cap:] bounds the list on write),
+    # silently disabling the storm-guard for the entire [cap+1, old-100] range.
+    # max(1, v) removed: parse_env_positive_int guarantees v >= 1 when non-None.
+    v = parse_env_positive_int("COZEMPIC_RELOAD_MAX", maximum=_RELOAD_LEDGER_HIST_CAP)
+    return v if v is not None else 3
 
 
 # ── In-flight work detector (1.8.22 safe-point gate, component A) ─────────────
@@ -3008,7 +3020,19 @@ def _reload_rate_exceeded(ledger_path: Path, now: float | None = None) -> tuple[
         return True, len(hist)
     hist.append(now)
     try:
-        ledger_path.write_text(_json.dumps(hist[-50:]))
+        # Atomic write (tmp + os.replace): a SIGKILL mid-write leaves a stale
+        # .tmp rather than a partial ledger, preventing the `except Exception:
+        # hist = []` silent reset that would clear the storm-guard count.
+        # Mirrors _write_armed_atomic (guard.py:2780) — same pattern, string payload.
+        _tmp = ledger_path.with_suffix(ledger_path.suffix + f".tmp{os.getpid()}")
+        try:
+            _tmp.write_text(_json.dumps(hist[-_RELOAD_LEDGER_HIST_CAP:]))
+            os.replace(_tmp, ledger_path)
+        finally:
+            try:
+                _tmp.unlink(missing_ok=True)  # no-op after a successful replace
+            except Exception:
+                pass
     except Exception:
         pass
     return False, len(hist)
