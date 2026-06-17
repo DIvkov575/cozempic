@@ -53,12 +53,24 @@ def load_lifetime(path: Path | None = None) -> dict | None:
     rate = round(saved / processed * 100, 1) if processed > 0 else None
     if rate is not None and not (0 <= rate <= 100):
         rate = None  # processed < saved => corrupt/untrustworthy ledger; suppress
+    prune_count = _num_or_zero(data.get("prune_count"))
+    sessions = _num_or_zero(data.get("sessions"))
+    # Measured per-pruned-session extension = 1 + avg_prunes_per_session * reclaim.
+    # MUST use tracked_prunes (forward-only), NOT the lifetime prune_count — the
+    # latter holds pre-tracking prunes and would divide by a tiny new session count
+    # (e.g. 3,309/5 -> absurd 117x). Both operands here cover the same window.
+    tracked_prunes = _num_or_zero(data.get("tracked_prunes"))
+    multiplier = None
+    if sessions >= 5 and rate is not None and tracked_prunes > 0:
+        multiplier = round(1 + (tracked_prunes / sessions) * (rate / 100), 2)
     since = data.get("since")
     return {
         "tokens_saved": saved,
         "tokens_processed": processed,
-        "prune_count": _num_or_zero(data.get("prune_count")),
+        "prune_count": prune_count,
         "turns_gained": _num_or_zero(data.get("turns_gained")),
+        "sessions": sessions,
+        "session_multiplier_x": multiplier,
         "since": since if isinstance(since, str) else None,
         "savings_rate_pct": rate,
     }

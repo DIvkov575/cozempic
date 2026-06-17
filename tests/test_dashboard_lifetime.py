@@ -74,6 +74,61 @@ class TestLoadLifetime(unittest.TestCase):
             self.assertEqual(lg["savings_rate_pct"], 20.0)
 
 
+class TestSessionMultiplier(unittest.TestCase):
+    def test_multiplier_uses_tracked_prunes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # rate=17.5%, tracked_prunes/sessions=20/10=2 -> 1 + 2*0.175 = 1.35
+            lg = load_lifetime(_ledger_file(tmp, {"tokens_saved": 175, "tokens_processed": 1000,
+                                                  "tracked_prunes": 20, "sessions": 10}))
+            self.assertEqual(lg["session_multiplier_x"], 1.35)
+            self.assertEqual(lg["sessions"], 10)
+
+    def test_lifetime_prune_count_NOT_used(self):
+        # the real-world mismatch: huge lifetime prune_count, tiny forward window.
+        # Must use tracked_prunes (10/5=2 -> 1.35x), NOT prune_count (3309/5 -> 117x).
+        with tempfile.TemporaryDirectory() as tmp:
+            lg = load_lifetime(_ledger_file(tmp, {"tokens_saved": 175, "tokens_processed": 1000,
+                                                  "prune_count": 3309, "tracked_prunes": 10,
+                                                  "sessions": 5}))
+            self.assertEqual(lg["session_multiplier_x"], 1.35)
+            self.assertLess(lg["session_multiplier_x"], 2)  # never the absurd 117x
+
+    def test_multiplier_none_below_threshold(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lg = load_lifetime(_ledger_file(tmp, {"tokens_saved": 175, "tokens_processed": 1000,
+                                                  "tracked_prunes": 5, "sessions": 3}))
+            self.assertIsNone(lg["session_multiplier_x"])  # too few sessions to be stable
+
+    def test_no_tracking_means_no_multiplier(self):
+        # existing ledger with lifetime prune_count but no forward tracking yet
+        with tempfile.TemporaryDirectory() as tmp:
+            lg = load_lifetime(_ledger_file(tmp, {"tokens_saved": 175, "tokens_processed": 1000,
+                                                  "prune_count": 3309}))
+            self.assertEqual(lg["sessions"], 0)
+            self.assertIsNone(lg["session_multiplier_x"])  # honest-blank until measured
+
+
+class TestRecordSavingsSessions(unittest.TestCase):
+    def test_distinct_pruned_sessions_counted(self):
+        from cozempic import helpers
+
+        with tempfile.TemporaryDirectory() as tmp:
+            sav = Path(tmp) / "sav.json"
+            with patch.object(helpers, "_SAVINGS_FILE", sav), \
+                 patch.dict(os.environ, {"COZEMPIC_NO_TELEMETRY": "1"}):
+                helpers.record_savings(100, total_tokens=1000, turn_count=10, session_id="A")
+                helpers.record_savings(100, total_tokens=1000, turn_count=10, session_id="A")  # repeat
+                helpers.record_savings(100, total_tokens=1000, turn_count=10, session_id="B")
+                helpers.record_savings(100, total_tokens=1000, turn_count=10)  # no session id
+            data = json.loads(sav.read_text())
+            self.assertEqual(data["prune_count"], 4)  # lifetime: all 4 prunes
+            self.assertEqual(data["tracked_prunes"], 3)  # forward: only the 3 with a session_id
+            self.assertEqual(data["sessions"], 2)  # A and B distinct; repeat A not recounted
+            self.assertEqual(len(data["_pruned_session_hashes"]), 2)
+            # raw session id never stored (hashed)
+            self.assertNotIn("A", data["_pruned_session_hashes"])
+
+
 class TestLifetimeBand(unittest.TestCase):
     _LEDGER = {"tokens_saved": 456170685, "tokens_processed": 2601916262,
                "prune_count": 3309, "turns_gained": 23394, "since": "2026-04-09",
@@ -96,6 +151,12 @@ class TestLifetimeBand(unittest.TestCase):
         h = render_html({"lifetime": {"prunes_total": 0}}, generated_ts="t", ledger=None)
         self.assertNotIn('<section class="lifetime">', h)  # no band section emitted
         self.assertNotIn("reclaimed (lifetime)", h)
+
+    def test_band_shows_session_multiplier_chip(self):
+        h = render_html({"lifetime": {"prunes_total": 0}}, generated_ts="t",
+                        ledger={"tokens_saved": 1000, "session_multiplier_x": 1.35})
+        self.assertIn("1.35×", h)
+        self.assertIn("longer per pruned session", h)
 
     def test_band_escapes_since(self):
         h = render_html({"lifetime": {"prunes_total": 0}}, generated_ts="t",

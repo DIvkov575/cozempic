@@ -507,6 +507,7 @@ def cmd_treat(args):
                 pr.original_tokens - pr.final_tokens,
                 total_tokens=pr.original_tokens,
                 turn_count=turn_count,
+                session_id=path.stem if path else None,
             )
             savings = get_savings_line()
             if savings:
@@ -804,6 +805,7 @@ def cmd_reload(args):
                 pre_te.total - post_te.total,
                 total_tokens=pre_te.total,
                 turn_count=turn_count,
+                session_id=sess["session_id"],
             )
             savings = get_savings_line()
             if savings:
@@ -2204,6 +2206,9 @@ def cmd_dashboard(args):
         if ledger.get("since"):
             line += f" since {ledger['since']}"
         print(line)
+        if ledger.get("session_multiplier_x"):
+            print(f"  Sessions ~{ledger['session_multiplier_x']:.2f}x longer "
+                  f"(measured across {ledger['sessions']:,} pruned sessions).")
     if n:
         lt = data["lifetime"]
         print(f"  {n} prune(s), {lt.get('committed', 0)} applied across "

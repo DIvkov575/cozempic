@@ -1628,7 +1628,8 @@ def guard_prune_cycle(
         turn_count = sum(1 for _, m, _ in messages
                        if get_msg_type(m) == "user"
                        and isinstance(m.get("message", {}).get("content", ""), str))
-        record_savings(tokens_saved, total_tokens=pre_te.total, turn_count=turn_count)
+        record_savings(tokens_saved, total_tokens=pre_te.total, turn_count=turn_count,
+                       session_id=session_id or (session_path.stem if session_path else None))
 
     # #106 deferred writer — persists the pruned session ONLY after the process
     # holding it is dead. Re-acquires the prune lock; the snapshot makes the

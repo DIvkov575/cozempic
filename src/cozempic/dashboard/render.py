@@ -139,6 +139,8 @@ def _lifetime_band(ledger: dict | None) -> str:
     if ledger.get("savings_rate_pct") is not None:
         # saved/processed (processed is cumulative-with-overlap) — NOT a per-prune average
         chips.append((f"{ledger['savings_rate_pct']:.1f}%", "reclaimed of processed"))
+    if ledger.get("session_multiplier_x"):
+        chips.append((f"{ledger['session_multiplier_x']:.2f}×", "longer per pruned session"))
     cells = "".join(
         f'<div class="lt-cell"><div class="lt-n">{_esc(n)}</div>'
         f'<div class="lt-l">{_esc(label)}</div></div>'
