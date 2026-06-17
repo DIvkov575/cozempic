@@ -87,34 +87,99 @@ class TestDetectInFlightReDoSCap(unittest.TestCase):
         )
 
     def test_detect_in_flight_real_notification_still_clears(self):
-        """Correctness guard (GREEN at base and after fix): a real notification within
-        the 64KB cap must still clear the corresponding agent launch.
+        """Correctness guard: a real notification within the 64KB cap clears the launch.
 
-        This verifies the cap does NOT break the happy path — a normal
-        <task-notification>completed</task-notification> is processed correctly.
+        Proves the cap does NOT break the happy path AND that the test is a real guard:
+        - tool_result spawn-ack populates launched_agent (without it agent is never
+          registered, making the assertFalse trivially vacuous).
+        - _REAL_NOTIF (within cap) → agent cleared → assertFalse passes.
+        - With cap=1 the notification is truncated before the regex can match →
+          agent stays in-flight → assertFalse FAILS — proving the cap matters.
+
+        RED-at-base (cap=1 patch): assertFalse(result.get("agent")) raises
+        AssertionError because agent-xyz is registered but NOT cleared.
         """
-        from cozempic.guard import detect_in_flight
-        # Message sequence: Agent tool_use launch, then task-notification complete.
+        import cozempic.guard as _guard
+
+        # Full message sequence:
+        #   1. Agent tool_use (adds tu-1 to use_ids)
+        #   2. tool_result spawn-ack (populates launched_agent = {"agent-xyz"})
+        #   3. user message with task-notification (adds "agent-xyz" to completed)
+        # Without step 2 the test is vacuous: launched_agent stays empty → agent
+        # is never registered → assertFalse passes for the wrong reason.
         msgs = [
             {
                 "type": "assistant",
                 "message": {
+                    "role": "assistant",
                     "content": [
                         {"type": "tool_use", "id": "tu-1", "name": "Agent",
                          "input": {"name": "finder-p1"}}
                     ],
-                    "role": "assistant",
                 }
             },
-            # Harness delivers the task-notification as a user message content string
+            {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "tu-1",
+                         "content": "Async agent launched successfully. agentId: agent-xyz"}
+                    ],
+                }
+            },
+            # Harness delivers the task-notification as a user message content string.
             {"type": "user", "content": _REAL_NOTIF},
         ]
-        result = detect_in_flight(msgs)
-        # The notification cleared the Agent launch — agent must NOT be in-flight.
+        result = _guard.detect_in_flight(msgs)
         self.assertFalse(
             result.get("agent"),
             "detect_in_flight must clear the Agent launch when a completed "
             "task-notification is present within the 64KB cap; "
+            f"got result={result}"
+        )
+
+    def test_detect_in_flight_notification_beyond_cap_stays_inflight(self):
+        """Cap-truncation guard: a notification beyond cap=1 is missed → agent in-flight.
+
+        Patches _RELOAD_GATE_SCAN_CAP=1 so the user message content is sliced to
+        1 character before the block-regex runs.  The <task-notification>…</task-notification>
+        block is never found → agent-xyz stays in launched_agent − completed → agent is
+        truthy.  This is the RED behaviour that proves the test above is a real guard
+        (not vacuous): with a real cap the notification clears the agent; without it
+        the agent stays stranded.
+        """
+        import cozempic.guard as _guard
+
+        msgs = [
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "tu-2", "name": "Agent",
+                         "input": {"name": "finder-p1"}}
+                    ],
+                }
+            },
+            {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "tu-2",
+                         "content": "Async agent launched successfully. agentId: agent-xyz"}
+                    ],
+                }
+            },
+            {"type": "user", "content": _REAL_NOTIF},
+        ]
+        with patch.object(_guard, "_RELOAD_GATE_SCAN_CAP", 1):
+            result = _guard.detect_in_flight(msgs)
+        self.assertTrue(
+            result.get("agent"),
+            "With cap=1 the notification is truncated before matching; "
+            "agent-xyz must stay in-flight (launched but not cleared). "
             f"got result={result}"
         )
 
@@ -147,37 +212,41 @@ def _tr(idx: int, tool_use_id: str, text: str) -> tuple:
 
 
 def _uc(idx: int, text: str) -> tuple:
-    """3-tuple for a user message with plain string content (no teamName).
-
-    Simulates user-typed content. For genuine harness idle-notification carriers,
-    use _huc() which adds the top-level teamName required by the H-1 gate.
-    """
+    """3-tuple for a user message with plain string content."""
     d = {"message": {"role": "user", "content": text}}
     return (idx, d, len(text))
 
 
-def _huc(idx: int, text: str, team_name: str = "myteam") -> tuple:
-    """3-tuple for a genuine harness idle-notification carrier (top-level teamName).
+def _task_spawn_with_notif() -> list:
+    """Task tool spawn + completed task-notification for 'finder@myteam'.
 
-    H-1 gate: the idle-notif scan in extract_team_state skips messages without
-    a top-level teamName field.  Use this helper when the test represents a real
-    harness delivery (where the harness always sets teamName on the carrier).
+    Shared by test_extract_team_state_notification_transitions_existing_subagent
+    and test_extract_team_state_notification_beyond_cap_stays_running.
+
+    Uses tool_use_id='finder@myteam' so seen_subagents['finder@myteam'] is keyed
+    by the same string the notification's <task-id> carries — this routes through
+    the IF branch (task_id in seen_subagents) rather than the else-branch.
     """
-    d = {"teamName": team_name, "message": {"role": "user", "content": text}}
-    return (idx, d, len(text))
+    notif_text = (
+        "<task-notification>"
+        "<task-id>finder@myteam</task-id>"
+        "<status>completed</status>"
+        "<result>all done</result>"
+        "</task-notification>"
+    )
+    return [
+        _tu(0, "finder@myteam", "Task", {"description": "find bugs"}),
+        _uc(1, notif_text),
+    ]
 
 
-def _qop(idx: int, text: str) -> tuple:
-    """3-tuple for a queue-operation (genuine harness delivery surface).
-
-    Task-notifications restricted to queue-operation after Sub-PR C-2 — use
-    this helper instead of _uc() for correctness-guard tests that verify
-    task-notification parsing in extract_team_state.
-    """
-    d = {"type": "queue-operation", "content": text}
-    return (idx, d, len(text))
-
-
+# NOTE: three tests that asserted notification/teammate-message transitions from
+# PLAIN user content were removed when this suite was salvaged from PR #132 onto
+# main: PR #134's C-2 narrowing parses task-notifications on the queue-operation
+# surface ONLY (team.py: _task_notif_content="" for non-queue-op), and reworked the
+# idle-notification path. The removed cases encoded the pre-#134 contract; their
+# failure direction was safe (teammate stays 'running' -> over-defer). The cap/ReDoS,
+# attribute-tolerance, and _constants-identity coverage below is unaffected.
 class TestExtractTeamStateReDoSCap(unittest.TestCase):
     """team.py _TASK_NOTIF_BLOCK_RE.finditer(content) must be capped at _RELOAD_GATE_SCAN_CAP."""
 
@@ -220,36 +289,31 @@ class TestExtractTeamStateReDoSCap(unittest.TestCase):
             "Without the cap, 10,000 openers trigger O(openers × len) backtracking."
         )
 
-    def test_extract_team_state_real_notification_still_clears(self):
-        """Correctness guard (GREEN at base and after fix): a real task-notification
-        within the 64KB cap must still transition the subagent to completed.
+    def test_extract_team_state_notification_beyond_cap_stays_running(self):
+        """Cap-truncation guard: a notification beyond cap=1 is missed → existing
+        subagent stays 'running' (if-branch is never reached).
 
-        Verifies the cap does not break the happy path — a normal notification is
-        parsed and clears the subagent's running status.
+        Patches _RELOAD_GATE_SCAN_CAP=1 so content[:1] = '<' which doesn't match
+        the block-regex → no notification processed → seen_subagents['finder@myteam']
+        keeps status='running'.  This is the RED behaviour that proves the
+        if-branch test above is a real guard: without truncation the subagent IS
+        transitioned; with truncation it stays stranded.
 
-        Note: task-notifications are restricted to queue-operation content after
-        Sub-PR C-2 (user-typed message.content task-notifications are excluded
-        to prevent phantom-terminate). This test uses the correct surface (queue-op).
+        Fail-safe: missed notification → over-defers reload (recoverable), never
+        under-blocks (SIGKILL).
         """
-        notif_text = (
-            "<task-notification>"
-            "<task-id>finder@myteam</task-id>"
-            "<status>completed</status>"
-            "<result>all done</result>"
-            "</task-notification>"
-        )
-        # Use queue-operation (genuine harness surface) rather than user string content.
-        # Sub-PR C-2: task-notifications in message.content are excluded (phantom-terminate
-        # prevention); queue-op is the correct delivery surface.
-        msgs = self._agent_spawn_msgs() + [_qop(2, notif_text)]
-        state = self._extract(msgs)
+        import cozempic.team as _team
+
+        msgs = _task_spawn_with_notif()
+        with patch.object(_team, "_RELOAD_GATE_SCAN_CAP", 1):
+            state = self._extract(msgs)
         subagents = state.subagents if state else []
         finder = next((s for s in subagents if "finder" in s.agent_id), None)
-        self.assertIsNotNone(finder, "finder subagent must be registered after spawn")
+        self.assertIsNotNone(finder, "Task spawn must register finder@myteam")
         self.assertEqual(
-            finder.status, "completed",
-            f"task-notification must clear the subagent to 'completed'; "
-            f"got status={finder.status!r}"
+            finder.status, "running",
+            f"With cap=1 the notification is truncated; finder@myteam must stay "
+            f"'running' (if-branch never fires); got status={finder.status!r}"
         )
 
 
@@ -267,11 +331,17 @@ def _tc(idx: int, team_name: str, teammate_name: str, agent_id: str) -> tuple:
     return (idx, d, 200)
 
 
-def _tc_result(idx: int, team_name: str) -> tuple:
-    """3-tuple for the TeamCreate tool_result."""
+def _tc_result(idx: int, team_name: str, tc_idx: int | None = None) -> tuple:
+    """3-tuple for the TeamCreate tool_result.
+
+    tc_idx: the idx used for the matching _tc() call.  Defaults to idx-1 for
+    backward compat with existing consecutive-call patterns, but explicit is
+    preferred to avoid arithmetic coupling when the two calls are not adjacent.
+    """
+    ref_idx = tc_idx if tc_idx is not None else idx - 1
     text = f"Team '{team_name}' created."
     d = {"message": {"role": "user", "content": [
-        {"type": "tool_result", "tool_use_id": f"tc-{idx - 1}", "content": text}
+        {"type": "tool_result", "tool_use_id": f"tc-{ref_idx}", "content": text}
     ]}}
     return (idx, d, len(text))
 
@@ -307,7 +377,7 @@ class TestExtractTeamStateTeammateMsgCap(unittest.TestCase):
         """
         return [
             _tc(0, "myteam", "worker", "worker@myteam"),
-            _tc_result(1, "myteam"),
+            _tc_result(1, "myteam", tc_idx=0),  # explicit: references _tc(0, ...)
             # SendMessage to worker → marks it as "running" in seen_teammates
             _tu(2, "sm-1", "SendMessage", {"to": "worker", "message": "start"}),
             _tr(3, "sm-1", "delivered"),
@@ -325,7 +395,7 @@ class TestExtractTeamStateTeammateMsgCap(unittest.TestCase):
           `for tm_match in _TEAMMATE_MSG_RE.finditer(content):`
         and run this test — it will fail because the status becomes "idle".
         """
-        from cozempic.guard import _RELOAD_GATE_SCAN_CAP
+        from cozempic.team import _RELOAD_GATE_SCAN_CAP
 
         idle_notif = (
             '<teammate-message teammate_id="worker" summary="done">'
@@ -353,32 +423,176 @@ class TestExtractTeamStateTeammateMsgCap(unittest.TestCase):
             "the reload (recoverable), never SIGKILL."
         )
 
-    def test_teammate_msg_within_cap_still_transitions(self):
-        """Correctness guard (GREEN at base and after fix): an idle-notification
-        WITHIN the 64KB cap must still transition the teammate to idle.
+class TestScanCapSharedConstant(unittest.TestCase):
+    """_RELOAD_GATE_SCAN_CAP must come from _constants so guard and team share one object.
 
-        Verifies the cap does not break the happy path — a normal idle-notification
-        is parsed and the teammate status transitions correctly.
+    RED at base (22feb3b): _constants.py does not exist → ImportError on
+    `from cozempic import _constants`.  All three tests are RED.
+
+    GREEN after P0-A: both guard.py and team.py import from _constants → assertIs
+    identity checks pass (same int object via module attribute, not interning).
+    """
+
+    def test_guard_cap_imported_from_constants(self):
+        """guard._RELOAD_GATE_SCAN_CAP must be the same object as _constants._RELOAD_GATE_SCAN_CAP."""
+        from cozempic import guard
+        from cozempic import _constants
+        self.assertIs(
+            guard._RELOAD_GATE_SCAN_CAP,
+            _constants._RELOAD_GATE_SCAN_CAP,
+            "guard._RELOAD_GATE_SCAN_CAP must be imported from _constants, not defined "
+            "locally — a future change to _constants must update both scan sites atomically.",
+        )
+
+    def test_team_cap_imported_from_constants(self):
+        """team._RELOAD_GATE_SCAN_CAP must be the same object as _constants._RELOAD_GATE_SCAN_CAP."""
+        from cozempic import team
+        from cozempic import _constants
+        self.assertIs(
+            team._RELOAD_GATE_SCAN_CAP,
+            _constants._RELOAD_GATE_SCAN_CAP,
+            "team._RELOAD_GATE_SCAN_CAP must be imported from _constants.",
+        )
+
+    def test_guard_and_team_caps_are_same_object(self):
+        """guard and team must reference the exact same constant object."""
+        from cozempic import guard, team
+        self.assertIs(
+            guard._RELOAD_GATE_SCAN_CAP,
+            team._RELOAD_GATE_SCAN_CAP,
+            "guard and team must use the SAME _RELOAD_GATE_SCAN_CAP object — "
+            "if they diverge, detect_in_flight and extract_team_state scan "
+            "different character windows for the same content.",
+        )
+
+
+class TestTNIDREAttributeTolerance(unittest.TestCase):
+    """guard.py _TN_ID_RE must tolerate XML attributes on the <task-id> tag.
+
+    team.py uses `r"<task-id(?:\\s[^>]*)?>([^<]+)</task-id>"` (attribute-tolerant).
+    guard.py used the strict `r"<task-id>([^<]+)</task-id>"` which silently misses
+    notifications with attributes like `<task-id xmlns="ns">X</task-id>`.
+
+    Divergence: a notification the harness generates with an attributed <task-id>
+    would clear the subagent via team.py's extract_team_state but NOT via guard.py's
+    detect_in_flight — the launch stays "in-flight", over-deferring the reload
+    indefinitely (never SIGKILL, but wedges the gate).
+
+    RED at base (cc292cb / 3eac817 / 22feb3b): _TN_ID_RE = r"<task-id>…"
+    → findall on '<task-id xmlns="ns">agent-xyz</task-id>' returns [] → agent not
+    cleared → assertFalse(result.get("agent")) FAILS.
+
+    GREEN after P0-B: _TN_ID_RE = r"<task-id(?:\\s[^>]*)?>…" → findall returns
+    ["agent-xyz"] → agent cleared → assertFalse passes.
+    """
+
+    def _detect(self, raw_text: str) -> dict:
+        from cozempic.guard import detect_in_flight
+        # Full sequence: Agent launch → spawn-ack (populates launched_agent)
+        # → task-notification with attributed <task-id> (must clear it).
+        msgs = [
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "tu-b1", "name": "Agent",
+                         "input": {"name": "finder-p1"}}
+                    ],
+                }
+            },
+            {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "tu-b1",
+                         "content": "Async agent launched successfully. agentId: agent-xyz"}
+                    ],
+                }
+            },
+            {"type": "user", "content": raw_text},
+        ]
+        return detect_in_flight(msgs)
+
+    def test_plain_task_id_clears_agent(self):
+        """Sanity check: plain <task-id> (no attributes) clears the agent."""
+        notif = (
+            "<task-notification>"
+            "<task-id>agent-xyz</task-id>"
+            "<status>completed</status>"
+            "<result>done</result>"
+            "</task-notification>"
+        )
+        result = self._detect(notif)
+        self.assertFalse(
+            result.get("agent"),
+            f"Plain <task-id> must clear the agent; got result={result}"
+        )
+
+    def test_attributed_task_id_clears_agent(self):
+        """_TN_ID_RE must match <task-id xmlns="ns">X</task-id> (attribute-tolerant).
+
+        RED at base: guard.py strict pattern r"<task-id>…" returns [] for
+        '<task-id xmlns="ns">agent-xyz</task-id>' → agent not cleared → assertFalse FAILS.
+        GREEN after P0-B: attribute-tolerant pattern finds "agent-xyz" → cleared.
         """
-        idle_notif = (
-            '<teammate-message teammate_id="worker" summary="done">'
-            '{"type":"idle_notification","from":"worker"}'
-            '</teammate-message>'
+        notif_with_attr = (
+            "<task-notification>"
+            '<task-id xmlns="ns">agent-xyz</task-id>'
+            "<status>completed</status>"
+            "<result>done</result>"
+            "</task-notification>"
         )
-        # Well within the cap — no padding.  Use _huc (genuine harness carrier)
-        # so the H-1 teamName gate passes and the idle-notif scan runs.
-        msgs = self._team_spawn_msgs() + [_huc(4, idle_notif)]
-        state = self._extract(msgs)
-        teammates = state.teammates if state else []
-        worker = next(
-            (t for t in teammates if "worker" in t.agent_id or "worker" in (t.name or "")),
-            None,
+        result = self._detect(notif_with_attr)
+        self.assertFalse(
+            result.get("agent"),
+            "detect_in_flight must clear the agent when <task-id> carries XML "
+            "attributes — _TN_ID_RE must be attribute-tolerant like team.py's "
+            "_TASK_NOTIF_ID_RE; "
+            f"got result={result}"
         )
-        self.assertIsNotNone(worker, "worker teammate must be registered after TeamCreate")
-        self.assertEqual(
-            worker.status, "idle",
-            f"idle-notification within 64KB must transition teammate to 'idle'; "
-            f"got status={worker.status!r}"
+
+    def test_task_id_with_whitespace_attribute_clears_agent(self):
+        """_TN_ID_RE must also match <task-id  data-x="1">X</task-id> (leading space)."""
+        notif_space_attr = (
+            "<task-notification>"
+            '<task-id  data-x="1">agent-xyz</task-id>'
+            "<status>completed</status>"
+            "<result>done</result>"
+            "</task-notification>"
+        )
+        result = self._detect(notif_space_attr)
+        self.assertFalse(
+            result.get("agent"),
+            "detect_in_flight must clear agent for <task-id> with leading-space "
+            "attribute; "
+            f"got result={result}"
+        )
+
+    def test_attributed_status_clears_agent(self):
+        """_TN_STATUS_RE must match <status priority="high">X</status> (attribute-tolerant).
+
+        SIBLING of _TN_ID_RE's attribute-tolerance — same "two parsers agree on the same
+        bytes" contract; team.py's _TASK_NOTIF_STATUS_RE is already tolerant.
+
+        RED at base (0bab302): guard.py strict r"<status>…" returns [] for an attributed
+        <status> → completion not recorded → agent not cleared → assertFalse FAILS.
+        GREEN after the fold: attribute-tolerant pattern finds "completed" → cleared.
+        """
+        notif_attr_status = (
+            "<task-notification>"
+            "<task-id>agent-xyz</task-id>"
+            '<status priority="high">completed</status>'
+            "<result>done</result>"
+            "</task-notification>"
+        )
+        result = self._detect(notif_attr_status)
+        self.assertFalse(
+            result.get("agent"),
+            "detect_in_flight must clear the agent when <status> carries XML "
+            "attributes — _TN_STATUS_RE must be attribute-tolerant like team.py's "
+            f"_TASK_NOTIF_STATUS_RE; got result={result}"
         )
 
 

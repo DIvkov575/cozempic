@@ -408,8 +408,9 @@ _TEAM_EXTRACT_TOOL_NAMES = TEAM_TOOL_NAMES | {"Agent"}
 # extract_team_state's second pass.  Without a cap, many unmatched openers trigger
 # O(openers × len) catastrophic backtracking — same class as recap.py's DoS guard.
 # 64KB is ~64× a real notification; a missed notification → over-defers reload
-# (recoverable, not under-blocks / SIGKILL).  Mirrors guard._RELOAD_GATE_SCAN_CAP.
-_RELOAD_GATE_SCAN_CAP = 65536
+# (recoverable, not under-blocks / SIGKILL).  Single source of truth in _constants;
+# guard.py imports the same object — tune both scan sites by changing _constants only.
+from ._constants import _RELOAD_GATE_SCAN_CAP
 
 _TASK_NOTIF_BLOCK_RE = re.compile(
     r"<task-notification(?:\s[^>]*)?>(.*?)</task-notification>", re.DOTALL | re.IGNORECASE)

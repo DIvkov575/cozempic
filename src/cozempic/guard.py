@@ -2573,9 +2573,15 @@ _TN_BLOCK_RE = re.compile(r"<task-notification(?:\s[^>]*)?>(.*?)</task-notificat
 # cap is MISSED → the launch stays "in-flight" → the gate OVER-DEFERS the reload
 # (recoverable). It never UNDER-BLOCKS, which would SIGKILL.  Mirrors recap.py's
 # own DoS guard (text[:32768] and text[:8000]) introduced for system-reminder tags.
-_RELOAD_GATE_SCAN_CAP = 65536
-_TN_ID_RE = re.compile(r"<task-id>([^<]+)</task-id>", re.IGNORECASE)
-_TN_STATUS_RE = re.compile(r"<status>([^<]+)</status>", re.IGNORECASE)
+# Single source of truth in _constants; team.py imports the same object.
+from ._constants import _RELOAD_GATE_SCAN_CAP  # noqa: E402 — after regex block
+# Attribute-tolerant: matches <task-id>X</task-id> and <task-id xmlns="ns">X</task-id>.
+# Parity with team.py _TASK_NOTIF_ID_RE. The strict form silently drops any
+# notification whose <task-id> carries an XML attribute → launch stays
+# "in-flight" → gate over-defers indefinitely.
+_TN_ID_RE = re.compile(r"<task-id(?:\s[^>]*)?>([^<]+)</task-id>", re.IGNORECASE)
+# Attribute-tolerant sibling of _TN_ID_RE — parity with team.py _TASK_NOTIF_STATUS_RE.
+_TN_STATUS_RE = re.compile(r"<status(?:\s[^>]*)?>([^<]+)</status>", re.IGNORECASE)
 # Terminal completion vocabulary — broadened so a harness phrasing skew (success/
 # done/finished vs completed) can't pin a finished task "in-flight" forever.
 _INFLIGHT_DONE = {"completed", "complete", "failed", "cancelled", "canceled",
