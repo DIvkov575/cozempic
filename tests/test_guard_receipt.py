@@ -119,23 +119,32 @@ class TestGuardReceiptIntegration(unittest.TestCase):
                                    confidence="high", model="claude-opus-4-8",
                                    context_window=200000)
 
-        with patch.dict(os.environ, {"HOME": home}), \
+        scratch = self.tmp / "scratch"
+        scratch.mkdir(exist_ok=True)
+        # Build the cycle (returns the deferred writer). Mirrors the guard's current
+        # mock surface: load_messages_and_snapshot + _guard_tmp_root (post-#138).
+        with patch("cozempic.guard._guard_tmp_root", return_value=scratch), \
+                patch("cozempic.guard.load_messages_and_snapshot", return_value=(orig, MagicMock())), \
                 patch("cozempic.guard.load_messages", return_value=orig), \
                 patch("cozempic.guard.prune_with_team_protect", return_value=(pruned, results, team)), \
-                patch("cozempic.guard.save_messages", side_effect=lambda *a, **k: None), \
-                patch("cozempic.guard.snapshot_session", return_value=MagicMock()), \
                 patch("cozempic.tokens.estimate_session_tokens", side_effect=est), \
-                patch("cozempic.tokens.calibrate_ratio", return_value=0.5), \
-                patch("cozempic.helpers.record_savings"):  # never touch the real ledger
-            #  ^ _SAVINGS_FILE is a frozen module constant, so a HOME patch alone
-            #    does NOT redirect record_savings — it must be patched directly.
-            os.environ.pop("COZEMPIC_NO_RECEIPTS", None)
+                patch("cozempic.tokens.calibrate_ratio", return_value=0.5):
             result = guard_prune_cycle(
                 session_path=self.session, rx_name="gentle", config=None,
                 auto_reload=False, read_only_live=read_only_live, trigger_source=trigger_source,
+                session_id="testsess",
             )
-            writer = result.get("_deferred_writer")
-            if invoke_writer and writer is not None:
+        # Invoke the deferred writer (post-death) under patched I/O + temp HOME, and
+        # patch record_savings — _SAVINGS_FILE is a frozen module constant a HOME
+        # patch can't redirect, so it must be patched to spare the real ledger.
+        writer = result.get("_deferred_writer")
+        if invoke_writer and writer is not None:
+            with patch.dict(os.environ, {"HOME": home}), \
+                    patch("cozempic.guard._PruneLock"), \
+                    patch("cozempic.guard.save_messages", return_value=None), \
+                    patch("cozempic.guard.cleanup_old_backups"), \
+                    patch("cozempic.helpers.record_savings"):
+                os.environ.pop("COZEMPIC_NO_RECEIPTS", None)
                 writer()
         recdir = Path(home) / ".cozempic" / "receipts"
         if not recdir.exists():
