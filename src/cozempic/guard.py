@@ -2303,7 +2303,7 @@ def _spawn_reload_watcher(claude_pid: int, project_dir: str, session_id: str | N
     # The slug uses reload_lock._slug_for so it matches _reload_sentinel_path_for.
     from .reload_lock import _slug_for as _rl_slug_for
     if session_id:
-        sid12 = _rl_slug_for(session_id)[:12]
+        sid12 = _rl_slug_for(session_id)
         sentinel_path = f"/tmp/cozempic_reload_{sid12}.in-flight"
         status_path = f"/tmp/cozempic_reload_{sid12}.status"
         pgrep_pattern = f"claude.*{sid12}"
@@ -2890,8 +2890,11 @@ def safe_to_reload(team_state, messages, session_path) -> tuple[bool, str]:
 # precondition). `cozempic reload` clears the sentinel (user took control).
 # Shared by guard (write) and cli `nudge` (read/warn).
 def _reload_armed_path(session_id: str | None, session_path: Path | None = None) -> Path:
-    raw = (session_id or (session_path.stem if session_path else None) or "session")
-    slug = re.sub(r"[^a-z0-9_-]", "_", str(raw).lower())[:12] or "session"
+    from .reload_lock import _slug_for as _rl_slug_for  # lazy — matches guard.py:2233 pattern
+    raw = session_id or (session_path.stem if session_path else None) or None
+    # str() restores the coercion the old inline formula provided via str(raw);
+    # callers are typed str|None but we keep defensive parity for non-str inputs.
+    slug = _rl_slug_for(str(raw)) if raw is not None else "default"
     return _guard_tmp_root() / f"cozempic_reload_armed_{slug}.json"
 
 
@@ -2972,8 +2975,11 @@ def clear_armed(session_id, session_path: Path | None = None) -> None:
 
 
 def _reload_ledger_path(session_id: str | None, session_path: Path) -> Path:
-    raw = (session_id or session_path.stem or "session")
-    slug = re.sub(r"[^a-z0-9_-]", "_", raw.lower())[:12] or "session"
+    from .reload_lock import _slug_for as _rl_slug_for  # lazy — matches guard.py:2233 pattern
+    raw = session_id or session_path.stem or None
+    # str() restores the coercion the old inline formula provided via str(raw);
+    # callers are typed str|None but we keep defensive parity for non-str inputs.
+    slug = _rl_slug_for(str(raw)) if raw is not None else "default"
     return _guard_tmp_root() / f"cozempic_reload_{slug}.history"
 
 
