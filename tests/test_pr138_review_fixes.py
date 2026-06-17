@@ -157,8 +157,10 @@ class TestPersistedTokensSavedCallSite(unittest.TestCase):
 
         # RED at base: mock_record NOT called (tokens_saved computed as 0)
         # GREEN after fix: mock_record called once with total_tokens=100_000
+        # (session_id added by the dashboard-receipt branch — distinct-pruned-session tracking)
         from unittest.mock import ANY
-        mock_record.assert_called_once_with(100_000, total_tokens=100_000, turn_count=ANY)
+        mock_record.assert_called_once_with(100_000, total_tokens=100_000, turn_count=ANY,
+                                            session_id=ANY)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

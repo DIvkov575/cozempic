@@ -168,11 +168,15 @@ class _HostFileLock:
             pass
 
 
-def record_savings(tokens_saved: int, total_tokens: int = 0, turn_count: int = 0) -> None:
+def record_savings(tokens_saved: int, total_tokens: int = 0, turn_count: int = 0,
+                   session_id: str | None = None) -> None:
     """Add tokens saved to the lifetime tracker. Called after successful prune+reload.
 
     If total_tokens and turn_count are provided, estimates extra turns gained
-    from the freed headroom.
+    from the freed headroom. If session_id is provided, tracks the distinct
+    pruned-session count (the right denominator for the "sessions are Nx longer"
+    multiplier — record_savings only fires on a prune, so sessions seen here are
+    exactly the ones cozempic extended).
 
     Atomic-safe: read-modify-write is wrapped in a host-wide flock so two
     concurrent prune cycles don't lose increments. Write itself uses mkstemp
@@ -193,6 +197,25 @@ def record_savings(tokens_saved: int, total_tokens: int = 0, turn_count: int = 0
             if "since" not in data:
                 from datetime import date
                 data["since"] = date.today().isoformat()
+
+            # Forward-only session tracking (hashed; bounded) for the MEASURED
+            # per-pruned-session multiplier. Both counters start now, so the
+            # dashboard never divides the lifetime prune_count (e.g. 3,309) by a
+            # tiny new session count — it uses tracked_prunes/sessions, same window.
+            if session_id:
+                import hashlib
+                h = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:12]
+                seen = data.get("_pruned_session_hashes")
+                if not isinstance(seen, list):
+                    seen = []
+                # numerator: prunes that occurred under session tracking
+                data["tracked_prunes"] = data.get("tracked_prunes", 0) + 1
+                # denominator: distinct sessions, counted only when actually
+                # recorded (so past the cap `sessions` can't overcount)
+                if h not in set(seen) and len(seen) < 50_000:
+                    seen.append(h)
+                    data["sessions"] = data.get("sessions", 0) + 1
+                data["_pruned_session_hashes"] = seen
 
             # Estimate extra turns gained from freed headroom
             if turn_count > 0 and total_tokens > 0:

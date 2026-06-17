@@ -1501,6 +1501,61 @@ def _arm_nudge_from_result(session_id, session_path, tier, result):
         pass
 
 
+_GUARD_TIER_NAMES = {"gentle", "standard", "aggressive"}
+
+
+def _emit_guard_receipt(*, session_path, session_id, cwd, rx_name, trigger_source,
+                        results, pruned_messages, original_msgs, pre_te, post_te,
+                        original_bytes):
+    """Fire-and-forget a COMMITTED prune receipt for a guard/overflow auto-prune.
+
+    Called ONLY from _record_persisted_savings — i.e. only after the prune is
+    confirmed written to disk (the same after-write hook record_savings uses).
+    Doubly exception-isolated (here AND inside emit_receipt) so a receipt can
+    never perturb the prune / terminate / resume cycle.
+    """
+    try:
+        from .metrics import ClaudeMetricsAdapter, TriggerInfo, ValidationInfo
+        from .receipts import emit_receipt
+        from .registry import STRATEGIES
+        from .types import PrescriptionResult
+
+        pr = PrescriptionResult(
+            prescription_name=rx_name,
+            strategy_results=results,
+            original_total_bytes=original_bytes,
+            final_total_bytes=sum(b for _, _, b in pruned_messages),
+            original_message_count=len(original_msgs),
+            final_message_count=len(pruned_messages),
+            original_tokens=pre_te.total,
+            final_tokens=post_te.total,
+            token_method=pre_te.method,
+            model=pre_te.model,
+            context_window=pre_te.context_window,
+        )
+        tiers = {
+            sr.strategy_name: STRATEGIES[sr.strategy_name].tier
+            for sr in results if sr.strategy_name in STRATEGIES
+        }
+        emit_receipt(
+            pr,
+            adapter=ClaudeMetricsAdapter(),
+            session_id=session_id or (session_path.stem if session_path else None),
+            transcript_path=str(session_path) if session_path else None,
+            cwd=cwd or None,
+            trigger=TriggerInfo(
+                source=trigger_source,
+                tier=rx_name if rx_name in _GUARD_TIER_NAMES else "custom",
+                prescription=rx_name,
+            ),
+            outcome="committed",
+            validation=ValidationInfo(passed=True),
+            strategy_tiers=tiers,
+        )
+    except Exception:
+        pass
+
+
 def guard_prune_cycle(
     session_path: Path,
     rx_name: str = "standard",
@@ -1512,6 +1567,7 @@ def guard_prune_cycle(
     read_only_live: bool = False,
     project: bool = False,
     protect_patterns: list | None = None,
+    trigger_source: str = "guard",
 ) -> dict:
     """Execute a single guard prune cycle.
 
@@ -1776,7 +1832,8 @@ def guard_prune_cycle(
         turn_count = sum(1 for _, m, _ in messages
                        if get_msg_type(m) == "user"
                        and isinstance(m.get("message", {}).get("content", ""), str))
-        record_savings(tokens_saved, total_tokens=pre_te.total, turn_count=turn_count)
+        record_savings(tokens_saved, total_tokens=pre_te.total, turn_count=turn_count,
+                       session_id=session_id or (session_path.stem if session_path else None))
 
     # #106 deferred writer — persists the pruned session ONLY after the process
     # holding it is dead. Re-acquires the prune lock; the snapshot makes the
@@ -1801,6 +1858,15 @@ def guard_prune_cycle(
             # writer post-death), so a deferred/futile/looping cycle that never
             # writes can never inflate the prune/tokens counters.
             _record_persisted_savings()
+            # Per-prune dashboard receipt on EVERY confirmed write — covers guard +
+            # overflow and, unlike the ledger above, is NOT gated on the token
+            # delta, so a byte-only (token-neutral) committed prune still counts.
+            # Fully exception-isolated; can never perturb the write/resume.
+            _emit_guard_receipt(
+                session_path=session_path, session_id=session_id, cwd=cwd, rx_name=rx_name,
+                trigger_source=trigger_source, results=results, pruned_messages=pruned_messages,
+                original_msgs=messages, pre_te=pre_te, post_te=post_te, original_bytes=original_bytes,
+            )
         except (PruneConflictError, PruneLockError) as exc:
             _write_holder["error"] = "conflict"
             print(f"  [{_now()}] Deferred prune write skipped — {exc}", file=sys.stderr)

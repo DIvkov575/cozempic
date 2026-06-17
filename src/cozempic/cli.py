@@ -342,6 +342,46 @@ def _compile_protect_patterns_or_exit(args):
         sys.exit(2)
 
 
+_TIER_NAMES = {"gentle", "standard", "aggressive"}
+
+
+def _emit_prune_receipt(path, pr, *, source, outcome, session_id=None, cwd=None, defer_reason=None):
+    """Fire-and-forget a prune receipt (D1 of the dashboard path).
+
+    Doubly exception-isolated (here AND inside emit_receipt) so a receipt can
+    never break or defer the prune it records. Called on every outcome —
+    committed and deferred.
+    """
+    try:
+        from .metrics import ClaudeMetricsAdapter, TriggerInfo, ValidationInfo
+        from .receipts import emit_receipt
+
+        tiers = {
+            sr.strategy_name: STRATEGIES[sr.strategy_name].tier
+            for sr in pr.strategy_results
+            if sr.strategy_name in STRATEGIES
+        }
+        deferred = outcome != "committed"
+        tier = pr.prescription_name if pr.prescription_name in _TIER_NAMES else "custom"
+        emit_receipt(
+            pr,
+            adapter=ClaudeMetricsAdapter(),
+            session_id=session_id or (path.stem if path else None),
+            transcript_path=str(path) if path else None,
+            cwd=cwd,
+            trigger=TriggerInfo(
+                source=source, tier=tier, prescription=pr.prescription_name,
+            ),
+            outcome=outcome,
+            validation=ValidationInfo(
+                passed=not deferred, deferred=deferred, defer_reason=defer_reason,
+            ),
+            strategy_tiers=tiers,
+        )
+    except Exception:
+        pass
+
+
 def cmd_treat(args):
     path = resolve_session(args.session, getattr(args, "project", None), strict=getattr(args, "execute", False))
     # Take snapshot BEFORE load so append-conflict detection in save_messages
@@ -443,11 +483,16 @@ def cmd_treat(args):
             with _PruneLock(path):
                 backup = save_messages(path, new_messages, create_backup=True, snapshot=snapshot)
         except PruneLockError:
+            _emit_prune_receipt(path, pr, source="manual", outcome="deferred",
+                                cwd=os.getcwd(), defer_reason="prune_lock")
             print("  Aborted: another prune cycle (guard daemon) is active. Try again in a few seconds.", file=sys.stderr)
             sys.exit(2)
         except PruneConflictError as exc:
+            _emit_prune_receipt(path, pr, source="manual", outcome="deferred",
+                                cwd=os.getcwd(), defer_reason="session_changed")
             print(f"  Aborted: session changed mid-prune (Claude wrote new lines). {exc}", file=sys.stderr)
             sys.exit(3)
+        _emit_prune_receipt(path, pr, source="manual", outcome="committed", cwd=os.getcwd())
         print(f"  Applied to {path}")
         if backup:
             print(f"  Backup: {backup}")
@@ -463,6 +508,7 @@ def cmd_treat(args):
                 pr.original_tokens - pr.final_tokens,
                 total_tokens=pr.original_tokens,
                 turn_count=turn_count,
+                session_id=path.stem if path else None,
             )
             savings = get_savings_line()
             if savings:
@@ -734,11 +780,17 @@ def cmd_reload(args):
             with _PruneLock(path):
                 backup = save_messages(path, new_messages, create_backup=True, snapshot=snapshot)
         except PruneLockError:
+            _emit_prune_receipt(path, pr, source="manual", outcome="deferred",
+                                session_id=sess["session_id"], cwd=cwd, defer_reason="prune_lock")
             print("  Aborted: another prune cycle (guard daemon) is active. Try again in a few seconds.", file=sys.stderr)
             sys.exit(2)
         except PruneConflictError as exc:
+            _emit_prune_receipt(path, pr, source="manual", outcome="deferred",
+                                session_id=sess["session_id"], cwd=cwd, defer_reason="session_changed")
             print(f"  Aborted: session changed mid-prune (Claude wrote new lines). {exc}", file=sys.stderr)
             sys.exit(3)
+        _emit_prune_receipt(path, pr, source="manual", outcome="committed",
+                            session_id=sess["session_id"], cwd=cwd)
         print(f"  Applied to {path}")
         if backup:
             print(f"  Backup: {backup}")
@@ -754,6 +806,7 @@ def cmd_reload(args):
                 pre_te.total - post_te.total,
                 total_tokens=pre_te.total,
                 turn_count=turn_count,
+                session_id=sess["session_id"],
             )
             savings = get_savings_line()
             if savings:
@@ -1704,13 +1757,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_digest.add_argument("--session", help=session_help)
     p_digest.add_argument("--cwd", help="Working directory (default: current)")
 
+    p_dash = sub.add_parser("dashboard", help="Generate + open the prune-value dashboard (HTML)")
+    p_dash.add_argument("--no-open", action="store_true",
+                        help="Write the HTML but don't open a browser")
+    p_dash.add_argument("--agent", help="Filter to one agent (e.g. claude, codex)")
+
     return parser
 
 
 _SUBCOMMANDS = {
     "list", "current", "diagnose", "treat", "strategy", "reload",
     "checkpoint", "post-compact", "guard", "init", "doctor", "formulary", "completions",
-    "digest", "self-update", "remind", "guard-watchdog",
+    "digest", "self-update", "remind", "guard-watchdog", "dashboard",
 }
 
 
@@ -1799,6 +1857,7 @@ _AUTO_INIT_SKIP_CMDS = frozenset({
     "doctor",        # diagnostic-only; doctor surfaces missing init via its own check
     "nudge",         # Stop-hook protocol command; never mutate state as a side effect
     "guard-watchdog",  # read-only log scan; never mutate project state
+    "dashboard",     # report-only; reads/writes only ~/.cozempic, never project state
 })
 
 _GLOBAL_INIT_MARKER = Path.home() / ".cozempic_global_initialized"
@@ -2121,6 +2180,62 @@ def _maybe_auto_init(argv: list[str]) -> None:
         )
 
 
+def cmd_dashboard(args):
+    """Generate (and open) the local prune-value dashboard from receipts."""
+    from datetime import datetime, timezone
+
+    from .dashboard import aggregate, load_receipts
+    from .dashboard.lifetime import load_lifetime
+    from .dashboard.render import dashboard_path, render_html, write_dashboard
+
+    receipts = load_receipts()
+    agent = getattr(args, "agent", None)
+    if agent:
+        receipts = [r for r in receipts
+                    if isinstance(r.get("agent"), dict) and r["agent"].get("name") == agent]
+    # The lifetime ledger is GLOBAL (no agent dimension), so it would contradict
+    # an agent-filtered view ("456M reclaimed" next to "no prunes for codex").
+    # Show it only on the unfiltered dashboard.
+    ledger = None if agent else load_lifetime()
+    data = aggregate(receipts)
+    ts = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    label = "~/.cozempic/receipts" + (f" · agent={agent}" if agent else "")
+    html_str = render_html(data, generated_ts=ts, source_label=label, ledger=ledger)
+    try:
+        path = write_dashboard(html_str)
+    except Exception as exc:
+        print(f"  Error: could not write dashboard: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    n = data.get("lifetime", {}).get("prunes_total", 0)
+    print(f"  Dashboard: {path}")
+    if ledger:
+        line = f"  Lifetime: {ledger['tokens_saved'] / 1e6:.1f}M tokens reclaimed across {ledger['prune_count']:,} prunes"
+        if ledger.get("since"):
+            line += f" since {ledger['since']}"
+        print(line)
+        if ledger.get("session_multiplier_x"):
+            print(f"  Sessions ~{ledger['session_multiplier_x']:.2f}x longer "
+                  f"(measured across {ledger['sessions']:,} pruned sessions).")
+    if n:
+        lt = data["lifetime"]
+        print(f"  {n} prune(s), {lt.get('committed', 0)} applied across "
+              f"{lt.get('sessions', 0)} session(s).")
+    elif agent:
+        print(f"  No prunes recorded for agent '{agent}'.")
+    else:
+        print("  No prunes recorded yet — run `cozempic treat --execute` first.")
+
+    if not getattr(args, "no_open", False):
+        try:
+            import webbrowser
+
+            if not webbrowser.open(dashboard_path().as_uri()):
+                print("  (open it manually in a browser)")
+        except Exception:
+            print("  (open it manually in a browser)")
+
+
 def main():
     from .updater import maybe_auto_update, ping_install_if_new
 
@@ -2166,6 +2281,7 @@ def main():
         "self-update": cmd_self_update,
         "remind": cmd_remind,
         "nudge": cmd_nudge,
+        "dashboard": cmd_dashboard,
     }
 
     try:
