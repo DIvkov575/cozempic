@@ -166,7 +166,7 @@ def detect_model(messages: list[Message]) -> str | None:
             continue
         if msg.get("isSidechain"):
             continue
-        inner = msg.get("message", {})
+        inner = _inner_dict(msg)
         model = inner.get("model", "")
         if model and model != "<synthetic>":
             return model
@@ -217,6 +217,42 @@ def detect_context_window(messages: list[Message]) -> int:
     return DEFAULT_CONTEXT_WINDOW
 
 
+def _as_int(value) -> int:
+    """Coerce a JSONL `usage` field to a non-negative int, tolerating junk.
+
+    A malformed transcript can carry a present-but-null/string/float usage value
+    (e.g. ``"input_tokens": null``). The bare ``.get(k, 0)`` default only covers a
+    MISSING key, so ``None + 0`` (or ``"x" + 0``) raises TypeError — and that
+    escapes the guard daemon's per-cycle loop (whose only handler is
+    KeyboardInterrupt), killing the daemon with no respawn. Coerce defensively:
+    bool/None/str/garbage -> 0, float -> int, negative -> 0.
+    """
+    if isinstance(value, bool):  # bool is an int subclass — treat True/False as 0
+        return 0
+    if isinstance(value, int):
+        return value if value > 0 else 0
+    if isinstance(value, float):
+        # inf/nan are valid JSON numbers (1e999 -> inf, json accepts NaN/Infinity)
+        # and int(inf) raises OverflowError / int(nan) raises ValueError — which
+        # would escape into the guard loop. Treat non-finite as 0.
+        import math
+        if not math.isfinite(value) or value <= 0:
+            return 0
+        return int(value)
+    return 0
+
+
+def _inner_dict(msg: dict) -> dict:
+    """The message's inner dict, or {} if 'message' is missing OR a non-dict.
+
+    `msg.get("message", {})` only defaults a MISSING key — a present-but-non-dict
+    "message" (a plain string, which occurs in real JSONL) makes the following
+    `.get()` raise AttributeError and (pre-fix) escape into the guard loop. Coerce
+    a non-dict to {} so every message-access site is crash-safe."""
+    inner = msg.get("message")
+    return inner if isinstance(inner, dict) else {}
+
+
 def _is_sidechain(msg: dict) -> bool:
     """Check if a message belongs to a sidechain (subagent) conversation."""
     return bool(msg.get("isSidechain"))
@@ -241,9 +277,16 @@ def _is_context_message(msg: dict) -> bool:
     # Assistant messages that are pure thinking (no text/tool_use output)
     if mtype == "assistant":
         blocks = get_content_blocks(msg)
+        # isinstance guard: get_content_blocks returns content VERBATIM (the round-3
+        # revert that stopped write-path data loss), so a non-dict content element
+        # reaches here. Without the guard b.get(...) raises AttributeError, which is
+        # UNHANDLED in cmd_treat (aborts the prune → user marches into auto-compaction)
+        # and a respawn-storm in the guard cycle (R4 findings is-context-message /
+        # nondict-block-elem token crash).
         has_output = any(
             b.get("type") in ("text", "tool_use", "tool_result")
             for b in blocks
+            if isinstance(b, dict)
         )
         if blocks and not has_output:
             return False
@@ -271,7 +314,7 @@ def extract_usage_tokens(messages: list[Message]) -> dict | None:
         if msg.get("_parse_error"):
             continue
 
-        inner = msg.get("message", {})
+        inner = _inner_dict(msg)
         # Skip synthetic messages — their usage is all zeros
         if inner.get("model") == "<synthetic>":
             continue
@@ -279,10 +322,10 @@ def extract_usage_tokens(messages: list[Message]) -> dict | None:
         if not usage or not isinstance(usage, dict):
             continue
 
-        input_tok = usage.get("input_tokens", 0)
-        output_tok = usage.get("output_tokens", 0)
-        cache_create = usage.get("cache_creation_input_tokens", 0)
-        cache_read = usage.get("cache_read_input_tokens", 0)
+        input_tok = _as_int(usage.get("input_tokens", 0))
+        output_tok = _as_int(usage.get("output_tokens", 0))
+        cache_create = _as_int(usage.get("cache_creation_input_tokens", 0))
+        cache_read = _as_int(usage.get("cache_read_input_tokens", 0))
 
         # The cumulative context size is the sum of all token components
         total = input_tok + cache_create + cache_read + output_tok
@@ -300,6 +343,11 @@ def extract_usage_tokens(messages: list[Message]) -> dict | None:
 
 def _estimate_block_chars(block: dict) -> int:
     """Estimate character count for a content block, excluding thinking."""
+    # A content array can legally hold a bare string/number (get_content_blocks now
+    # returns elements verbatim to avoid write-path data loss). This read-only path
+    # is OUTSIDE the executor's per-strategy isolation, so coerce here.
+    if not isinstance(block, dict):
+        return len(block) if isinstance(block, str) else len(json.dumps(block, separators=(",", ":")))
     btype = block.get("type", "")
 
     # Thinking blocks are not counted (they're ephemeral)
@@ -348,7 +396,7 @@ def estimate_tokens_heuristic(
                 msg_chars += _estimate_block_chars(block)
         else:
             # Simple message with string content
-            inner = msg.get("message", {})
+            inner = _inner_dict(msg)
             content = inner.get("content", "")
             if isinstance(content, str):
                 msg_chars = len(content)
@@ -475,17 +523,17 @@ def quick_token_estimate(path: Path, context_window: int = DEFAULT_CONTEXT_WINDO
                 if msg.get("isSidechain"):
                     continue
 
-                inner = msg.get("message", {})
+                inner = _inner_dict(msg)
                 if inner.get("model") == "<synthetic>":
                     continue
                 usage = inner.get("usage")
                 if not usage or not isinstance(usage, dict):
                     continue
 
-                input_tok = usage.get("input_tokens", 0)
-                output_tok = usage.get("output_tokens", 0)
-                cache_create = usage.get("cache_creation_input_tokens", 0)
-                cache_read = usage.get("cache_read_input_tokens", 0)
+                input_tok = _as_int(usage.get("input_tokens", 0))
+                output_tok = _as_int(usage.get("output_tokens", 0))
+                cache_create = _as_int(usage.get("cache_creation_input_tokens", 0))
+                cache_read = _as_int(usage.get("cache_read_input_tokens", 0))
                 return input_tok + cache_create + cache_read + output_tok
             # No usage in this tail — grow to the next (larger) size and retry.
 
@@ -520,7 +568,7 @@ def calibrate_ratio(messages: list[Message]) -> float | None:
             for block in blocks:
                 total_chars += _estimate_block_chars(block)
         else:
-            inner = msg.get("message", {})
+            inner = _inner_dict(msg)
             content = inner.get("content", "")
             if isinstance(content, str):
                 total_chars += len(content)

@@ -23,7 +23,7 @@ from .init import run_init
 from .recap import save_recap
 from .registry import PRESCRIPTIONS, STRATEGIES
 from .safety import PruneValidationError
-from .session import _PruneLock, PruneConflictError, PruneLockError, find_claude_pid, find_current_session, find_sessions, get_session_cwd, load_messages, project_slug_to_path, resolve_session, save_messages, snapshot_session
+from .session import _PruneLock, PruneConflictError, PruneLockError, find_claude_pid, find_current_session, find_sessions, get_session_cwd, load_messages, load_messages_and_snapshot, project_slug_to_path, resolve_session, save_messages, snapshot_session
 from .tokens import estimate_session_tokens, quick_token_estimate, calibrate_ratio
 from .types import PrescriptionResult, StrategyResult
 
@@ -346,9 +346,10 @@ def cmd_treat(args):
     path = resolve_session(args.session, getattr(args, "project", None), strict=getattr(args, "execute", False))
     # Take snapshot BEFORE load so append-conflict detection in save_messages
     # can correctly identify if Claude wrote new lines mid-prune. Only needed
-    # for execute path but cheap to compute always.
-    snapshot = snapshot_session(path) if getattr(args, "execute", False) else None
-    messages = load_messages(path)
+    # for execute path but cheap to compute always. Read once so the snapshot and
+    # messages come from identical bytes (no TOCTOU append-duplication).
+    messages, _snap = load_messages_and_snapshot(path)
+    snapshot = _snap if getattr(args, "execute", False) else None
     rx_name = args.rx or "standard"
 
     if rx_name not in PRESCRIPTIONS:
@@ -478,9 +479,10 @@ def cmd_treat(args):
 
 def cmd_strategy(args):
     path = resolve_session(args.session, getattr(args, "project", None), strict=getattr(args, "execute", False))
-    # Take snapshot before load for append-conflict detection on execute path
-    snapshot = snapshot_session(path) if getattr(args, "execute", False) else None
-    messages = load_messages(path)
+    # Read once (snapshot + messages from identical bytes) for append-conflict
+    # detection on the execute path without a TOCTOU append-duplication window.
+    messages, _snap = load_messages_and_snapshot(path)
+    snapshot = _snap if getattr(args, "execute", False) else None
 
     if args.name not in STRATEGIES:
         print(f"Error: Unknown strategy '{args.name}'.", file=sys.stderr)
@@ -666,8 +668,7 @@ def cmd_reload(args):
         path = sess["path"]
         # Snapshot BEFORE load so append-conflict detection works (Claude may write
         # mid-prune; we need the file state at this exact instant for diff classification).
-        snapshot = snapshot_session(path)
-        messages = load_messages(path)
+        messages, snapshot = load_messages_and_snapshot(path)
         strategy_names = PRESCRIPTIONS[rx_name]
         config = {}
         if args.thinking_mode:
@@ -974,8 +975,9 @@ def cmd_guard_watchdog(args):
     A process safeguard outside the daemon: an OLD or broken guard that fails to
     self-arrest (the f641174c / PilotCC reload-loop) keeps spinning until killed.
     This reads the guard logs and flags the loop signature. ``--fix`` SIGTERMs a
-    LIVE looping daemon (our own process — stopping a harmful loop is safe); the
-    default is report-only.
+    LIVE looping daemon that has been IDENTITY-VERIFIED as a cozempic guard
+    process; without that check, a recycled PID (kernel reuse after hard exit)
+    could be an innocent unrelated process. The default mode is report-only.
     """
     import signal
     from .watchdog import scan_guard_logs
@@ -1000,13 +1002,16 @@ def cmd_guard_watchdog(args):
         print(f"      {h.report.reason}")
         print(f"      futile={h.report.futile_cycles} total={h.report.total_prune_cycles} "
               f"backoff_max={h.report.max_backoff_s}s exit_seen={h.report.has_exit}")
-        if getattr(args, "fix", False) and h.pid_alive and h.pid:
+        if getattr(args, "fix", False) and h.guard_confirmed:
             try:
                 os.kill(int(h.pid), signal.SIGTERM)
                 print(f"      → SIGTERM sent to looping daemon pid {h.pid}")
                 arrested += 1
             except (ProcessLookupError, PermissionError, OSError) as e:
                 print(f"      ! could not signal pid {h.pid}: {e}")
+        elif getattr(args, "fix", False) and h.pid_alive and h.pid:
+            print(f"      → pid {h.pid} is alive but is NOT a cozempic guard "
+                  f"(recycled?) — refusing to kill")
         elif h.pid_alive:
             print(f"      → re-run with --fix to terminate this looping daemon "
                   f"(or: kill {h.pid})")
@@ -1387,13 +1392,16 @@ def cmd_remind(args):
     # Collect rules: digest active rules + CLAUDE.md critical rules
     lines = []
 
-    # 1. Active digest rules
-    from .digest import load_digest_store
+    # 1. Active digest rules. Sanitize r.rule — it is untrusted transcript-derived
+    # text and this is emitted into Claude's context via the PostToolUse hook, so a
+    # multi-line / markdown-structured rule could inject instructions (sibling of
+    # the digest injection fix; the #123 fix-one-miss-the-sibling lesson).
+    from .digest import load_digest_store, _sanitize_for_injection
     store = load_digest_store()
     active = store.active_rules()
     if active:
         for r in active[:5]:
-            lines.append(f"  [{r.id}|{r.scope}] {r.rule}")
+            lines.append(f"  [{r.id}|{r.scope}] {_sanitize_for_injection(r.rule)}")
 
     # 2. Critical CLAUDE.md rules (grep for enforcement markers)
     for candidate in ["CLAUDE.md", ".claude/CLAUDE.md"]:

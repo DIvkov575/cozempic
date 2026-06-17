@@ -105,6 +105,23 @@ class TestHealthy(unittest.TestCase):
 
     def test_real_prunes_not_flagged(self):
         rep = scan_log_text(_daemon_start() + "".join(_good_cycle(n=i) for i in range(50)))
+        # The K-suffixed productive lines MUST be counted (the old regex silently
+        # dropped them — assert the absolute count so a parse-miss can never again
+        # masquerade as "no futile cycles").
+        self.assertEqual(rep.total_prune_cycles, 50,
+                         "productive K-format prunes must be parsed, not dropped")
+        self.assertEqual(rep.futile_cycles, 0)
+        self.assertFalse(rep.looping)
+
+    def test_K_and_M_suffix_prunes_counted_non_futile(self):
+        # Direct regression for the watchdog K/M-regex P1: both K- and M-format
+        # productive prune lines parse and classify non-futile.
+        text = _daemon_start()
+        text += "  Pruned: 5.0K tokens freed (12.5%), 1.5MB saved\n"
+        text += "  Pruned: 1.2M tokens freed (60.0%), 9.0MB saved\n"
+        text += "  Pruned: 1,234 tokens freed (8.0%), 0.1MB saved\n"
+        rep = scan_log_text(text)
+        self.assertEqual(rep.total_prune_cycles, 3, "K/M/comma forms must all parse")
         self.assertEqual(rep.futile_cycles, 0)
         self.assertFalse(rep.looping)
 
@@ -122,12 +139,17 @@ class TestHealthy(unittest.TestCase):
         self.assertFalse(rep.looping)
 
     def test_mostly_real_some_futile_not_flagged(self):
-        # 40 real prunes + 5 marginal futile → futile does NOT dominate.
+        # 40 real (K-format) prunes + 25 marginal futile → futile is 25/65 = 38%,
+        # NOT dominant. This only exercises the dominance math if the real prunes
+        # are actually counted — assert the full denominator so the K-format
+        # parse-miss (the watchdog P1) can't make this pass vacuously.
         text = _daemon_start() + "".join(_good_cycle(n=i) for i in range(40))
-        text += "".join(_futile_cycle(n=i) for i in range(5))
+        text += "".join(_futile_cycle(n=i) for i in range(25))
         rep = scan_log_text(text)
-        self.assertEqual(rep.futile_cycles, 5)
-        self.assertFalse(rep.looping, "futile must DOMINATE to flag")
+        self.assertEqual(rep.total_prune_cycles, 65,
+                         "all 40 real + 25 futile prunes must be in the denominator")
+        self.assertEqual(rep.futile_cycles, 25)
+        self.assertFalse(rep.looping, "futile (38%) must DOMINATE (>=80%) to flag")
 
     def test_empty_log(self):
         self.assertFalse(scan_log_text("").looping)
@@ -209,13 +231,75 @@ class TestCliCommand(unittest.TestCase):
         self.assertEqual(cm.exception.code, 3)
 
     def test_fix_sends_sigterm(self):
+        """--fix SIGTERMs a pid confirmed as a cozempic guard (guard_confirmed=True)."""
         killed = {}
         def fake_kill(pid, sig):
             killed["pid"], killed["sig"] = pid, sig
         with mock.patch("cozempic.watchdog._pid_alive", lambda pid: True), \
+             mock.patch("cozempic.guard._is_cozempic_guard_process", return_value=True), \
              mock.patch("os.kill", fake_kill):
             self._run(fix=True)
         self.assertEqual(killed.get("pid"), 4242)
+        self.assertEqual(killed.get("sig"), signal.SIGTERM)
+
+
+class TestFixIdentityGate(unittest.TestCase):
+    """L2 HIGH: --fix must verify guard identity before sending SIGTERM.
+
+    Confused-deputy scenario: guard exits hard (SIGKILL / OOM), pidfile is
+    never unlinked, OS recycles the PID to an unrelated same-user process,
+    operator runs `cozempic guard-watchdog --fix`.  Without an identity gate,
+    the innocent process is SIGTERMed.
+
+    RED-at-base proof: before the fix, ``test_fix_refuses_to_kill_non_guard``
+    fails because os.kill IS called on the recycled pid (SIGTERM to innocent).
+    After the fix, the gate blocks the kill and the test passes.
+    """
+
+    def setUp(self):
+        self._td = TemporaryDirectory()
+        self.dir = Path(self._td.name)
+        (self.dir / "cozempic_guard_zzz.log").write_text(_respawn_storm(), encoding="utf-8")
+        (self.dir / "cozempic_guard_zzz.pid").write_text("7777", encoding="utf-8")
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def _run_fix(self, is_guard: bool) -> dict:
+        """Drive cmd_guard_watchdog(fix=True) with identity mock; return kill calls."""
+        from types import SimpleNamespace
+        from cozempic.cli import cmd_guard_watchdog
+        killed: dict = {}
+
+        def fake_kill(pid, sig):
+            killed["pid"], killed["sig"] = pid, sig
+
+        with mock.patch("cozempic.watchdog._pid_alive", return_value=True), \
+             mock.patch("cozempic.guard._is_cozempic_guard_process", return_value=is_guard), \
+             mock.patch("os.kill", fake_kill):
+            args = SimpleNamespace(fix=True, log_dir=str(self.dir), loop_trip=20)
+            try:
+                cmd_guard_watchdog(args)
+            except SystemExit:
+                # sys.exit(3) when live loop not arrested (non-guard case) — expected
+                pass
+        return killed
+
+    def test_fix_refuses_to_kill_non_guard(self):
+        """RED-at-base: a recycled (non-guard) pid must NOT receive SIGTERM.
+
+        Without guard_confirmed gate, os.kill IS called — this test FAILS at
+        base and PASSES after the fix adds the identity check.
+        """
+        killed = self._run_fix(is_guard=False)
+        self.assertNotIn("pid", killed,
+                         "os.kill was called on a recycled non-guard pid — "
+                         "confused-deputy bug: the identity gate is missing")
+
+    def test_fix_kills_confirmed_guard(self):
+        """A pid confirmed as a cozempic guard MUST receive SIGTERM under --fix."""
+        killed = self._run_fix(is_guard=True)
+        self.assertEqual(killed.get("pid"), 7777)
         self.assertEqual(killed.get("sig"), signal.SIGTERM)
 
 

@@ -133,10 +133,12 @@ class TestOverflowDetection(unittest.TestCase):
             json.dumps({"type": "user", "message": "hello"}),
             json.dumps({"type": "assistant", "message": "hi"}),
         ] * 10
-        # Add the overflow marker
+        # Add the overflow marker as a genuine API-error entry (the structural
+        # contract: only real error entries trigger, not any line quoting the phrase).
         lines.append(json.dumps({
-            "type": "system",
-            "message": f"Error: {OVERFLOW_PATTERN} for this model",
+            "type": "assistant",
+            "isApiErrorMessage": True,
+            "message": {"role": "assistant", "content": f"Error: {OVERFLOW_PATTERN} for this model"},
         }))
         self._write_lines(lines)
 
@@ -147,6 +149,51 @@ class TestOverflowDetection(unittest.TestCase):
                 self.session_path, "test-detect", self.tmpdir, breaker,
             )
             self.assertTrue(recovery.detect_overflow())
+        finally:
+            breaker.reset()
+
+    def test_detects_widened_markers(self):
+        """Beyond 'Conversation too long', the widened marker set must catch the
+        API-style prompt-too-long forms (the single hardcoded string may be
+        TUI-only and never persisted — Batch-3 widen)."""
+        from cozempic.overflow import OVERFLOW_MARKERS
+        for marker in ("Prompt is too long", "context_length_exceeded", "maximum context length"):
+            self.assertIn(marker, OVERFLOW_MARKERS)
+            lines = [json.dumps({"type": "user", "message": "x"})] * 5
+            lines.append(json.dumps({"type": "assistant", "isApiErrorMessage": True,
+                                     "message": {"role": "assistant", "content": f"API error: {marker}"}}))
+            self._write_lines(lines)
+            breaker = CircuitBreaker(session_id="t-mark", max_recoveries=3)
+            breaker.reset()
+            try:
+                rec = OverflowRecovery(self.session_path, "t-mark", self.tmpdir, breaker)
+                self.assertTrue(rec.detect_overflow(), f"must detect marker: {marker}")
+            finally:
+                breaker.reset()
+
+    def test_user_discussing_limits_does_not_false_trigger(self):
+        """Mission-critical C6: a USER turn that merely mentions overflow phrasing
+        must NOT trigger reactive kill+resume — only a real API-error line does."""
+        lines = [json.dumps({"type": "user", "message": {"role": "user",
+                 "content": "my prompt is too long — how do I raise the maximum context length?"}})] * 3
+        self._write_lines(lines)
+        breaker = CircuitBreaker(session_id="t-fp", max_recoveries=3); breaker.reset()
+        try:
+            rec = OverflowRecovery(self.session_path, "t-fp", self.tmpdir, breaker)
+            self.assertFalse(rec.detect_overflow(),
+                             "user text discussing context limits must not trigger overflow")
+        finally:
+            breaker.reset()
+
+    def test_api_error_message_flag_triggers(self):
+        lines = [json.dumps({"type": "user", "message": {"role": "user", "content": "hi"}}),
+                 json.dumps({"type": "assistant", "isApiErrorMessage": True,
+                             "message": {"role": "assistant", "content": "Prompt is too long"}})]
+        self._write_lines(lines)
+        breaker = CircuitBreaker(session_id="t-api", max_recoveries=3); breaker.reset()
+        try:
+            rec = OverflowRecovery(self.session_path, "t-api", self.tmpdir, breaker)
+            self.assertTrue(rec.detect_overflow(), "isApiErrorMessage line must trigger")
         finally:
             breaker.reset()
 

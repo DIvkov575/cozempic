@@ -55,7 +55,23 @@ STORM_TRIP = 5
 # The guard's back-off cap (HARD_LOOP_BACKOFF_CAP), recorded for diagnostics.
 BACKOFF_CAP_S = 300
 
-_PRUNED_RE = re.compile(r"Pruned:\s+([0-9.]+|[0-9,]+)\s+tokens freed\s+\(([0-9.]+)%\)", re.IGNORECASE)
+# The token-count group must tolerate the K/M/G suffix and comma grouping that
+# guard._fmt_prune_result emits ("210.0K tokens freed", "1.2M tokens freed") for
+# any prune >= 1000 tokens — WITHOUT this, every productive prune line is
+# unparsed, so the futile-dominance ratio skews to ~1.0 and the watchdog
+# FALSE-FLAGS a healthy daemon as looping (and --fix would SIGTERM it). The count
+# is matched but NOT captured (the percent is the only capture group, group 1, and
+# the only value consumed downstream), so the K/M/comma suffix only needs tolerating.
+# Anchored to line-start (re.M, optional leading whitespace) — the guard emits its
+# real prune line as "  Pruned: …" at the START of a log line. Anchoring stops a
+# "Pruned: 0 tokens freed (0.0%)" substring embedded MID-line (e.g. inside a
+# Team '<attacker-name>' state preserved log line) from forging a futile-prune
+# match and false-tripping the watchdog (C7 log-injection — the residual the
+# newline-only _log_safe scrub didn't cover).
+_PRUNED_RE = re.compile(
+    r"^\s*Pruned:\s+[0-9][0-9,]*(?:\.[0-9]+)?[KMG]?\s+tokens freed\s+\(([0-9.]+)%\)",
+    re.IGNORECASE | re.MULTILINE,
+)
 _BACKOFF_RE = re.compile(r"back-off \(next sleep:\s*(\d+)s", re.IGNORECASE)
 _DAEMON_START_RE = re.compile(r"Guard daemon started", re.IGNORECASE)
 # Circuit-breaker / daemon-exit markers (recorded for diagnostics — NOT treated
@@ -65,6 +81,12 @@ _EXIT_RE = re.compile(
     r"giving up|consecutive empty|reload-loop)",
     re.IGNORECASE,
 )
+# C7: the inert/erroring-guard signature emits NO "Pruned:" line — a per-cycle
+# exception spinner logs "skipping a cycle after an unexpected error", and the
+# C2 escalation logs "cycle-error escalation" before exiting for respawn. The
+# watchdog must SEE these (it was previously blind to any non-futile-prune loop).
+_CYCLE_ERR_RE = re.compile(r"skipping a cycle after an unexpected error", re.IGNORECASE)
+_CYCLE_ESCALATION_RE = re.compile(r"cycle-error escalation", re.IGNORECASE)
 
 
 @dataclass
@@ -73,6 +95,8 @@ class LoopReport:
     total_prune_cycles: int = 0
     futile_cycles: int = 0
     daemon_starts: int = 0
+    cycle_errors: int = 0
+    cycle_escalations: int = 0
     max_backoff_s: int = 0
     has_backoff: bool = False
     has_exit: bool = False
@@ -98,7 +122,7 @@ def scan_log_text(text: str, loop_trip: int = LOOP_TRIP_DEFAULT) -> LoopReport:
     for m in _PRUNED_RE.finditer(text):
         rep.total_prune_cycles += 1
         try:
-            pct = float(m.group(2))
+            pct = float(m.group(1))
         except (TypeError, ValueError):
             continue
         rep.recent_pcts.append(pct)
@@ -113,6 +137,51 @@ def scan_log_text(text: str, loop_trip: int = LOOP_TRIP_DEFAULT) -> LoopReport:
         rep.has_backoff = True
         rep.max_backoff_s = max(backoffs)
     rep.has_exit = bool(_EXIT_RE.search(text))
+
+    # C7: erroring/inert-guard signature — the guard is erroring MORE than it is
+    # productively pruning. Discriminator (R15, after three weaker attempts each leaked):
+    #   cycle_errors >= loop_trip  AND  cycle_errors > productive_prunes
+    # where productive_prunes = total_prune_cycles - futile_cycles (prunes that actually
+    # freed space). This is robust in BOTH directions on a flat append-mode log:
+    #  - HEALTHY busy guard (many productive prunes, occasional transient error):
+    #    cycle_errors <= productive_prunes -> NOT flagged.
+    #  - HEALTHY IDLE guard (short sessions, 0 prunes, 0 errors, several restarts):
+    #    cycle_errors (0) < loop_trip -> NOT flagged (the daemon_starts-only trigger of
+    #    the prior attempt false-flagged this — R15 FP).
+    #  - HEALTHY fresh gen + a couple of STALE escalations from dead gens (~10 errors):
+    #    < loop_trip -> NOT flagged (R15 FP).
+    #  - ERROR respawn storm, even WITH a stray early productive prune line in the tail
+    #    (the R15 FN that defeated the total_prune_cycles==0 gate): many errors greatly
+    #    outnumber the lone productive prune -> flagged.
+    #  - single INERT generation (>= loop_trip errors, 0 prunes) -> flagged.
+    # The futile-PRUNE storm (f641174c: many <1%-freed prunes, ~0 errors) has
+    # productive_prunes near 0 but cycle_errors near 0 too, so it is owned by the
+    # separate futile-dominance branch below (which keeps the "respawn storm" reason).
+    #
+    # KNOWN RESIDUAL (accepted, REPORT-ONLY; tracked follow-up = a rate-based redesign):
+    # because this counts over a flat 256KB append-mode tail with no recency/rate
+    # awareness, two edge cases survive — (FN) a CURRENT error-storm can be masked if
+    # stale productive-prune lines from an earlier dead generation still in the window
+    # outnumber the errors; (FP) a long healthy daemon that self-recovered >= loop_trip
+    # SCATTERED transient errors (counter reset each time, never escalated) with its
+    # productive prunes scrolled out of the window can be flagged. Both are bounded:
+    # this is a REPORT-ONLY monitor (--fix is manual + guard-identity-gated), the
+    # daemon's OWN circuit-breaker self-arrests real error-storms, and the well-tested
+    # futile-PRUNE loop detection (the real f641174c incident shape) is unaffected. The
+    # durable fix is to parse the per-line timestamps and key the verdict on RESTART
+    # RATE within a recent window — deferred to a follow-up (not blocking PR #138).
+    rep.cycle_errors = len(_CYCLE_ERR_RE.findall(text))
+    rep.cycle_escalations = len(_CYCLE_ESCALATION_RE.findall(text))
+    _productive_prunes = rep.total_prune_cycles - rep.futile_cycles
+    if rep.cycle_errors >= loop_trip and rep.cycle_errors > _productive_prunes:
+        rep.looping = True
+        rep.reason = (
+            f"{rep.cycle_errors} per-cycle errors / {rep.cycle_escalations} escalations / "
+            f"{rep.daemon_starts} restarts vs {_productive_prunes} space-freeing prunes "
+            f"— guard is erroring more than it is productively pruning (inert or "
+            f"respawn-cycling on a deterministic failure); investigate the logged exception"
+        )
+        return rep
 
     futile_ratio = futile / rep.total_prune_cycles if rep.total_prune_cycles else 0.0
     if futile >= loop_trip and futile_ratio >= FUTILE_DOMINANCE:
@@ -142,6 +211,7 @@ class GuardLoopHit:
     pid: int | None
     pid_alive: bool
     report: LoopReport
+    guard_confirmed: bool = False  # True iff pid_alive AND process is a cozempic guard
 
 
 def _read_pid(pid_file: Path) -> int | None:
@@ -194,11 +264,22 @@ def scan_guard_logs(
             continue
         pid_file = log_file.with_suffix(".pid")
         pid = _read_pid(pid_file) if pid_file.exists() else None
+        alive = _pid_alive(pid)
+        if alive:
+            # Lazy import: avoids the heavy module-level guard.py load (large,
+            # side-effecty) and prevents a circular import (guard imports watchdog
+            # indirectly through its own helpers). alive=True implies pid is not
+            # None (since _pid_alive(None) returns False).
+            from .guard import _is_cozempic_guard_process
+            confirmed = _is_cozempic_guard_process(pid)
+        else:
+            confirmed = False
         hits.append(GuardLoopHit(
             log_file=log_file,
             pid_file=pid_file if pid_file.exists() else None,
             pid=pid,
-            pid_alive=_pid_alive(pid),
+            pid_alive=alive,
             report=rep,
+            guard_confirmed=confirmed,
         ))
     return hits

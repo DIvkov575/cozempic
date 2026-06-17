@@ -421,6 +421,94 @@ class TestDoctorRespectsPruneLock(unittest.TestCase):
         self.assertIn("Skipped", src,
             "fix_corrupted_tool_use must report skipped sessions")
 
+    def test_fix_corrupted_repairs_line_with_unicode_separator(self):
+        """A corrupt tool_use on a line that ALSO carries a raw U+2028 must still be
+        repaired — str.splitlines() would tear it into unparseable fragments and
+        silently skip the repair (4th sibling of the splitlines class)."""
+        import json
+        from cozempic import session as S
+        from cozempic import doctor as D
+        proj = S.get_projects_dir() / "-unic"
+        proj.mkdir(parents=True, exist_ok=True)
+        sess = proj / "unicrep1.jsonl"
+        corrupt_name = 'Bash" command="' + ("y" * 250) + '"'
+        # One assistant line: a corrupt tool_use AND a text block with a raw U+2028.
+        line = json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "before after"},
+            {"type": "tool_use", "id": "t1", "name": corrupt_name, "input": {}},
+        ]}}, ensure_ascii=False)
+        sess.write_text(line + "\n", encoding="utf-8")
+        D.fix_corrupted_tool_use()
+        # Read back splitting on "\n" only (NOT splitlines — the line carries U+2028).
+        objs = [json.loads(ln) for ln in sess.read_text(encoding="utf-8").split("\n") if ln.strip()]
+        tu = next(b for o in objs for b in (o.get("message", {}).get("content") or [])
+                  if isinstance(o.get("message", {}).get("content"), list) and b.get("type") == "tool_use")
+        self.assertEqual(tu["name"], "Bash", "corrupt block on a U+2028 line must still be repaired")
+
+    def test_fix_corrupted_preserves_concurrent_append_behavioral(self):
+        """BEHAVIORAL (not static): fix_corrupted_tool_use must NOT drop a line
+        Claude appends between our read and our write. Regression for the audit
+        P1 (read_text→atomic_write with no snapshot). We inject the concurrent
+        append exactly between read and classify via a wrapper snapshot."""
+        import json
+        from pathlib import Path
+        from unittest import mock
+        from cozempic import session as S
+        from cozempic import doctor as D
+
+        proj = S.get_projects_dir() / "-proj"
+        proj.mkdir(parents=True, exist_ok=True)
+        sess = proj / "behav1234.jsonl"
+        # A corrupted tool_use block: name > 200 chars in the flattened-XML form.
+        corrupt_name = 'Bash" command="' + ("x" * 250) + '"'
+        line0 = json.dumps({"type": "user", "message": {"role": "user", "content": "hi"}})
+        line1 = json.dumps({"type": "assistant", "message": {"role": "assistant",
+                  "content": [{"type": "tool_use", "id": "t1", "name": corrupt_name, "input": {}}]}})
+        sess.write_text(line0 + "\n" + line1 + "\n", encoding="utf-8")
+
+        # The line Claude "appends" mid-repair — must survive.
+        appended_obj = {"type": "user", "message": {"role": "user", "content": "APPENDED_LIVE_TURN"}}
+        appended_line = json.dumps(appended_obj) + "\n"
+
+        class _InjectingSnapshot:
+            def __init__(self, real, path):
+                self._real, self._path, self._done = real, path, False
+            @property
+            def size(self):
+                return self._real.size
+            def read_delta(self, p):
+                return self._real.read_delta(p)
+            def _inject(self):
+                if not self._done:  # inject append between the function's read and classify
+                    with open(self._path, "a", encoding="utf-8") as f:
+                        f.write(appended_line)
+                    self._done = True
+            def classify(self, p):
+                self._inject()
+                return self._real.classify(p)
+            def classify_and_delta(self, p):
+                self._inject()
+                return self._real.classify_and_delta(p)
+
+        # doctor now reads once via _FileSnapshot.from_bytes(path, raw); wrap that
+        # so the append is injected between the read and classify.
+        real_from_bytes = S._FileSnapshot.from_bytes.__func__
+        def injecting_from_bytes(cls, path, raw):
+            return _InjectingSnapshot(real_from_bytes(cls, path, raw), path)
+
+        with mock.patch.object(S._FileSnapshot, "from_bytes", classmethod(injecting_from_bytes)):
+            D.fix_corrupted_tool_use()
+
+        final = sess.read_text(encoding="utf-8")
+        # 1) The concurrently-appended live turn survived (no data loss).
+        self.assertIn("APPENDED_LIVE_TURN", final,
+                      "fix_corrupted_tool_use dropped a concurrently-appended line (data loss)")
+        # 2) The corruption was actually repaired (name parsed back to 'Bash').
+        objs = [json.loads(ln) for ln in final.splitlines() if ln.strip()]
+        tu = next(b for o in objs for b in o.get("message", {}).get("content", [])
+                  if isinstance(o.get("message", {}).get("content"), list) and b.get("type") == "tool_use")
+        self.assertEqual(tu["name"], "Bash", "corruption must still be repaired")
+
     def test_fix_orphaned_uses_prune_lock_snapshot_and_reports_skipped(self):
         """fix_orphaned_tool_results was the second unprotected save_messages
         site flagged by the architecture review. Must mirror fix_corrupted's
@@ -430,8 +518,8 @@ class TestDoctorRespectsPruneLock(unittest.TestCase):
         src = inspect.getsource(fix_orphaned_tool_results)
         self.assertIn("_PruneLock", src,
             "fix_orphaned_tool_results must use _PruneLock")
-        self.assertIn("snapshot_session", src,
-            "fix_orphaned_tool_results must take a pre-load snapshot")
+        self.assertIn("load_messages_and_snapshot", src,
+            "fix_orphaned_tool_results must read once (snapshot+messages from same bytes)")
         self.assertIn("Skipped", src,
             "fix_orphaned_tool_results must report skipped sessions")
 
@@ -440,6 +528,76 @@ class TestMcpTreatSessionPruneLock(unittest.TestCase):
     """The MCP plugin's treat_session tool was the third unprotected
     save_messages site flagged by the architecture review. It exposes the
     same data-loss race to users invoking /cozempic:treat via Claude Code."""
+
+    def test_mcp_treat_session_aborts_on_conflict_behavioral(self):
+        """BEHAVIORAL (not a static scan): the MCP treat_session(execute=True) guard
+        must ABORT (PruneConflictError) and NOT clobber when the session is rewritten
+        mid-prune. Loads the plugin with a fastmcp stub and drives the real function."""
+        import importlib.util
+        import json
+        import sys
+        import types
+        from pathlib import Path
+        from unittest import mock
+        from cozempic import session as S
+
+        # Stub fastmcp so @mcp.tool() returns the function unchanged + import is cheap.
+        fake = types.ModuleType("fastmcp")
+        class _FakeMCP:
+            def __init__(self, *a, **k): pass
+            def tool(self, *a, **k):
+                def deco(fn): return fn
+                return deco
+        fake.FastMCP = _FakeMCP
+        plugin_path = Path(__file__).parent.parent / "plugin" / "servers" / "cozempic_mcp.py"
+        with mock.patch.dict(sys.modules, {"fastmcp": fake}):
+            spec = importlib.util.spec_from_file_location("cozempic_mcp_behav", plugin_path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+
+        # A real session under the isolated projects dir (conftest sets CLAUDE_CONFIG_DIR).
+        proj = S.get_projects_dir() / "-mcp"
+        proj.mkdir(parents=True, exist_ok=True)
+        sess_path = proj / "mcpbehav1.jsonl"
+        body = "".join(json.dumps({"type": "user", "message": {"role": "user",
+                "content": "ORIGINAL_LINE_%d" % i}}) + "\n" for i in range(20))
+        sess_path.write_text(body, encoding="utf-8")
+        sess = {"path": sess_path, "session_id": "mcpbehav1", "project": "-mcp",
+                "size": sess_path.stat().st_size, "mtime": 0, "lines": 20}
+
+        # treat_session reads once via load_messages_and_snapshot; wrap _FileSnapshot
+        # .from_bytes so the returned snapshot injects a same-prefix rewrite at
+        # classify time (→ "conflict"), simulating a concurrent mutation mid-prune.
+        class _Conflicting:
+            def __init__(self, real, path): self._r, self._p, self._done = real, path, False
+            @property
+            def size(self): return self._r.size
+            def read_delta(self, p): return self._r.read_delta(p)
+            def _inject(self):
+                if not self._done:
+                    with open(self._p, "r+b") as f:  # mutate the prefix in place
+                        f.seek(0); f.write(b'{"type":"user","message":{"role":"user","content":"REWRITTEN"}}')
+                    self._done = True
+            def classify(self, p):
+                self._inject()
+                return self._r.classify(p)
+            def classify_and_delta(self, p):
+                self._inject()
+                return self._r.classify_and_delta(p)
+
+        real_from_bytes = S._FileSnapshot.from_bytes.__func__
+        def injecting_from_bytes(cls, path, raw):
+            return _Conflicting(real_from_bytes(cls, path, raw), path)
+
+        with mock.patch.object(S, "find_current_session", lambda *a, **k: sess), \
+             mock.patch.object(S._FileSnapshot, "from_bytes", classmethod(injecting_from_bytes)):
+            out = mod.treat_session(prescription="standard", execute=True)
+
+        self.assertIn("Aborted: session changed mid-prune", out,
+                      "treat_session must abort on a concurrent rewrite, not clobber")
+        # The original content must NOT have been replaced by the pruned buffer.
+        self.assertIn("ORIGINAL_LINE_19", sess_path.read_text(encoding="utf-8"),
+                      "conflict abort must leave the live session intact (no data loss)")
 
     def test_mcp_treat_session_uses_prune_lock_and_snapshot(self):
         import inspect
@@ -450,8 +608,8 @@ class TestMcpTreatSessionPruneLock(unittest.TestCase):
         # + the abort messages for both error paths
         self.assertIn("_PruneLock", src,
             "MCP treat_session must use _PruneLock")
-        self.assertIn("snapshot_session", src,
-            "MCP treat_session must take a pre-load snapshot")
+        self.assertIn("load_messages_and_snapshot", src,
+            "MCP treat_session must read once (snapshot+messages from same bytes)")
         self.assertIn("PruneLockError", src,
             "MCP treat_session must handle PruneLockError")
         self.assertIn("PruneConflictError", src,

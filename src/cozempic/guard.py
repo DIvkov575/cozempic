@@ -54,6 +54,13 @@ from .safety import PruneValidationError
 HARD_LOOP_BACKOFF_START = 3
 HARD_LOOP_BACKOFF_CAP_SECONDS = 300
 HARD_LOOP_EXIT_THRESHOLD = 10
+# C2: consecutive per-cycle exceptions after which the daemon stops silently
+# spinning (inert-but-alive, watchdog-invisible) and exits for SessionStart to
+# respawn — turning a deterministic repeating failure into a visible respawn.
+GUARD_CYCLE_ERROR_EXIT = 5
+# C2: max consecutive cycles the escalation-exit will defer while agents are
+# active before escalating anyway (a stuck guard must not spin inert forever).
+GUARD_CYCLE_ERROR_DEFER_MAX = 20
 
 
 # ── Hard cap: K=10 exit deferral when agents_active (PR #93 item #4) ────────
@@ -170,7 +177,7 @@ def _hard_prune_counts_as_futile(result: dict) -> bool:
 
 from ._validation import ConfigError
 from .executor import run_prescription
-from .helpers import is_ssh_session, shell_quote, tag_pattern_matches, strip_pattern_tags
+from .helpers import hashable_str, is_ssh_session, shell_quote, tag_pattern_matches, strip_pattern_tags
 from .registry import PRESCRIPTIONS
 import cozempic.strategies  # noqa: F401 — register strategies so guard_prune_cycle can actually prune (#15)
 from .session import (
@@ -182,6 +189,7 @@ from .session import (
     find_current_session,
     find_sessions,
     load_messages,
+    load_messages_and_snapshot,
     load_messages_incremental,
     save_messages,
     snapshot_session,
@@ -410,9 +418,16 @@ def prune_with_team_protect(
     pending_task_ids: set[str] = set()
     for _, msg_dict, _ in messages:
         inner = msg_dict.get("message", {})
+        if not isinstance(inner, dict):
+            continue
         for block in (inner.get("content", []) if isinstance(inner.get("content"), list) else []):
-            if block.get("type") == "tool_use" and block.get("name") in TEAM_TOOL_NAMES:
-                tool_use_id = block.get("id", "")
+            # isinstance/hashable_str guards: this is the prune_with_team_protect SIBLING
+            # of the team.py extraction loop — an unhashable name/id (poisoned JSONL) or a
+            # non-dict block crashed the prune EVERY cycle -> guard respawn storm (R6).
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use" and hashable_str(block.get("name")) in TEAM_TOOL_NAMES:
+                tool_use_id = hashable_str(block.get("id"))
                 if tool_use_id:
                     pending_task_ids.add(tool_use_id)
 
@@ -883,6 +898,10 @@ def start_guard(
     prev_size = -1                    # last cycle's transcript size (idle detection)
     idle_cycles = 0                   # F: consecutive stable-size cycles
     noop_cycles = 0                   # G: cycles where a fire was skipped as a no-op
+    consecutive_cycle_errors = 0      # C2: deterministic per-cycle error -> escalate, not silent-inert
+    last_agents_active = False        # C2: don't escalate-exit while a subagent team is live
+    logged_decode_skip = False        # C1/C2: log a non-UTF-8 session once, don't respawn-storm
+    deferred_error_cycles = 0         # C2: bound the agents-active escalation deferral
     interactive_mode = _detect_interactive(claude_pid)   # H
     force_pct = _force_reload_pct()                       # E
     force_threshold_tokens = (
@@ -896,334 +915,381 @@ def start_guard(
     try:
         while True:
             time.sleep(poll_interval)
-            cycle_count += 1
+            try:
+                cycle_count += 1
 
-            # Periodic backup cleanup every 10 cycles (~5min)
-            if cycle_count % 10 == 0:
-                cleanup_old_backups(session_path, keep=3)
+                # Periodic backup cleanup every 10 cycles (~5min)
+                if cycle_count % 10 == 0:
+                    cleanup_old_backups(session_path, keep=3)
 
-            # Re-check file exists
-            if not session_path.exists():
-                print("  WARNING: Session file disappeared. Stopping guard.")
-                break
+                # Re-check file exists
+                if not session_path.exists():
+                    print("  WARNING: Session file disappeared. Stopping guard.")
+                    break
 
-            # Watchdog: detect Claude exit (workaround for Stop hook not firing)
-            if claude_pid and claude_alive:
-                try:
-                    os.kill(claude_pid, 0)
-                except (ProcessLookupError, PermissionError):
-                    claude_alive = False
-                else:
-                    # Liveness confirmed — also verify PID identity to guard against
-                    # PID reuse (daemon started hours ago; original Claude exited and
-                    # kernel recycled its PID to an unrelated process).
+                # Watchdog: detect Claude exit (workaround for Stop hook not firing)
+                if claude_pid and claude_alive:
                     try:
-                        if not _pid_identity_match(claude_pid, session_id) \
-                                or not _is_claude_process(claude_pid, session_path=session_path):
-                            claude_alive = False
-                    except ProcessLookupError:
+                        os.kill(claude_pid, 0)
+                    except (ProcessLookupError, PermissionError):
                         claude_alive = False
-                if not claude_alive:
-                    print(f"  [{_now()}] Claude process exited (PID {claude_pid}). Final checkpoint...")
-                    # Clear start-time record: this session's Claude is gone.
-                    if session_id:
-                        _CLAUDE_IDENTITY.pop(session_id, None)
-                    # Option (b) defense-in-depth: unlink pidfile IMMEDIATELY so a
-                    # concurrent SessionStart for the new Claude doesn't see a stale
-                    # transient-daemon slot. The finally-block call is a no-op after
-                    # this (CAS fails cleanly — we no longer own the file).
-                    _safe_unlink_session_pidfile(sess.get("session_id"))
-                    checkpoint_team(session_path=session_path, quiet=False)
-                    print(f"  Guard stopping (Claude exited).")
-                    break
-
-            current_size = session_path.stat().st_size
-
-            # ── F/H: idle detection + adaptive poll back-off ──────────
-            # "idle" = the transcript hasn't grown since last cycle (we're between
-            # turns). Drives the interactive reload gate (E), the no-op skip (G),
-            # and exponential poll back-off (F).
-            idle = (prev_size >= 0 and current_size == prev_size)
-            if idle:
-                idle_cycles += 1
-            else:
-                idle_cycles = 0
-            # NB: poll_interval (F back-off) is decided at the END of the cycle,
-            # once we know whether a HARD tier fired — over a hard tier the reload
-            # (E) or the HARD circuit-breaker owns the cadence, so F stands down.
-
-            # ── Phase 1: Continuous checkpoint ────────────────────────
-            state = checkpoint_team(
-                session_path=session_path,
-                quiet=True,
-            )
-
-            # Track team state changes silently — only note when prune/threshold fires
-            if state and not state.is_empty():
-                team_hash = f"{len(state.subagents)}:{len(state.tasks)}:{state.message_count}"
-                if team_hash != last_team_hash:
-                    checkpoint_count += 1
-                    last_team_hash = team_hash
-
-            # ── Token check (fast, from tail of file) ────────────────
-            current_tokens = None
-            if threshold_tokens is not None or soft_threshold_tokens is not None:
-                current_tokens = quick_token_estimate(session_path)
-
-            # Detect if agents are actively running (reload would kill them)
-            agents_active = False
-            if state and not state.is_empty():
-                agents_active = any(
-                    s.status in ("running", "unknown")
-                    for s in state.subagents
-                )
-
-            # ── E: interactive reload gating ──────────────────────────
-            # Interactive sessions never reload mid-turn — they wait for an idle
-            # breakpoint (the Stop-hook nudge has already warned the user at the
-            # turn that crossed the tier). Once past the force line (~88%) a
-            # higher-fidelity reload still beats hitting the autocompact wall, so we
-            # allow it even mid-turn; the safe_to_reload gate inside
-            # guard_prune_cycle keeps protecting any in-flight Workflow/subagent
-            # even then. Headless sessions are unchanged (reload immediately).
-            force_now = (
-                force_threshold_tokens is not None
-                and current_tokens is not None
-                and current_tokens >= force_threshold_tokens
-            )
-            # Require SUSTAINED idle (N consecutive stable cycles), not a single
-            # one — a momentary mid-turn stall must not be read as a breakpoint.
-            sustained_idle = idle and idle_cycles >= _idle_reload_cycles()
-            # E (warned-before-reload): an interactive reload needs BOTH a sustained
-            # idle breakpoint AND the user warned (the nudge upserts sentinel.warned
-            # at the turn that crossed the tier), with a grace fallback so a
-            # missing/disabled nudge can't wedge it. Force (88%) + headless bypass.
-            defer_for_turn = False
-            if interactive_mode and not force_now:
-                if not sustained_idle:
-                    defer_for_turn = True                      # mid-turn: never reload
-                else:
-                    _grace = _reload_warn_grace()
-                    _armed = read_armed(sess["session_id"], session_path)
-                    _warned = bool(_armed and _armed.get("warned"))
-                    _at = (_armed or {}).get("armed_at")
-                    _grace_ok = _grace <= 0 or (bool(_armed) and _at is not None
-                                                and (time.time() - _at) >= _grace)
-                    if _warned or _grace_ok:
-                        defer_for_turn = False                 # warned/waited → reload
                     else:
-                        # Arm (so the nudge can warn) when unarmed OR when an
-                        # existing sentinel lacks the grace clock — backfilling
-                        # armed_at so a corrupt/old sentinel can't wedge forever.
-                        if not _armed or _at is None:
-                            _arm_tier = 80 if (hard2_threshold_tokens and current_tokens
-                                               and current_tokens >= hard2_threshold_tokens) else 55
-                            write_armed(sess["session_id"], session_path, _arm_tier, 0.0)
-                        defer_for_turn = True                   # hold until warned/grace
-            eff_auto_reload = auto_reload and not defer_for_turn
-            # Whether a HARD tier is active this cycle (gates F's idle back-off).
-            hard_active = (
-                (hard2_threshold_tokens is not None and current_tokens is not None
-                 and current_tokens >= hard2_threshold_tokens)
-                or (threshold_tokens is not None and current_tokens is not None
-                    and current_tokens >= threshold_tokens)
-            )
+                        # Liveness confirmed — also verify PID identity to guard against
+                        # PID reuse (daemon started hours ago; original Claude exited and
+                        # kernel recycled its PID to an unrelated process).
+                        try:
+                            if not _pid_identity_match(claude_pid, session_id) \
+                                    or not _is_claude_process(claude_pid, session_path=session_path):
+                                claude_alive = False
+                        except ProcessLookupError:
+                            claude_alive = False
+                    if not claude_alive:
+                        print(f"  [{_now()}] Claude process exited (PID {claude_pid}). Final checkpoint...")
+                        # Clear start-time record: this session's Claude is gone.
+                        if session_id:
+                            _CLAUDE_IDENTITY.pop(session_id, None)
+                        # Option (b) defense-in-depth: unlink pidfile IMMEDIATELY so a
+                        # concurrent SessionStart for the new Claude doesn't see a stale
+                        # transient-daemon slot. The finally-block call is a no-op after
+                        # this (CAS fails cleanly — we no longer own the file).
+                        _safe_unlink_session_pidfile(sess.get("session_id"))
+                        checkpoint_team(session_path=session_path, quiet=False)
+                        print(f"  Guard stopping (Claude exited).")
+                        break
 
-            # ── Phase 4: HARD2 (80%) — aggressive + reload, GATED by the
-            #    safe-point check. NEVER force-terminates through in-flight work
-            #    (running Workflow / subagent / open call): the safe_to_reload gate
-            #    inside guard_prune_cycle defers those to a read-only checkpoint and
-            #    lets the autocompact wall be the lesser evil. (Was: "reload ALWAYS,
-            #    even with agents" — that was the catastrophic data-loss bug.) ──
-            hard2_tokens_hit = (
-                hard2_threshold_tokens is not None
-                and current_tokens is not None
-                and current_tokens >= hard2_threshold_tokens
-            )
-            if hard2_tokens_hit:
-                prune_count += 1
-                reason = f"{current_tokens:,} tokens >= {hard2_threshold_tokens:,} (80%)"
-                print(f"  [{_now()}] HARD2 THRESHOLD (80%): {reason}")
-                print(f"  Aggressive prune + reload (cycle #{prune_count}) — gated by safe-point check...")
+                current_size = session_path.stat().st_size
 
-                if defer_for_turn:
-                    _force_note = (f" (or force at {int(force_pct * 100)}%)"
-                                   if force_threshold_tokens else "")
-                    _why = ("waiting for the warning to reach you" if sustained_idle
-                            else "interactive turn in progress")
-                    print(f"  Armed — {_why}; will reload at the next safe breakpoint"
-                          f"{_force_note}. Read-only checkpoint now.")
-                result = guard_prune_cycle(
+                # ── F/H: idle detection + adaptive poll back-off ──────────
+                # "idle" = the transcript hasn't grown since last cycle (we're between
+                # turns). Drives the interactive reload gate (E), the no-op skip (G),
+                # and exponential poll back-off (F).
+                idle = (prev_size >= 0 and current_size == prev_size)
+                if idle:
+                    idle_cycles += 1
+                else:
+                    idle_cycles = 0
+                # NB: poll_interval (F back-off) is decided at the END of the cycle,
+                # once we know whether a HARD tier fired — over a hard tier the reload
+                # (E) or the HARD circuit-breaker owns the cadence, so F stands down.
+
+                # ── Phase 1: Continuous checkpoint ────────────────────────
+                state = checkpoint_team(
                     session_path=session_path,
-                    rx_name="aggressive",
-                    config=config,
-                    auto_reload=eff_auto_reload,
-                    cwd=cwd or os.getcwd(),
-                    session_id=sess["session_id"],
-                    claude_pid=claude_pid,
-                    protect_patterns=protect_patterns,
-                    # --no-reload OR an interactive mid-turn defer: we won't
-                    # terminate Claude, so we can't safely write the live file
-                    # (#106) — go read-only instead of falsely reporting a prune
-                    # that never persisted.
-                    read_only_live=not eff_auto_reload,
-                    project=defer_for_turn,  # compute the real reclaim % for the nudge
+                    quiet=True,
                 )
-                if defer_for_turn:
-                    _arm_nudge_from_result(sess["session_id"], session_path, 80, result)
 
-                if result.get("reloading"):
-                    clear_armed(sess["session_id"], session_path)  # consumed
-                    from .helpers import get_savings_line
-                    savings = get_savings_line()
-                    if savings:
-                        print(f"  {savings}")
-                    print(f"  Reload triggered. Guard exiting.")
-                    break
+                # Track team state changes silently — only note when prune/threshold fires
+                if state and not state.is_empty():
+                    team_hash = f"{len(state.subagents)}:{len(state.tasks)}:{state.message_count}"
+                    if team_hash != last_team_hash:
+                        checkpoint_count += 1
+                        last_team_hash = team_hash
 
-                if result.get("reload_unsafe"):
-                    pass  # safe-point gate already printed "Reload DEFERRED — <reason>"
-                elif result.get("live_write_skipped"):
-                    print(f"  Read-only — live session not rewritten (#106).")
-                elif result.get("futile_reload_skipped"):
-                    pass  # futile prune — nothing persisted (live file untouched)
-                else:
-                    print(f"  Pruned: {_fmt_prune_result(result)}")
-                if result.get("team_name"):
-                    print(f"  Team '{result['team_name']}' state preserved ({result['team_messages']} messages)")
-                # Reaching here means HARD2 did NOT reload (the reloading branch
-                # above breaks/exits first). Apply the same circuit-breaker
-                # accounting as HARD1 so a sustained deferred-conflict / futile
-                # prune at 80% backs off and eventually exits instead of
-                # spinning kill→no-write→resume forever.
-                _account_hard_prune(result, agents_active, state)
-                print()
+                # ── Token check (fast, from tail of file) ────────────────
+                current_tokens = None
+                if threshold_tokens is not None or soft_threshold_tokens is not None:
+                    current_tokens = quick_token_estimate(session_path)
 
-            # ── Phase 3: HARD1 (55%) — standard + reload (SKIP reload if agents active) ──
-            elif (threshold_tokens is not None
-                  and current_tokens is not None
-                  and current_tokens >= threshold_tokens):
-                prune_count += 1
-                reason = f"{current_tokens:,} tokens >= {threshold_tokens:,} (55%)"
-
-                if agents_active:
-                    # Agents running — read-only checkpoint, no reload (don't kill
-                    # active work) and no live write (#106: rewriting the file
-                    # Claude holds open races the harness). HARD2 (80%) force-
-                    # reloads later if context keeps growing, terminating first.
-                    print(f"  [{_now()}] HARD THRESHOLD (55%): {reason}")
-                    print(f"  Agents active — read-only checkpoint, deferring prune+reload (cycle #{prune_count})...")
-
-                    result = guard_prune_cycle(
-                        session_path=session_path,
-                        rx_name=rx_name,
-                        config=config,
-                        auto_reload=False,  # Don't reload — agents are working
-                        cwd=cwd or os.getcwd(),
-                        session_id=sess["session_id"],
-                        read_only_live=True,
+                # Detect if agents are actively running (reload would kill them)
+                agents_active = False
+                if state and not state.is_empty():
+                    agents_active = any(
+                        s.status in ("running", "unknown")
+                        for s in state.subagents
                     )
-                else:
-                    print(f"  [{_now()}] HARD THRESHOLD (55%): {reason}")
+                last_agents_active = agents_active  # C2: remembered for the escalation gate
+
+                # ── E: interactive reload gating ──────────────────────────
+                # Interactive sessions never reload mid-turn — they wait for an idle
+                # breakpoint (the Stop-hook nudge has already warned the user at the
+                # turn that crossed the tier). Once past the force line (~88%) a
+                # higher-fidelity reload still beats hitting the autocompact wall, so we
+                # allow it even mid-turn; the safe_to_reload gate inside
+                # guard_prune_cycle keeps protecting any in-flight Workflow/subagent
+                # even then. Headless sessions are unchanged (reload immediately).
+                force_now = (
+                    force_threshold_tokens is not None
+                    and current_tokens is not None
+                    and current_tokens >= force_threshold_tokens
+                )
+                # Require SUSTAINED idle (N consecutive stable cycles), not a single
+                # one — a momentary mid-turn stall must not be read as a breakpoint.
+                sustained_idle = idle and idle_cycles >= _idle_reload_cycles()
+                # E (warned-before-reload): an interactive reload needs BOTH a sustained
+                # idle breakpoint AND the user warned (the nudge upserts sentinel.warned
+                # at the turn that crossed the tier), with a grace fallback so a
+                # missing/disabled nudge can't wedge it. Force (88%) + headless bypass.
+                defer_for_turn = False
+                if interactive_mode and not force_now:
+                    if not sustained_idle:
+                        defer_for_turn = True                      # mid-turn: never reload
+                    else:
+                        _grace = _reload_warn_grace()
+                        _armed = read_armed(sess["session_id"], session_path)
+                        _warned = bool(_armed and _armed.get("warned"))
+                        _at = (_armed or {}).get("armed_at")
+                        _grace_ok = _grace <= 0 or (bool(_armed) and _at is not None
+                                                    and (time.time() - _at) >= _grace)
+                        if _warned or _grace_ok:
+                            defer_for_turn = False                 # warned/waited → reload
+                        else:
+                            # Arm (so the nudge can warn) when unarmed OR when an
+                            # existing sentinel lacks the grace clock — backfilling
+                            # armed_at so a corrupt/old sentinel can't wedge forever.
+                            if not _armed or _at is None:
+                                _arm_tier = 80 if (hard2_threshold_tokens and current_tokens
+                                                   and current_tokens >= hard2_threshold_tokens) else 55
+                                write_armed(sess["session_id"], session_path, _arm_tier, 0.0)
+                            defer_for_turn = True                   # hold until warned/grace
+                eff_auto_reload = auto_reload and not defer_for_turn
+                # Whether a HARD tier is active this cycle (gates F's idle back-off).
+                hard_active = (
+                    (hard2_threshold_tokens is not None and current_tokens is not None
+                     and current_tokens >= hard2_threshold_tokens)
+                    or (threshold_tokens is not None and current_tokens is not None
+                        and current_tokens >= threshold_tokens)
+                )
+
+                # ── Phase 4: HARD2 (80%) — aggressive + reload, GATED by the
+                #    safe-point check. NEVER force-terminates through in-flight work
+                #    (running Workflow / subagent / open call): the safe_to_reload gate
+                #    inside guard_prune_cycle defers those to a read-only checkpoint and
+                #    lets the autocompact wall be the lesser evil. (Was: "reload ALWAYS,
+                #    even with agents" — that was the catastrophic data-loss bug.) ──
+                hard2_tokens_hit = (
+                    hard2_threshold_tokens is not None
+                    and current_tokens is not None
+                    and current_tokens >= hard2_threshold_tokens
+                )
+                if hard2_tokens_hit:
+                    prune_count += 1
+                    reason = f"{current_tokens:,} tokens >= {hard2_threshold_tokens:,} (80%)"
+                    print(f"  [{_now()}] HARD2 THRESHOLD (80%): {reason}")
+                    print(f"  Aggressive prune + reload (cycle #{prune_count}) — gated by safe-point check...")
+
                     if defer_for_turn:
+                        _force_note = (f" (or force at {int(force_pct * 100)}%)"
+                                       if force_threshold_tokens else "")
                         _why = ("waiting for the warning to reach you" if sustained_idle
                                 else "interactive turn in progress")
-                        print(f"  Armed — {_why}; will reload at the next safe "
-                              f"breakpoint. Read-only checkpoint now.")
-                    else:
-                        print(f"  Standard prune + reload (cycle #{prune_count})...")
-
+                        print(f"  Armed — {_why}; will reload at the next safe breakpoint"
+                              f"{_force_note}. Read-only checkpoint now.")
                     result = guard_prune_cycle(
                         session_path=session_path,
-                        rx_name=rx_name,
+                        rx_name="aggressive",
                         config=config,
                         auto_reload=eff_auto_reload,
                         cwd=cwd or os.getcwd(),
                         session_id=sess["session_id"],
                         claude_pid=claude_pid,
                         protect_patterns=protect_patterns,
-                        # --no-reload OR an interactive mid-turn defer: read-only
-                        # (can't safely write a live file without terminating
-                        # Claude — #106).
+                        # --no-reload OR an interactive mid-turn defer: we won't
+                        # terminate Claude, so we can't safely write the live file
+                        # (#106) — go read-only instead of falsely reporting a prune
+                        # that never persisted.
                         read_only_live=not eff_auto_reload,
                         project=defer_for_turn,  # compute the real reclaim % for the nudge
                     )
                     if defer_for_turn:
-                        _arm_nudge_from_result(sess["session_id"], session_path, 55, result)
+                        _arm_nudge_from_result(sess["session_id"], session_path, 80, result)
 
-                if result.get("reloading"):
-                    clear_armed(sess["session_id"], session_path)  # consumed
-                    from .helpers import get_savings_line
-                    savings = get_savings_line()
-                    if savings:
-                        print(f"  {savings}")
-                    print(f"  Reload triggered. Guard exiting.")
-                    break
+                    if result.get("reloading"):
+                        clear_armed(sess["session_id"], session_path)  # consumed
+                        from .helpers import get_savings_line
+                        savings = get_savings_line()
+                        if savings:
+                            print(f"  {savings}")
+                        print(f"  Reload triggered. Guard exiting.")
+                        break
 
-                if result.get("reload_unsafe"):
-                    pass  # safe-point gate already printed "Reload DEFERRED — <reason>"
-                elif result.get("live_write_skipped"):
-                    print(f"  Read-only — live session not rewritten (#106).")
-                elif result.get("futile_reload_skipped"):
-                    pass  # futile prune — nothing persisted (live file untouched)
-                else:
-                    print(f"  Pruned: {_fmt_prune_result(result)}")
-                if result.get("team_name"):
-                    print(f"  Team '{result['team_name']}' state preserved ({result['team_messages']} messages)")
-
-                _account_hard_prune(result, agents_active, state)
-                print()
-
-            # ── Phase 2: SOFT (25%) — gentle, no reload (file maintenance only) ──
-            else:
-                soft_bytes_hit = current_size >= soft_threshold_bytes
-                soft_tokens_hit = (
-                    soft_threshold_tokens is not None
-                    and current_tokens is not None
-                    and current_tokens >= soft_threshold_tokens
-                )
-                if (soft_bytes_hit or soft_tokens_hit) and idle:
-                    # G (no-op accounting): the transcript hasn't grown since last
-                    # cycle, so a gentle recompute would reproduce the identical
-                    # read-only result. Skip it — the Phase-1 checkpoint above
-                    # already refreshed team state — and do NOT count it as a SOFT
-                    # "fire" (the 1056-no-op problem from issue #115).
-                    noop_cycles += 1
-                elif soft_bytes_hit or soft_tokens_hit:
-                    soft_prune_count += 1
-                    reason = f"{current_tokens:,} tokens >= {soft_threshold_tokens:,} (25%)" if soft_tokens_hit else f"{current_size / 1024 / 1024:.1f}MB"
-                    print(f"  [{_now()}] SOFT THRESHOLD (25%): {reason}")
-                    print(f"  Read-only checkpoint — live prune deferred to reload tier (#106) (cycle #{soft_prune_count})...")
-
-                    result = guard_prune_cycle(
-                        session_path=session_path,
-                        rx_name="gentle",
-                        config=config,
-                        auto_reload=False,
-                        cwd=cwd or os.getcwd(),
-                        session_id=sess["session_id"],
-                        read_only_live=True,
-                    )
-
+                    if result.get("reload_unsafe"):
+                        pass  # safe-point gate already printed "Reload DEFERRED — <reason>"
+                    elif result.get("live_write_skipped"):
+                        print(f"  Read-only — live session not rewritten (#106).")
+                    elif result.get("futile_reload_skipped"):
+                        pass  # futile prune — nothing persisted (live file untouched)
+                    else:
+                        print(f"  Pruned: {_fmt_prune_result(result)}")
                     if result.get("team_name"):
-                        print(f"  Team '{result['team_name']}' checkpointed ({result['team_messages']} messages)")
+                        print(f"  Team '{result['team_name']}' state preserved ({result['team_messages']} messages)")
+                    # Reaching here means HARD2 did NOT reload (the reloading branch
+                    # above breaks/exits first). Apply the same circuit-breaker
+                    # accounting as HARD1 so a sustained deferred-conflict / futile
+                    # prune at 80% backs off and eventually exits instead of
+                    # spinning kill→no-write→resume forever.
+                    _account_hard_prune(result, agents_active, state)
                     print()
 
-            # ── F: idle poll back-off (decided here, after the tier check) ──
-            # Back off the top-of-loop poll ONLY when nothing is actionable: the
-            # session is idle (no growth) AND below the HARD tiers. Over a hard
-            # tier, E's idle reload or the HARD circuit-breaker owns the cadence,
-            # so we keep polling at the base interval. `interval` itself is never
-            # mutated — only this separate poll_interval.
-            _bo = _idle_backoff_cycles()
-            if not idle or hard_active:
-                poll_interval = interval
-            elif _bo and idle_cycles >= _bo:
-                poll_interval = min(interval * (2 ** (idle_cycles - _bo + 1)), 300)
+                # ── Phase 3: HARD1 (55%) — standard + reload (SKIP reload if agents active) ──
+                elif (threshold_tokens is not None
+                      and current_tokens is not None
+                      and current_tokens >= threshold_tokens):
+                    prune_count += 1
+                    reason = f"{current_tokens:,} tokens >= {threshold_tokens:,} (55%)"
 
-            # End-of-cycle: remember this size so the next cycle can detect idle.
-            prev_size = current_size
+                    if agents_active:
+                        # Agents running — read-only checkpoint, no reload (don't kill
+                        # active work) and no live write (#106: rewriting the file
+                        # Claude holds open races the harness). HARD2 (80%) force-
+                        # reloads later if context keeps growing, terminating first.
+                        print(f"  [{_now()}] HARD THRESHOLD (55%): {reason}")
+                        print(f"  Agents active — read-only checkpoint, deferring prune+reload (cycle #{prune_count})...")
 
+                        result = guard_prune_cycle(
+                            session_path=session_path,
+                            rx_name=rx_name,
+                            config=config,
+                            auto_reload=False,  # Don't reload — agents are working
+                            cwd=cwd or os.getcwd(),
+                            session_id=sess["session_id"],
+                            read_only_live=True,
+                        )
+                    else:
+                        print(f"  [{_now()}] HARD THRESHOLD (55%): {reason}")
+                        if defer_for_turn:
+                            _why = ("waiting for the warning to reach you" if sustained_idle
+                                    else "interactive turn in progress")
+                            print(f"  Armed — {_why}; will reload at the next safe "
+                                  f"breakpoint. Read-only checkpoint now.")
+                        else:
+                            print(f"  Standard prune + reload (cycle #{prune_count})...")
+
+                        result = guard_prune_cycle(
+                            session_path=session_path,
+                            rx_name=rx_name,
+                            config=config,
+                            auto_reload=eff_auto_reload,
+                            cwd=cwd or os.getcwd(),
+                            session_id=sess["session_id"],
+                            claude_pid=claude_pid,
+                            protect_patterns=protect_patterns,
+                            # --no-reload OR an interactive mid-turn defer: read-only
+                            # (can't safely write a live file without terminating
+                            # Claude — #106).
+                            read_only_live=not eff_auto_reload,
+                            project=defer_for_turn,  # compute the real reclaim % for the nudge
+                        )
+                        if defer_for_turn:
+                            _arm_nudge_from_result(sess["session_id"], session_path, 55, result)
+
+                    if result.get("reloading"):
+                        clear_armed(sess["session_id"], session_path)  # consumed
+                        from .helpers import get_savings_line
+                        savings = get_savings_line()
+                        if savings:
+                            print(f"  {savings}")
+                        print(f"  Reload triggered. Guard exiting.")
+                        break
+
+                    if result.get("reload_unsafe"):
+                        pass  # safe-point gate already printed "Reload DEFERRED — <reason>"
+                    elif result.get("live_write_skipped"):
+                        print(f"  Read-only — live session not rewritten (#106).")
+                    elif result.get("futile_reload_skipped"):
+                        pass  # futile prune — nothing persisted (live file untouched)
+                    else:
+                        print(f"  Pruned: {_fmt_prune_result(result)}")
+                    if result.get("team_name"):
+                        print(f"  Team '{result['team_name']}' state preserved ({result['team_messages']} messages)")
+
+                    _account_hard_prune(result, agents_active, state)
+                    print()
+
+                # ── Phase 2: SOFT (25%) — gentle, no reload (file maintenance only) ──
+                else:
+                    soft_bytes_hit = current_size >= soft_threshold_bytes
+                    soft_tokens_hit = (
+                        soft_threshold_tokens is not None
+                        and current_tokens is not None
+                        and current_tokens >= soft_threshold_tokens
+                    )
+                    if (soft_bytes_hit or soft_tokens_hit) and idle:
+                        # G (no-op accounting): the transcript hasn't grown since last
+                        # cycle, so a gentle recompute would reproduce the identical
+                        # read-only result. Skip it — the Phase-1 checkpoint above
+                        # already refreshed team state — and do NOT count it as a SOFT
+                        # "fire" (the 1056-no-op problem from issue #115).
+                        noop_cycles += 1
+                    elif soft_bytes_hit or soft_tokens_hit:
+                        soft_prune_count += 1
+                        reason = f"{current_tokens:,} tokens >= {soft_threshold_tokens:,} (25%)" if soft_tokens_hit else f"{current_size / 1024 / 1024:.1f}MB"
+                        print(f"  [{_now()}] SOFT THRESHOLD (25%): {reason}")
+                        print(f"  Read-only checkpoint — live prune deferred to reload tier (#106) (cycle #{soft_prune_count})...")
+
+                        result = guard_prune_cycle(
+                            session_path=session_path,
+                            rx_name="gentle",
+                            config=config,
+                            auto_reload=False,
+                            cwd=cwd or os.getcwd(),
+                            session_id=sess["session_id"],
+                            read_only_live=True,
+                        )
+
+                        if result.get("team_name"):
+                            print(f"  Team '{result['team_name']}' checkpointed ({result['team_messages']} messages)")
+                        print()
+
+                # ── F: idle poll back-off (decided here, after the tier check) ──
+                # Back off the top-of-loop poll ONLY when nothing is actionable: the
+                # session is idle (no growth) AND below the HARD tiers. Over a hard
+                # tier, E's idle reload or the HARD circuit-breaker owns the cadence,
+                # so we keep polling at the base interval. `interval` itself is never
+                # mutated — only this separate poll_interval.
+                _bo = _idle_backoff_cycles()
+                if not idle or hard_active:
+                    poll_interval = interval
+                elif _bo and idle_cycles >= _bo:
+                    poll_interval = min(interval * (2 ** (idle_cycles - _bo + 1)), 300)
+
+                # End-of-cycle: remember this size so the next cycle can detect idle.
+                prev_size = current_size
+                consecutive_cycle_errors = 0  # a clean cycle clears the error streak
+                deferred_error_cycles = 0
+
+            except (KeyboardInterrupt, SystemExit):
+                raise  # voluntary exits (Ctrl-C, K-exit) reach the outer handler/finally
+            except UnicodeDecodeError as _dec_exc:
+                # C1/C2 crossfix: a non-UTF-8 session makes the strict loader raise
+                # EVERY cycle. Escalating+respawning on it would be a RESPAWN STORM
+                # (the error is deterministic — a fresh daemon hits it too). Treat it
+                # as a BENIGN skip: this session just isn't prunable until its bytes
+                # become valid UTF-8. Do NOT count toward the escalation; log once.
+                if not logged_decode_skip:
+                    print(f"  Guard: session is not valid UTF-8 — skipping prune for this "
+                          f"session (not an error, no respawn): {_dec_exc!r}", flush=True)
+                    logged_decode_skip = True
+                continue
+            except Exception as _cycle_exc:
+                # Defense-in-depth: one malformed cycle must never kill the daemon
+                # (the only outer handler is KeyboardInterrupt). BUT a DETERMINISTIC
+                # per-cycle error must not silently spin forever as an inert-but-alive
+                # daemon (invisible to the watchdog). Count consecutive errors; after
+                # K, escalate with a watchdog-detectable marker and EXIT so the
+                # SessionStart hook respawns a fresh daemon (which also makes a
+                # genuine repeating failure visible as a respawn pattern).
+                consecutive_cycle_errors += 1
+                print(f"  Guard: skipping a cycle after an unexpected error "
+                      f"({consecutive_cycle_errors}/{GUARD_CYCLE_ERROR_EXIT}): {_cycle_exc!r}", flush=True)
+                if consecutive_cycle_errors >= GUARD_CYCLE_ERROR_EXIT:
+                    # C2: defer the escalation-exit while a subagent team is live —
+                    # don't drop guard coverage mid-team. BUT BOUND the deferral: a
+                    # guard erroring this long while "agents active" may be reading a
+                    # stale/zombie team state, and spinning inert forever (the
+                    # round-3 regression) is worse than a brief gap. After
+                    # GUARD_CYCLE_ERROR_DEFER_MAX deferred cycles, escalate anyway.
+                    if last_agents_active and deferred_error_cycles < GUARD_CYCLE_ERROR_DEFER_MAX:
+                        deferred_error_cycles += 1
+                        print(f"  Guard: {consecutive_cycle_errors} cycle errors but agents are "
+                              f"active — deferring respawn ({deferred_error_cycles}/"
+                              f"{GUARD_CYCLE_ERROR_DEFER_MAX}).", flush=True)
+                        consecutive_cycle_errors = GUARD_CYCLE_ERROR_EXIT  # hold at threshold
+                        continue
+                    print(f"  Guard cycle-error escalation: {consecutive_cycle_errors} consecutive "
+                          f"cycle errors ({deferred_error_cycles} deferred) — exiting for respawn "
+                          f"(last: {_cycle_exc!r}).", flush=True)
+                    sys.exit(1)
+                continue
     except KeyboardInterrupt:
         # Final checkpoint before exit
         checkpoint_team(session_path=session_path, quiet=True)
@@ -1394,16 +1460,17 @@ def guard_prune_cycle(
 
     try:
         with _PruneLock(session_path):
-            # Snapshot before load so we can detect Claude appending mid-prune
-            snap = snapshot_session(session_path)
-
-            # Size guard: skip prune for very large sessions (OOM risk #74)
+            # Size guard: skip prune for very large sessions (OOM risk #74).
+            # Cheap stat — do it before the full read.
             file_size_mb = session_path.stat().st_size / 1024 / 1024
             if file_size_mb > 200:
                 print(f"  [{_now()}] Session {file_size_mb:.0f}MB exceeds 200MB — skipping prune (OOM risk).", file=sys.stderr)
                 return _no_change
 
-            messages = load_messages(session_path)
+            # Read once: messages + snapshot from identical bytes so a line Claude
+            # appends mid-prune can't be both loaded AND counted in the delta
+            # (TOCTOU append-duplication). Replaces snapshot_session()+load_messages().
+            messages, snap = load_messages_and_snapshot(session_path)
             original_bytes = sum(b for _, _, b in messages)
 
             # --protect-pattern (#122): tag matching messages so the strategies spare
@@ -1483,7 +1550,7 @@ def guard_prune_cycle(
                     "projected_final_tokens": projected_final,
                     "would_free_mb": _ro_would_free / 1024 / 1024,
                     "original_bytes": original_bytes,
-                    "team_name": team_state.team_name or None,
+                    "team_name": _log_safe(team_state.team_name) or None,
                     "team_messages": team_state.message_count,
                     "checkpoint_path": str(checkpoint_path) if checkpoint_path else None,
                     "backup_path": None,
@@ -1501,7 +1568,7 @@ def guard_prune_cycle(
                     "saved_mb": 0.0,
                     "original_tokens": pre_te.total,
                     "final_tokens": pre_te.total,
-                    "team_name": team_state.team_name,
+                    "team_name": _log_safe(team_state.team_name),
                     "team_messages": team_state.message_count,
                     "checkpoint_path": None,
                     "backup_path": None,
@@ -1529,7 +1596,7 @@ def guard_prune_cycle(
                     "original_bytes": original_bytes,
                     "original_tokens": pre_te.total,
                     "final_tokens": pre_te.total,  # post_te not computed (early return)
-                    "team_name": team_state.team_name or None,
+                    "team_name": _log_safe(team_state.team_name) or None,
                     "team_messages": team_state.message_count,
                     "checkpoint_path": str(checkpoint_path) if checkpoint_path else None,
                     "backup_path": None,
@@ -1584,7 +1651,7 @@ def guard_prune_cycle(
                     "original_bytes": original_bytes,
                     "original_tokens": pre_te.total,
                     "final_tokens": post_te.total,
-                    "team_name": team_state.team_name or None,
+                    "team_name": _log_safe(team_state.team_name) or None,
                     "team_messages": team_state.message_count,
                     "checkpoint_path": str(checkpoint_path) if checkpoint_path else None,
                     "backup_path": None,
@@ -1617,7 +1684,11 @@ def guard_prune_cycle(
     # counters on every deferred or looping cycle that never actually wrote — the
     # in-the-wild prune-spike signature: a stuck guard re-pruning every interval
     # bumps the counter each time despite persisting nothing.
-    tokens_saved = pre_te.total - post_te.total if pre_te.total and post_te.total else 0
+    # Gate on pre_te.total ONLY (ynaamane review #4): `and post_te.total` is the same
+    # trap fixed at _tokens_saved_now above — a maximal prune to post_te.total == 0 is
+    # FULL progress (pre - 0), not zero, so requiring post_te.total to be truthy makes
+    # the largest-possible savings event record as 0.
+    tokens_saved = (pre_te.total - post_te.total) if pre_te.total else 0
 
     def _record_persisted_savings():
         """Record savings to the lifetime tracker / global counter. Call ONLY
@@ -1671,7 +1742,7 @@ def guard_prune_cycle(
         "saved_mb": saved_bytes / 1024 / 1024,
         "original_tokens": pre_te.total,
         "final_tokens": post_te.total,
-        "team_name": team_state.team_name or None,
+        "team_name": _log_safe(team_state.team_name) or None,
         "team_messages": team_state.message_count,
         "checkpoint_path": str(checkpoint_path) if checkpoint_path else None,
         "backup_path": None,
@@ -2256,16 +2327,59 @@ def _spawn_reload_watcher(claude_pid: int, project_dir: str, session_id: str | N
             f"else echo 'No terminal emulator found' >> /tmp/cozempic_guard.log; fi"
         )
     elif system == "Windows":
-        # Escape cmd.exe metacharacters in project_dir so they cannot execute.
-        # ^ is the cmd.exe escape character; prefix each metachar with ^ to
-        # prevent them from being interpreted as shell operators.
+        # Windows has no bash, and the POSIX watcher below uses kill -0 / pgrep /
+        # date +%s / /tmp — so the old code (which built a cmd.exe resume_cmd and
+        # then ran it via Popen(["bash", ...])) was DEAD on Windows: auto-resume
+        # never fired. Build a PowerShell-native watcher instead and spawn it via
+        # powershell (the dedicated Windows branch at the spawn site below).
+        # Escape cmd.exe metacharacters in project_dir so they cannot execute when
+        # cmd.exe runs the `cd /d <dir> && claude` line.
         _cmd_metachars = set('&|<>^"')
         escaped_dir = "".join(f"^{c}" if c in _cmd_metachars else c for c in project_dir)
-        resume_cmd = (
-            f"start cmd /c \"cd /d {escaped_dir} && claude {resume_flag}\""
+        _win_resume_inner = f"cd /d {escaped_dir} && claude {resume_flag}"
+        _win_status = status_path
+        if status_path == "/dev/null" or status_path.startswith("/tmp"):
+            # /tmp / /dev/null don't exist on Windows — use the Windows temp dir.
+            _win_status = str(Path(tempfile.gettempdir()) / (f"cozempic_reload_{sid12}.status" if sid12 else "cozempic_reload.status"))
+        _win_sentinel = sentinel_path
+        if sentinel_path.startswith("/tmp"):
+            _win_sentinel = str(Path(tempfile.gettempdir()) / f"cozempic_reload_{sid12}.in-flight")
+        _win_log = str(Path(tempfile.gettempdir()) / "cozempic_guard.log")
+
+        def _ps_q(s: str) -> str:  # PowerShell single-quote literal (double internal ')
+            return "'" + s.replace("'", "''") + "'"
+
+        # SESSION-SCOPED success poll (ynaamane review, LOW): mirror the POSIX
+        # `pgrep -f 'claude.*<sid12>'` so a DIFFERENT session's Claude on a
+        # multi-session Windows host is not misread as OUR successful resume.
+        # Get-Process has no CommandLine, so use Get-CimInstance Win32_Process and
+        # match the session id on the command line. sid12 is sanitized to
+        # [a-z0-9_-] so it is safe inside a -like glob. Fall back to any-claude only
+        # when the session id is unknown.
+        if sid12:
+            _ps_find_new = (
+                "$new=Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | "
+                f"Where-Object {{ $_.CommandLine -like '*claude*' -and $_.CommandLine -like '*{sid12}*' }} | "
+                "Select-Object -First 1"
+            )
+        else:
+            _ps_find_new = "$new=Get-Process -Name claude -ErrorAction SilentlyContinue | Select-Object -First 1"
+
+        windows_ps_script = (
+            "$ErrorActionPreference='SilentlyContinue'; "
+            # Phase 1: wait for the old Claude to exit.
+            f"while (Get-Process -Id {int(claude_pid)} -ErrorAction SilentlyContinue) {{ Start-Sleep -Seconds 1 }}; "
+            "Start-Sleep -Seconds 1; "
+            # Phase 2: open a new window and resume (cmd.exe runs the cd && claude).
+            f"Start-Process -FilePath 'cmd.exe' -ArgumentList '/c',{_ps_q(_win_resume_inner)}; "
+            # Phase 3: drop the in-flight sentinel so the new session's guard can spawn.
+            + (f"Remove-Item -Force -ErrorAction SilentlyContinue {_ps_q(_win_sentinel)}; " if _win_sentinel else "")
+            # Phase 4: poll for the new claude; log on success, write status on timeout.
+            + f"$deadline=(Get-Date).AddSeconds({RELOAD_WATCHER_POLL_TIMEOUT_SECONDS}); $new=$null; "
+            f"while ((Get-Date) -lt $deadline) {{ {_ps_find_new}; if ($new) {{ break }}; Start-Sleep -Seconds {RELOAD_WATCHER_POLL_INTERVAL_SECONDS} }}; "
+            f"if ($new) {{ Add-Content -Path {_ps_q(_win_log)} -Value \"$(Get-Date): Cozempic guard resumed Claude (new PID $($new.Id))\" }} "
+            f"else {{ Set-Content -Path {_ps_q(_win_status)} -Value \"failed`n$(Get-Date -Format o)`nnew Claude did not start within {RELOAD_WATCHER_POLL_TIMEOUT_SECONDS}s`ninvestigate: claude on PATH / auth / JSONL path\" }}"
         )
-        # Use escaped form in log line too so the watcher_script has no raw metachars
-        log_dir = escaped_dir
     else:
         print(f"  WARNING: Auto-resume not supported on {system}.")
         # MED-3 fold: upstream wrote sentinel for plain path before calling us.
@@ -2277,10 +2391,14 @@ def _spawn_reload_watcher(claude_pid: int, project_dir: str, session_id: str | N
                 pass
         return
 
-    # Compose the sentinel unlink fragment (empty string when no session_id)
-    _sentinel_unlink = f"rm -f '{sentinel_path}'; " if sentinel_path else ""
-
-    watcher_script = (
+    # Compose the sentinel unlink fragment (empty string when no session_id).
+    # The bash watcher_script below is POSIX-only; Windows uses windows_ps_script
+    # (built in the Windows branch above) — guard the assembly so we don't
+    # reference the now-Windows-undefined `resume_cmd`/`log_dir` on Windows.
+    watcher_script = None
+    if system != "Windows":
+      _sentinel_unlink = f"rm -f '{sentinel_path}'; " if sentinel_path else ""
+      watcher_script = (
         # Phase 1: wait for old Claude to exit
         f"while kill -0 {int(claude_pid)} 2>/dev/null; do sleep 1; done; "
         f"sleep 1; "
@@ -2312,13 +2430,28 @@ def _spawn_reload_watcher(claude_pid: int, project_dir: str, session_id: str | N
         f"fi"
     )
 
-    subprocess.Popen(
-        ["bash", "-c", watcher_script],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        stdin=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    if system == "Windows":
+        # PowerShell-native watcher (the bash watcher_script above is POSIX-only
+        # and would never run on Windows). DETACHED_PROCESS|CREATE_NEW_PROCESS_GROUP
+        # so it outlives this process; no start_new_session (POSIX-only kwarg).
+        _flags = 0
+        _flags |= getattr(subprocess, "DETACHED_PROCESS", 0)
+        _flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        subprocess.Popen(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", windows_ps_script],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            creationflags=_flags,
+        )
+    else:
+        subprocess.Popen(
+            ["bash", "-c", watcher_script],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
 
 
 # Session-id validation for pidfile path composition.
@@ -2519,24 +2652,25 @@ def detect_in_flight(messages) -> dict:
                     continue
                 t = b.get("type")
                 if t == "tool_use":
-                    if b.get("id"):
-                        use_ids.add(b["id"])
-                        use_name[b["id"]] = (b.get("name") or "")
+                    bid = hashable_str(b.get("id"))  # unhashable id -> "" (R6 crash class)
+                    if bid:
+                        use_ids.add(bid)
+                        use_name[bid] = hashable_str(b.get("name"))
                         # Only a Bash with run_in_background=true actually launches a
                         # bg task; a normal Bash whose OUTPUT merely contains the
                         # ack-marker text (a test/grep printing "running in background
                         # with ID: X") must NOT be credited as a launch (real-transcript
                         # pollution, 2026-06-09).
-                        if ((b.get("name") or "") == "Bash"
+                        if (hashable_str(b.get("name")) == "Bash"
                                 and isinstance(b.get("input"), dict)
                                 and b["input"].get("run_in_background")):
-                            bg_bash_ids.add(b["id"])
+                            bg_bash_ids.add(bid)
                     else:
                         # A tool_use with no id can never be paired to a result —
                         # fail toward "open" rather than silently treat it closed.
                         open_unkeyed = True
                 elif t == "tool_result":
-                    tid = b.get("tool_use_id")
+                    tid = hashable_str(b.get("tool_use_id"))
                     if tid:
                         res_ids.add(tid)
                     results.append((tid, _block_text(b)))
@@ -2646,12 +2780,13 @@ def _unresolved_team_coordination(messages, team_state) -> bool:
                     continue
                 t = b.get("type")
                 if t == "tool_use":
-                    if b.get("name") in _TEAM_COORD_TOOLS:
+                    if hashable_str(b.get("name")) in _TEAM_COORD_TOOLS:
                         return True
-                    if b.get("id"):
-                        use_name[b["id"]] = (b.get("name") or "")
+                    bid = hashable_str(b.get("id"))  # unhashable id -> "" (R6 crash class)
+                    if bid:
+                        use_name[bid] = hashable_str(b.get("name"))
                 elif t == "tool_result":
-                    results.append((b.get("tool_use_id"), _block_text(b)))
+                    results.append((hashable_str(b.get("tool_use_id")), _block_text(b)))
     # Spawn marker — credited ONLY when its paired tool_use is a spawn tool we can
     # SEE. A pruned/unknown tool_use is NOT credited here (that would re-open the
     # teamless-session over-block); the roster + detect_in_flight remain the primary
@@ -3908,3 +4043,14 @@ def _fmt_prune_result(result: dict) -> str:
 def _now() -> str:
     from datetime import datetime
     return datetime.now().strftime("%H:%M:%S")
+
+
+def _log_safe(text, limit: int = 80) -> str:
+    """Make untrusted text safe to print into the guard log: collapse newlines /
+    control chars to spaces and cap length. Without this, an attacker-controlled
+    team_name could inject fake 'Pruned: 0 tokens freed (0.0%)' lines into the log
+    and trip cozempic guard-watchdog against a healthy daemon (C7 log-injection)."""
+    import re as _re
+    s = _re.sub(r"[\x00-\x1f\x7f]+", " ", str(text if text is not None else ""))
+    s = _re.sub(r"\s+", " ", s).strip()
+    return s[:limit]

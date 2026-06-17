@@ -112,6 +112,58 @@ class TestHardening1828(unittest.TestCase):
         return {"type": "assistant", "message": {"role": "assistant",
                 "content": [{"type": "tool_use", "id": i, "name": "Bash", "input": {"command": "x"}}]}}
 
+    def test_redos_fails_closed_when_no_sigalrm(self):
+        # Windows / non-main-thread: no SIGALRM budget can be armed, and a pure
+        # thread can't interrupt a CPU-bound re match — so a redos-shaped pattern
+        # must be REFUSED up front (fail closed), not run unbounded. Emulate "no
+        # SIGALRM" by patching _have_sigalrm (real Windows e2e needs a Windows box).
+        import os, time
+        from cozempic import helpers
+        with mock.patch.object(helpers, "_have_sigalrm", return_value=False), \
+             mock.patch.dict(os.environ, {"COZEMPIC_PROTECT_MATCH_SECONDS": "2.0"}):
+            evil = compile_protect_patterns([r"(a+)+$"])
+            msgs = [(0, _txt("a" * 5000 + "!"), 50)]  # would hang for minutes if matched
+            buf = io.StringIO()
+            t0 = time.perf_counter()
+            with redirect_stderr(buf):
+                n = tag_pattern_matches(msgs, evil)
+            dt = time.perf_counter() - t0
+            self.assertLess(dt, 1.0, "must refuse the risky pattern before matching, not hang")
+            self.assertEqual(n, 0, "fail closed: no protection applied")
+            self.assertNotIn(_PATTERN_PROTECTED_KEY, msgs[0][1])
+            self.assertIn("no time budget on this platform", buf.getvalue())
+
+    def test_safe_pattern_still_works_when_no_sigalrm(self):
+        # A non-redos pattern must still match normally on the no-SIGALRM path.
+        from cozempic import helpers
+        with mock.patch.object(helpers, "_have_sigalrm", return_value=False):
+            pats = compile_protect_patterns([r"GATE CONTRACT R\d+"])
+            msgs = [(0, _txt("GATE CONTRACT R1 standing rule"), 10)]
+            self.assertEqual(tag_pattern_matches(msgs, pats), 1)
+            self.assertIn(_PATTERN_PROTECTED_KEY, msgs[0][1])
+
+    def test_redos_shape_detector(self):
+        from cozempic.helpers import _pattern_is_redos_risky as risky
+        # Every catastrophic FORM must be flagged — including the R4-added
+        # UNGROUPED adjacent quantifiers (.*.*.*.*c / a*a*) the prior group-only
+        # detector MISSED and which froze the Windows daemon under the 512 cap.
+        for p in [r"(a+)+$", r"(a*)*", r"(ab+c)*", r"(a|a)+", r"(x+){10}",
+                  r"(x+){2,}", r"(a?)+", r"((a)|(a))+", r"(\S+\s+){5,}", r"(.*X){8}",
+                  r".*.*.*.*c", r"a*a*", r"(secret-\d+)+",
+                  # R12: ANY alternation is categorically refused (nested / unquantified
+                  # ambiguous-alternation chains freeze and can't be told from benign ones).
+                  r"foo|bar|baz", r"(TODO|FIXME)+"]:
+            self.assertTrue(risky(p), f"catastrophic / alternation form not flagged: {p}")
+        # Safe patterns stay usable (no false-positive freeze / silent protect drop).
+        # R4: benign SINGLE-quantifier groups must NOT be flagged. R5 P3: a FIXED-count
+        # inner brace ((\d{4})+, (\w{8})+) is unambiguous/linear and must NOT be flagged.
+        # NOTE (R12): patterns with an alternation `|` are now conservatively flagged
+        # (categorical) — they are NOT in this safe list.
+        for p in [r"GATE CONTRACT R\d+", r"R\d{1,5}", r"\bword\b",
+                  r"[A-Za-z0-9_]+", r"(KEEP)+", r"(DO-NOT-PRUNE)+",
+                  r"(important){1,3}", r".*", r"(a+)", r"(\d{4})+", r"(\w{8})+"]:
+            self.assertFalse(risky(p), f"safe pattern wrongly flagged: {p}")
+
     def test_redos_pattern_fails_open_within_budget(self):
         # A catastrophic-backtracking pattern must NOT hang the prune/daemon — it
         # times out and fails open (no protection this cycle), not seconds/minutes.

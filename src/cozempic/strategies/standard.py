@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 
-from ..helpers import get_content_blocks, get_msg_type, is_protected, msg_bytes, set_content_blocks, text_of
+from ..helpers import get_content_blocks, get_msg_type, hashable_str, is_protected, msg_bytes, set_content_blocks, text_of
 from ..registry import strategy
 from ..types import Message, PruneAction, StrategyResult
 from ._config import coerce_choice, coerce_non_negative_int, coerce_ordered_pair
@@ -107,8 +107,10 @@ def strategy_tool_output_trim(messages: list[Message], config: dict) -> Strategy
     compacted_tool_ids: set[str] = set()
     for _, msg, _ in messages:
         if msg.get("type") == "system" and msg.get("subtype") == "microcompact_boundary":
-            for tid in msg.get("compactedToolIds", []):
-                compacted_tool_ids.add(tid)
+            _ctids = msg.get("compactedToolIds", [])
+            for tid in (_ctids if isinstance(_ctids, list) else []):
+                if isinstance(tid, str):  # unhashable/non-str element -> skip (R6 crash class)
+                    compacted_tool_ids.add(tid)
 
     for pos, (idx, msg, size) in enumerate(messages):
         if is_protected(msg):
@@ -120,9 +122,12 @@ def strategy_tool_output_trim(messages: list[Message], config: dict) -> Strategy
         new_blocks = []
         changed = False
         for block in blocks:
+            if not isinstance(block, dict):  # non-dict element preserved, never .get()'d (R6)
+                new_blocks.append(block)
+                continue
             if block.get("type") == "tool_result":
                 # Skip tool results already microcompacted
-                tool_use_id = block.get("tool_use_id", "")
+                tool_use_id = hashable_str(block.get("tool_use_id"))
                 if tool_use_id and tool_use_id in compacted_tool_ids:
                     new_blocks.append(block)
                     continue
@@ -157,7 +162,7 @@ def strategy_tool_output_trim(messages: list[Message], config: dict) -> Strategy
                         for sub in content:
                             if isinstance(sub, dict) and sub.get("type") == "text":
                                 text = sub.get("text", "")
-                                if len(text.encode("utf-8")) > max_bytes:
+                                if isinstance(text, str) and len(text.encode("utf-8", "surrogateescape")) > max_bytes:
                                     half = max_bytes // 2
                                     sub = {**sub, "text": text[:half] + "\n...[trimmed by cozempic]...\n" + text[-half:]}
                             trimmed_content.append(sub)
@@ -413,7 +418,7 @@ def strategy_tool_result_age(messages: list[Message], config: dict) -> StrategyR
         if not blocks:
             continue
 
-        has_tool_result = any(b.get("type") == "tool_result" for b in blocks)
+        has_tool_result = any(isinstance(b, dict) and b.get("type") == "tool_result" for b in blocks)
         if not has_tool_result:
             continue
 
@@ -526,8 +531,14 @@ def _minify_tool_content(content: str) -> str:
     except (json.JSONDecodeError, TypeError):
         pass
 
-    # Collapse diff context lines — validate it's a real unified diff first
-    if (content.startswith("diff ") or "\n@@" in content[:500]) and "\0" not in content:
+    # Collapse diff context lines — but ONLY for a GENUINE unified diff. The gate
+    # requires the unified-diff ENVELOPE (a `--- `/`+++ ` file-header pair or a
+    # `diff ` command line) AND a real hunk header. A lone coincidental `@@ … @@`
+    # line in non-diff output (a git-log fragment, CI text, an indented config
+    # block) no longer triggers collapse — and even past the gate,
+    # _collapse_diff_context only collapses context lines INSIDE a hunk, so it can
+    # never wholesale-destroy indented non-diff content (the audit P1).
+    if "\0" not in content and _looks_like_unified_diff(content):
         collapsed = _collapse_diff_context(content)
         if collapsed != content:
             return collapsed
@@ -535,28 +546,60 @@ def _minify_tool_content(content: str) -> str:
     return content
 
 
+# A real unified-diff hunk header, anchored at line start: "@@ -12,7 +12,9 @@".
+_UNIFIED_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@", re.M)
+# The file-header pair every unified diff carries: a "--- …" line immediately
+# followed by a "+++ …" line.
+_DIFF_FILE_HDR_RE = re.compile(r"^--- .*\n\+\+\+ ", re.M)
+
+
+def _looks_like_unified_diff(content: str) -> bool:
+    """True only for content with the unified-diff envelope (so we never collapse
+    non-diff output that merely contains a hunk-shaped line)."""
+    if not _UNIFIED_HUNK_RE.search(content):
+        return False
+    if _DIFF_FILE_HDR_RE.search(content):
+        return True
+    return content.startswith("diff ") or "\ndiff --git " in content or "\ndiff " in content
+
+
 def _collapse_diff_context(diff_text: str) -> str:
-    """Strip unchanged context lines from unified diffs, keep +/- and headers."""
+    """Strip unchanged context lines from unified diffs, keep +/- and headers.
+
+    Context lines (" "-prefixed) are collapsed ONLY while inside a hunk (after an
+    `@@` header). Lines before the first hunk, and any non-hunk content, are kept
+    verbatim — so a stray indented block cannot be destroyed even if the gate
+    passed on a real diff that also contains trailing prose."""
     lines = diff_text.split("\n")
     result = []
     context_run = 0
+    in_hunk = False
+
+    def _flush():
+        nonlocal context_run
+        if context_run > 0:
+            result.append(f"  [...{context_run} unchanged lines...]")
+            context_run = 0
 
     for line in lines:
-        if line.startswith(("diff ", "---", "+++", "@@", "+", "-")):
-            if context_run > 0:
-                result.append(f"  [...{context_run} unchanged lines...]")
-                context_run = 0
+        if line.startswith("@@"):
+            _flush()
+            in_hunk = True
             result.append(line)
-        elif line.startswith(" "):
+        elif line.startswith(("diff ", "---", "+++", "+", "-")):
+            _flush()
+            result.append(line)
+        elif in_hunk and line.startswith(" "):
             context_run += 1
         else:
-            if context_run > 0:
-                result.append(f"  [...{context_run} unchanged lines...]")
-                context_run = 0
+            # A non-context line: we're no longer inside a hunk's body. Reset
+            # in_hunk so indented content AFTER the hunk (e.g. a git-log-p second
+            # commit's message body, or trailing prose) is kept verbatim and never
+            # collapsed (the audit P1 — in_hunk was set but never reset).
+            in_hunk = False
+            _flush()
             result.append(line)
 
-    if context_run > 0:
-        result.append(f"  [...{context_run} unchanged lines...]")
-
+    _flush()
     collapsed = "\n".join(result)
     return collapsed if len(collapsed) < len(diff_text) else diff_text

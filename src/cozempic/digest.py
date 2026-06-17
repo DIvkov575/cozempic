@@ -21,6 +21,7 @@ from typing import Literal
 
 from ._validation import parse_env_bool
 from .helpers import get_content_blocks, get_msg_type, text_of
+from .tokens import _is_sidechain
 from .types import Message
 
 # ---------------------------------------------------------------------------
@@ -426,6 +427,14 @@ def extract_corrections(
 
     prev_assistant_text = ""
     for pos, (idx, msg, _) in enumerate(messages):
+        # Skip sub-agent (sidechain) turns entirely — they are scaffolding/tool
+        # prompts, not the human correcting Claude. Mining them is an L6
+        # injection: untrusted sub-agent content becomes a learned behavioral rule.
+        # Also skip their assistant text from prev_assistant_text so sidechain
+        # context never bleeds into the `before` field of a following main turn.
+        if _is_sidechain(msg):
+            continue
+
         if pos < since_turn:
             # Track assistant text even before our window
             if get_msg_type(msg) == "assistant":
@@ -640,37 +649,17 @@ def admit_rule(rule: DigestRule, store: DigestStore) -> str:
 
 
 def _atomic_write_text(target: Path, data: str, encoding: str = "utf-8") -> None:
-    """Write `data` to `target` atomically with `fsync`.
+    """Atomic, fsync'd, collision-safe write — delegates to the ONE hardened
+    implementation in helpers.atomic_write_text so the temp-naming policy lives
+    in a single place and can't drift.
 
-    `fsync` before `os.replace` guarantees the new bytes are on disk before
-    the rename, so a power-loss or OOM-kill leaves `target` either fully-old
-    or fully-new — never zeroed or partially truncated. `mkstemp` provides
-    collision-safe temp paths for concurrent hook processes.
-
-    The tmp filename keeps `target.name` as its SUFFIX so the tests' `endswith`
-    filesystem patches cover the temp write too (crash-safety is test-verified).
+    Consolidation (Batch-4): this used to be a byte-identical third copy of the
+    atomic-write primitive, still on the OLD ``prefix='.tmp.', suffix=target.name``
+    pattern that #127 hardened elsewhere to ``.tmp.<name>.<rand>.partial`` — a
+    leftover divergent copy of exactly the temp-orphan class #127 set out to kill.
     """
-    import tempfile
-    target.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=".tmp.", suffix=target.name, dir=str(target.parent)
-    )
-    tmp_path = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "w", encoding=encoding) as f:
-            f.write(data)
-            f.flush()
-            try:
-                os.fsync(f.fileno())
-            except OSError:
-                pass
-        os.replace(tmp_path, target)
-    except Exception:
-        try:
-            tmp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
+    from .helpers import atomic_write_text as _hardened_atomic_write_text
+    _hardened_atomic_write_text(target, data, encoding=encoding)
 
 
 def load_digest_store(project_dir: str = "") -> DigestStore:
@@ -772,11 +761,11 @@ def _write_digest_md(store: DigestStore) -> None:
         lines.append(f"## Active Rules ({len(active)})")
         lines.append("")
         for r in active:
-            lines.append(f"- **[{r.id}|{r.scope}|{r.priority}]** {r.rule}")
+            lines.append(f"- **[{r.id}|{r.scope}|{r.priority}]** {_sanitize_for_injection(r.rule)}")
             if r.trigger:
-                lines.append(f"  - When: {r.trigger}")
+                lines.append(f"  - When: {_sanitize_for_injection(r.trigger)}")
             if r.evidence:
-                lines.append(f"  - Evidence: \"{r.evidence[:100]}\"")
+                lines.append(f"  - Evidence: \"{_sanitize_for_injection(r.evidence, limit=100)}\"")
             lines.append(f"  - Score: {score_rule(r):.2f} | Seen: {r.occurrence_count}x")
         lines.append("")
 
@@ -784,7 +773,7 @@ def _write_digest_md(store: DigestStore) -> None:
         lines.append(f"## Pending Rules ({len(pending)})")
         lines.append("")
         for r in pending:
-            lines.append(f"- **[{r.id}|{r.scope}]** {r.rule} (seen {r.occurrence_count}x)")
+            lines.append(f"- **[{r.id}|{r.scope}]** {_sanitize_for_injection(r.rule)} (seen {r.occurrence_count}x)")
         lines.append("")
 
     _atomic_write_text(DIGEST_MD_FILE, "\n".join(lines))
@@ -851,15 +840,40 @@ def update_digest(
 # ---------------------------------------------------------------------------
 
 
+def _sanitize_for_injection(text: str, limit: int = 300) -> str:
+    """Neutralize untrusted rule/evidence text before it is embedded into a
+    Claude-readable markdown file (digest memory / injection block).
+
+    Rule text comes from the user's transcript and is otherwise interpolated
+    verbatim — so a rule containing a newline + a fake `## header`, a list item,
+    a `>` quote, or a ``` code fence could inject structure/instructions into CC's
+    memory (prompt-injection / the audit P1). Defenses: collapse ALL newlines and
+    control chars to spaces (one rule stays one line — cannot add markdown lines),
+    neutralize a leading markdown-control char, and cap length.
+    """
+    if not isinstance(text, str):
+        text = str(text)
+    # Newlines + other C0 control chars -> space (single-line guarantee).
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    # Defang a leading markdown-structural char so the value can't render as a
+    # header/quote/list/fence at the start of its line.
+    if text[:1] in "#>-*`|":
+        text = "\\" + text
+    if len(text) > limit:
+        text = text[:limit] + "…"
+    return text
+
+
 def _format_rule_4field(rule: DigestRule) -> str:
     """Format a rule in 4-field compressed format (arXiv:2603.13017 — 11x compression)."""
-    line = f"[{rule.id}|{rule.scope}|{rule.priority}] {rule.rule}"
+    line = f"[{rule.id}|{rule.scope}|{rule.priority}] {_sanitize_for_injection(rule.rule)}"
     if rule.trigger:
-        line += f"\n  When: {rule.trigger}"
+        line += f"\n  When: {_sanitize_for_injection(rule.trigger)}"
     if rule.signal:
-        line += f"\n  Signal: {rule.signal}"
+        line += f"\n  Signal: {_sanitize_for_injection(rule.signal)}"
     if rule.evidence:
-        line += f"\n  Evidence: \"{rule.evidence[:120]}\""
+        line += f"\n  Evidence: \"{_sanitize_for_injection(rule.evidence, limit=120)}\""
     return line
 
 
@@ -1061,12 +1075,12 @@ def show_digest() -> str:
     if active:
         lines.append(f"Active rules ({len(active)}):")
         for r in active:
-            lines.append(f"  [{r.id}|{r.scope}|{r.priority}] {r.rule}")
+            lines.append(f"  [{r.id}|{r.scope}|{r.priority}] {_sanitize_for_injection(r.rule)}")
             lines.append(f"    Score: {score_rule(r):.2f} | Seen: {r.occurrence_count}x")
 
     if pending:
         lines.append(f"\nPending rules ({len(pending)}):")
         for r in pending:
-            lines.append(f"  [{r.id}|{r.scope}] {r.rule} (seen {r.occurrence_count}x)")
+            lines.append(f"  [{r.id}|{r.scope}] {_sanitize_for_injection(r.rule)} (seen {r.occurrence_count}x)")
 
     return "\n".join(lines)

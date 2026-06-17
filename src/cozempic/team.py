@@ -23,6 +23,22 @@ from pathlib import Path
 from .types import Message
 
 
+def _sfield(d: dict, *keys: str, default: str = "") -> str:
+    """First present-and-non-empty STRING value among *keys in untrusted tool-input
+    dict *d, else *default. Tool-input fields in poisoned/malformed JSONL can be any
+    JSON type — a non-str prompt crashes ``prompt[:200]`` (TypeError 'int' not
+    subscriptable) and an unhashable list/dict crashes ``task_id in seen`` / dict-key
+    use (TypeError). Every string/slice/.strip()/dict-key read in extract_team_state
+    routes through this so a single bad field can't crash the extractor and wedge the
+    guard into a respawn storm (R4 finding team-input-field-crash). Mirrors the
+    ``x or y or default`` semantics the call sites relied on (skips empty strings)."""
+    for k in keys:
+        v = d.get(k)
+        if isinstance(v, str) and v:
+            return v
+    return default
+
+
 @dataclass
 class SubagentInfo:
     """Information about a spawned subagent (Task tool call)."""
@@ -105,27 +121,55 @@ class TeamState:
             active.append(task)
         return active, completed, blank
 
+    @staticmethod
+    def _san(text) -> str:
+        """Sanitize untrusted team-derived text before it lands in a Claude-readable
+        checkpoint/recovery surface — the sibling of the digest _sanitize_for_injection
+        fix (result_summary/lead_summary/subject/description/name come from tool
+        results and team messages and were embedded verbatim, so a multi-line /
+        markdown-structured value could inject into CC memory). Lazy import avoids
+        any import-order coupling with digest."""
+        if not text:
+            return ""
+        try:
+            from .digest import _sanitize_for_injection
+            s = _sanitize_for_injection(str(text))
+        except Exception:
+            # Fail safe: at minimum collapse newlines so injection can't add lines.
+            import re as _re
+            s = _re.sub(r"\s+", " ", str(text)).strip()
+        # Replace any LONE SURROGATE (from a surrogateescape-decoded non-UTF-8 transcript
+        # byte) with U+FFFD so the rendered checkpoint is clean UTF-8 (R15): a surrogate
+        # in the markdown made the STRICT checkpoint write/read raise UnicodeEncode/Decode
+        # — the R14 surrogatepass write merely RELOCATED that crash to read_team_checkpoint
+        # / the PostCompact hook. Sanitizing at this single render chokepoint keeps the
+        # file strict-UTF-8 clean for both cozempic AND Claude Code's own reader, with no
+        # WTF-8 round-trip. A lone surrogate has no display value anyway.
+        if any(0xD800 <= ord(c) <= 0xDFFF for c in s):
+            s = "".join("�" if 0xD800 <= ord(c) <= 0xDFFF else c for c in s)
+        return s
+
     def to_markdown(self) -> str:
         """Render team state as markdown for checkpoint file."""
         lines = []
-        lines.append(f"# Agent Team Checkpoint: {self.team_name or 'unnamed'}")
+        lines.append(f"# Agent Team Checkpoint: {self._san(self.team_name) or 'unnamed'}")
         lines.append(f"_Generated: {datetime.now().isoformat()}_")
         if self.config_source:
-            lines.append(f"_Source: {self.config_source}_")
+            lines.append(f"_Source: {self._san(self.config_source)}_")
         lines.append("")
 
         if self.lead_agent_id or self.lead_session_id:
-            lines.append(f"**Lead:** `{self.lead_agent_id}` (session: `{self.lead_session_id[:12]}...`)")
+            lines.append(f"**Lead:** `{self._san(self.lead_agent_id)}` (session: `{self._san(self.lead_session_id)[:12]}...`)")
             lines.append("")
 
         if self.teammates:
             lines.append("## Teammates")
             for t in self.teammates:
-                status = f" ({t.status})" if t.status != "unknown" else ""
-                role = f" — {t.role}" if t.role else ""
-                model = f" [{t.model}]" if t.model else ""
-                cwd = f" cwd: {t.cwd}" if t.cwd else ""
-                lines.append(f"- **{t.name}** (`{t.agent_id}`){role}{model}{status}")
+                status = f" ({self._san(t.status)})" if t.status != "unknown" else ""
+                role = f" — {self._san(t.role)}" if t.role else ""
+                model = f" [{self._san(t.model)}]" if t.model else ""
+                cwd = f" cwd: {self._san(t.cwd)}" if t.cwd else ""
+                lines.append(f"- **{self._san(t.name)}** (`{self._san(t.agent_id)}`){role}{model}{status}")
                 if cwd:
                     lines.append(f"  {cwd}")
             lines.append("")
@@ -133,11 +177,11 @@ class TeamState:
         if self.subagents:
             lines.append("## Subagents")
             for s in self.subagents:
-                agent_type = f" [{s.subagent_type}]" if s.subagent_type else ""
-                desc = f" — {s.description}" if s.description else ""
-                lines.append(f"- `{s.agent_id}`{agent_type}{desc} ({s.status})")
+                agent_type = f" [{self._san(s.subagent_type)}]" if s.subagent_type else ""
+                desc = f" — {self._san(s.description)}" if s.description else ""
+                lines.append(f"- `{self._san(s.agent_id)}`{agent_type}{desc} ({self._san(s.status)})")
                 if s.result_summary:
-                    lines.append(f"  Result: {s.result_summary[:200]}")
+                    lines.append(f"  Result: {self._san(s.result_summary)[:200]}")
             lines.append("")
 
         if self.tasks:
@@ -147,10 +191,10 @@ class TeamState:
             if active_tasks:
                 for t in active_tasks:
                     icon = status_icons.get(t.status, " ")
-                    owner = f" @{t.owner}" if t.owner else ""
-                    lines.append(f"- [{icon}] {t.subject}{owner}")
+                    owner = f" @{self._san(t.owner)}" if t.owner else ""
+                    lines.append(f"- [{icon}] {self._san(t.subject)}{owner}")
                     if t.description:
-                        lines.append(f"  {t.description[:200]}")
+                        lines.append(f"  {self._san(t.description)[:200]}")
             else:
                 lines.append("- No active tasks.")
             omitted = completed_count + blank_count
@@ -165,7 +209,7 @@ class TeamState:
 
         if self.lead_summary:
             lines.append("## Lead Context")
-            lines.append(self.lead_summary)
+            lines.append(self._san(self.lead_summary))
             lines.append("")
 
         total = self.message_count
@@ -175,25 +219,25 @@ class TeamState:
     def to_recovery_text(self) -> str:
         """Render team state as text for injection into conversation."""
         parts = []
-        parts.append(f"Active agent team: {self.team_name or 'unnamed'}")
+        parts.append(f"Active agent team: {self._san(self.team_name) or 'unnamed'}")
         if self.lead_agent_id:
-            parts.append(f"Lead: {self.lead_agent_id} (session: {self.lead_session_id})")
+            parts.append(f"Lead: {self._san(self.lead_agent_id)} (session: {self._san(self.lead_session_id)})")
 
         if self.teammates:
             parts.append("\nTeammates:")
             for t in self.teammates:
-                role = f" — {t.role}" if t.role else ""
-                model = f" [{t.model}]" if t.model else ""
-                parts.append(f"  - {t.name} (agent_id: {t.agent_id}){role}{model} [{t.status}]")
+                role = f" — {self._san(t.role)}" if t.role else ""
+                model = f" [{self._san(t.model)}]" if t.model else ""
+                parts.append(f"  - {self._san(t.name)} (agent_id: {self._san(t.agent_id)}){role}{model} [{self._san(t.status)}]")
 
         if self.subagents:
             parts.append(f"\nSubagents ({len(self.subagents)}):")
             for s in self.subagents:
-                agent_type = f" [{s.subagent_type}]" if s.subagent_type else ""
-                desc = f" — {s.description}" if s.description else ""
-                parts.append(f"  - {s.agent_id}{agent_type}{desc} [{s.status}]")
+                agent_type = f" [{self._san(s.subagent_type)}]" if s.subagent_type else ""
+                desc = f" — {self._san(s.description)}" if s.description else ""
+                parts.append(f"  - {self._san(s.agent_id)}{agent_type}{desc} [{self._san(s.status)}]")
                 if s.result_summary:
-                    parts.append(f"    Result: {s.result_summary[:150]}")
+                    parts.append(f"    Result: {self._san(s.result_summary)[:150]}")
 
         if self.tasks:
             active_tasks, completed_count, blank_count = self._task_groups()
@@ -201,8 +245,8 @@ class TeamState:
                 parts.append("\nShared active tasks:")
                 shown_tasks = active_tasks[:10]
                 for t in shown_tasks:
-                    owner = f" (owner: {t.owner})" if t.owner else ""
-                    parts.append(f"  - [{t.status.upper()}] {t.subject}{owner}")
+                    owner = f" (owner: {self._san(t.owner)})" if t.owner else ""
+                    parts.append(f"  - [{self._san(t.status).upper()}] {self._san(t.subject)}{owner}")
                 if len(active_tasks) > len(shown_tasks):
                     parts.append(f"  - ... {len(active_tasks) - len(shown_tasks)} more active task(s) omitted")
             else:
@@ -217,7 +261,7 @@ class TeamState:
                 parts.append(f"Completed/empty tasks omitted from recovery context: {', '.join(detail)}.")
 
         if self.lead_summary:
-            parts.append(f"\nCoordination context: {self.lead_summary}")
+            parts.append(f"\nCoordination context: {self._san(self.lead_summary)}")
 
         return "\n".join(parts)
 
@@ -430,10 +474,14 @@ def _extract_block_text(block: dict) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
+        # str-guard each sub["text"] (ynaamane review #2): a non-str text (e.g.
+        # {"type":"text","text":99999} in malformed JSONL) would make "".join raise
+        # TypeError, crashing extract_team_state — which is NOT strategy-isolated and
+        # feeds the reactive overflow safe-gate (its throw used to fail-OPEN -> SIGKILL).
         return "".join(
-            sub.get("text", "")
+            sub["text"]
             for sub in content
-            if isinstance(sub, dict) and sub.get("type") == "text"
+            if isinstance(sub, dict) and sub.get("type") == "text" and isinstance(sub.get("text"), str)
         )
     return ""
 
@@ -469,15 +517,18 @@ def _is_team_message(msg_dict: dict, pending_task_ids: set[str] | None = None) -
 
             block_type = block.get("type", "")
 
-            # Tool use with team-related name — definitive signal
-            if block_type == "tool_use" and block.get("name") in TEAM_TOOL_NAMES:
+            # Tool use with team-related name — definitive signal.
+            # isinstance(str) guards the `in <set>` membership: an unhashable
+            # list/dict name (poisoned JSONL) would raise TypeError here (R5 finding).
+            name = block.get("name")
+            if block_type == "tool_use" and isinstance(name, str) and name in TEAM_TOOL_NAMES:
                 return True
 
             # Tool result — match by tool_use_id if we know the pending Task IDs;
             # fall back to nothing (don't use TEAM_KEYWORDS — too broad).
             if block_type == "tool_result" and pending_task_ids:
                 tool_use_id = block.get("tool_use_id", "")
-                if tool_use_id in pending_task_ids:
+                if isinstance(tool_use_id, str) and tool_use_id in pending_task_ids:
                     return True
 
     elif isinstance(content, str):
@@ -548,11 +599,21 @@ def extract_team_state(messages: list[Message]) -> TeamState:
     # are also scanned; _is_team_message itself still uses TEAM_TOOL_NAMES only.
     pending_task_ids: set[str] = set()
     for _, msg, _ in messages:
-        inner = msg.get("message", {})
-        for block in (inner.get("content", []) if isinstance(inner.get("content"), list) else []):
-            if block.get("type") == "tool_use" and block.get("name") in _TEAM_EXTRACT_TOOL_NAMES:
+        inner = msg.get("message")
+        if not isinstance(inner, dict):
+            continue
+        content = inner.get("content")
+        for block in (content if isinstance(content, list) else []):
+            if not isinstance(block, dict):  # a content array can hold a bare string/number
+                continue
+            # isinstance(str) guards both the set membership AND the set .add:
+            # an unhashable list/dict name or id (poisoned JSONL) would raise
+            # TypeError in this pre-pass, which runs OUTSIDE the main loop's R4
+            # coercion and crashed extract_team_state -> guard respawn storm (R5).
+            name = block.get("name")
+            if block.get("type") == "tool_use" and isinstance(name, str) and name in _TEAM_EXTRACT_TOOL_NAMES:
                 uid = block.get("id", "")
-                if uid:
+                if isinstance(uid, str) and uid:
                     pending_task_ids.add(uid)
 
     def _is_extract_message(m: dict) -> bool:
@@ -572,10 +633,12 @@ def extract_team_state(messages: list[Message]) -> TeamState:
                 if not isinstance(blk, dict):
                     continue
                 bt = blk.get("type", "")
-                if bt == "tool_use" and blk.get("name") in _TEAM_EXTRACT_TOOL_NAMES:
+                name = blk.get("name")
+                if bt == "tool_use" and isinstance(name, str) and name in _TEAM_EXTRACT_TOOL_NAMES:
                     return True
                 if bt == "tool_result" and pending_task_ids:
-                    if blk.get("tool_use_id", "") in pending_task_ids:
+                    tid = blk.get("tool_use_id", "")
+                    if isinstance(tid, str) and tid in pending_task_ids:
                         return True
         elif isinstance(c, str):
             return "<task-notification>" in c
@@ -588,7 +651,9 @@ def extract_team_state(messages: list[Message]) -> TeamState:
         state.message_count += 1
         state.last_coordination_index = line_idx
 
-        inner = msg.get("message", {})
+        inner = msg.get("message")
+        if not isinstance(inner, dict):
+            continue
         content = inner.get("content", [])
         if not isinstance(content, list):
             continue
@@ -601,19 +666,28 @@ def extract_team_state(messages: list[Message]) -> TeamState:
 
             # ── Tool use blocks ──────────────────────────────────────
             if block_type == "tool_use":
+                # Coerce name/id to str: both are used as dict keys / in comparisons
+                # below; an unhashable list/dict value (poisoned JSONL) would crash
+                # `tool_use_id_to_name[tool_use_id]` (R4 team-input-field-crash).
                 name = block.get("name", "")
+                if not isinstance(name, str):
+                    name = ""
                 inp = block.get("input", {})
+                if not isinstance(inp, dict):  # tool 'input' can be a non-dict in malformed JSONL
+                    inp = {}
                 tool_use_id = block.get("id", "")
+                if not isinstance(tool_use_id, str):
+                    tool_use_id = ""
 
                 if tool_use_id and name:
                     tool_use_id_to_name[tool_use_id] = name
 
                 # Task tool = subagent spawn
                 if name == "Task":
-                    description = inp.get("description", "")
-                    subagent_type = inp.get("subagent_type", "")
-                    prompt = inp.get("prompt", "")[:200]
-                    resume_id = inp.get("resume", "")
+                    description = _sfield(inp, "description")
+                    subagent_type = _sfield(inp, "subagent_type")
+                    prompt = _sfield(inp, "prompt")[:200]
+                    resume_id = _sfield(inp, "resume")
                     bg = inp.get("run_in_background", False)
 
                     # Use tool_use_id as temporary key until we get agent_id
@@ -634,14 +708,14 @@ def extract_team_state(messages: list[Message]) -> TeamState:
 
                 # TaskOutput = checking on background agent
                 elif name == "TaskOutput":
-                    task_id = inp.get("task_id", "")
+                    task_id = _sfield(inp, "task_id")
                     if task_id and task_id in seen_subagents:
                         # Still running, waiting for result
                         pass
 
                 # TaskStop = stopping a background agent
                 elif name == "TaskStop":
-                    task_id = inp.get("task_id", "")
+                    task_id = _sfield(inp, "task_id")
                     if task_id and task_id in seen_subagents:
                         seen_subagents[task_id].status = "stopped"
 
@@ -652,11 +726,16 @@ def extract_team_state(messages: list[Message]) -> TeamState:
                     # kept as a fallback for backward compat. Prefer the real key
                     # so a transcript carrying BOTH (rollout overlap) uses the
                     # authoritative "team_name", not the stale legacy "name".
-                    state.team_name = inp.get("team_name") or inp.get("name") or state.team_name
-                    for tm in inp.get("teammates", []):
-                        agent_id = tm.get("agentId", tm.get("agent_id", ""))
-                        tm_name = tm.get("name", agent_id)
-                        role = tm.get("role", tm.get("description", ""))
+                    state.team_name = _sfield(inp, "team_name", "name") or state.team_name
+                    _tms = inp.get("teammates", [])
+                    for tm in (_tms if isinstance(_tms, list) else []):
+                        if not isinstance(tm, dict):  # teammates array can hold a non-dict
+                            continue
+                        # Coerce to str: agent_id is a dict key (seen_teammates),
+                        # tm_name/role are rendered — non-str/unhashable values crash.
+                        agent_id = _sfield(tm, "agentId", "agent_id")
+                        tm_name = _sfield(tm, "name") or agent_id
+                        role = _sfield(tm, "role", "description")
                         if agent_id:
                             seen_teammates[agent_id] = TeammateInfo(
                                 agent_id=agent_id,
@@ -673,8 +752,8 @@ def extract_team_state(messages: list[Message]) -> TeamState:
                 # create a placeholder entry now so the spawn is immediately
                 # visible; the result handler below upgrades to the real agentId.
                 elif name == "Agent":
-                    agent_name = inp.get("name", "")
-                    agent_role = inp.get("role", inp.get("description", ""))
+                    agent_name = _sfield(inp, "name")
+                    agent_role = _sfield(inp, "role", "description")
                     # Placeholder key: use tool_use_id if available, else name.
                     # The result handler re-keys by the real agentId.
                     placeholder = tool_use_id or agent_name or f"agent-{len(seen_teammates)}"
@@ -700,7 +779,7 @@ def extract_team_state(messages: list[Message]) -> TeamState:
                 # uses suffixed ids (alice@myteam), so a genuine disband still lifts
                 # the wedge; only bare-id inline rosters fall back to the safe wedge.
                 elif name == "TeamDelete":
-                    _del_team = (inp.get("team_name") or inp.get("name") or "").strip()
+                    _del_team = _sfield(inp, "team_name", "name").strip()
                     _suffix = "@" + _del_team
                     if _del_team:
                         for _tm in seen_teammates.values():
@@ -709,36 +788,39 @@ def extract_team_state(messages: list[Message]) -> TeamState:
 
                 # TaskCreate (shared todo list)
                 elif name == "TaskCreate":
-                    task_id = inp.get("taskId", inp.get("id", str(len(seen_tasks))))
-                    subject = inp.get("subject", inp.get("title", ""))
+                    task_id = _sfield(inp, "taskId", "id") or str(len(seen_tasks))
+                    subject = _sfield(inp, "subject", "title")
                     seen_tasks[task_id] = TaskInfo(
                         task_id=task_id,
                         subject=subject,
                         status="pending",
-                        owner=inp.get("owner", ""),
-                        description=inp.get("description", ""),
+                        owner=_sfield(inp, "owner"),
+                        description=_sfield(inp, "description"),
                     )
 
                 # TaskUpdate (shared todo list)
                 elif name == "TaskUpdate":
-                    task_id = inp.get("taskId", inp.get("id", ""))
+                    task_id = _sfield(inp, "taskId", "id")
                     if task_id in seen_tasks:
-                        if inp.get("status"):
-                            seen_tasks[task_id].status = inp["status"]
-                        if inp.get("owner"):
-                            seen_tasks[task_id].owner = inp["owner"]
-                        if inp.get("subject"):
-                            seen_tasks[task_id].subject = inp["subject"]
+                        if _sfield(inp, "status"):
+                            seen_tasks[task_id].status = _sfield(inp, "status")
+                        if _sfield(inp, "owner"):
+                            seen_tasks[task_id].owner = _sfield(inp, "owner")
+                        if _sfield(inp, "subject"):
+                            seen_tasks[task_id].subject = _sfield(inp, "subject")
                     else:
                         seen_tasks[task_id] = TaskInfo(
                             task_id=task_id,
-                            subject=inp.get("subject", ""),
-                            status=inp.get("status", "unknown"),
-                            owner=inp.get("owner", ""),
+                            subject=_sfield(inp, "subject"),
+                            status=_sfield(inp, "status", default="unknown"),
+                            owner=_sfield(inp, "owner"),
                         )
 
                 elif name in ("SendMessage", "TeamMessage"):
-                    target = inp.get("to", inp.get("agentId", ""))
+                    # _sfield → str: `to` can be a list (multi-recipient) or other
+                    # non-hashable in poisoned JSONL; used as a dict key below, an
+                    # unhashable value crashes (R4 team-input-field-crash).
+                    target = _sfield(inp, "to", "agentId")
                     # Resolve bare name to agentId (P0-C): SendMessage carries a
                     # bare name ("alice") but seen_teammates is keyed by full
                     # agentId ("alice@myteam"). The _name_to_agent_id index bridges
@@ -751,6 +833,8 @@ def extract_team_state(messages: list[Message]) -> TeamState:
             # ── Tool result blocks ───────────────────────────────────
             elif block_type == "tool_result":
                 tool_use_id = block.get("tool_use_id", "")
+                if not isinstance(tool_use_id, str):  # dict-key use below
+                    tool_use_id = ""
                 tool_name = tool_use_id_to_name.get(tool_use_id, "")
 
                 # Task tool result = subagent finished, capture result
@@ -937,11 +1021,13 @@ def extract_team_state(messages: list[Message]) -> TeamState:
     for line_idx, msg, byte_size in messages:
         if msg.get("type") == "assistant" and _is_team_message(msg):
             inner = msg.get("message", {})
-            content = inner.get("content", [])
+            content = inner.get("content", []) if isinstance(inner, dict) else []
             if isinstance(content, list):
                 for block in content:
                     if isinstance(block, dict) and block.get("type") == "text":
-                        team_msgs.append(block.get("text", "")[:300])
+                        _t = block.get("text", "")
+                        if isinstance(_t, str):  # non-str text would crash the [:300] slice (#2)
+                            team_msgs.append(_t[:300])
 
     if team_msgs:
         state.lead_summary = " [...] ".join(team_msgs[-3:])
@@ -1105,7 +1191,16 @@ def write_team_checkpoint(state: TeamState, project_dir: Path | None = None) -> 
         from .session import get_claude_dir
         path = get_claude_dir() / "team-checkpoint.md"
 
-    path.write_text(state.to_markdown(), encoding="utf-8")
+    # atomic_write_text (ynaamane review #5): a SIGKILL/OOM mid-write would otherwise
+    # leave a PARTIAL checkpoint that PostCompact reads back as recovery state. Every
+    # other shared-state writer is atomic (temp + os.replace); this one was the holdout.
+    # Strict UTF-8 is safe now (R15): _san replaces lone surrogates with U+FFFD at the
+    # render chokepoint, so to_markdown() is clean UTF-8 — no UnicodeEncodeError on
+    # write and no WTF-8 for the reader (cozempic OR Claude Code) to choke on. (The R14
+    # errors="surrogatepass" write was reverted because it only RELOCATED the crash to
+    # the strict read in read_team_checkpoint / the PostCompact hook.)
+    from .helpers import atomic_write_text
+    atomic_write_text(path, state.to_markdown())
     return path
 
 
@@ -1139,7 +1234,17 @@ def read_team_checkpoint(
 
     for path in candidates:
         if path.exists():
-            content = path.read_text(encoding="utf-8").strip()
+            try:
+                # errors="surrogatepass": tolerate a STALE checkpoint written by the
+                # short-lived R14 surrogatepass code (WTF-8 bytes on disk) so the
+                # PostCompact hook degrades gracefully instead of crashing on a strict
+                # UnicodeDecodeError (R15). New writes are clean UTF-8 (_san strips
+                # surrogates), so this only matters for a pre-existing file.
+                content = path.read_text(encoding="utf-8", errors="surrogatepass").strip()
+            except (OSError, ValueError):
+                # Unreadable / undecodable checkpoint — degrade to None rather than
+                # crash the automatic PostCompact hook (which has no try/except).
+                continue
             if content:
                 return content
     return None
@@ -1209,7 +1314,7 @@ def inject_team_recovery(messages: list[Message], state: TeamState) -> list[Mess
     # Terse confirmation summary — avoid echoing the full team state back.
     summary_bits = []
     if state.team_name:
-        summary_bits.append(f"team={state.team_name}")
+        summary_bits.append(f"team={TeamState._san(state.team_name)}")
     if state.teammates:
         summary_bits.append(f"{len(state.teammates)} teammate(s)")
     if state.subagents:

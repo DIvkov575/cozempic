@@ -57,6 +57,90 @@ def _build_session(num_turns: int = 60, result_size: int = 1000) -> list:
     return messages
 
 
+class TestMinifyDiffGate(unittest.TestCase):
+    """The diff-collapse must only fire on a GENUINE unified diff. The old gate
+    over-triggered on any content containing '\\n@@', then collapsed every
+    space-indented line into '[...unchanged...]' = silent data loss (audit P1)."""
+
+    def test_real_diff_still_collapses(self):
+        from cozempic.strategies.standard import _minify_tool_content
+        ctx = "".join(f" unchanged context line number {i}\n" for i in range(12))
+        diff = "--- a/x.py\n+++ b/x.py\n@@ -1,14 +1,14 @@\n" + ctx + "-old\n+new\n"
+        out = _minify_tool_content(diff)
+        self.assertIn("unchanged lines", out, "a real unified diff must still collapse context")
+        self.assertIn("+new", out)
+
+    def test_single_fake_hunk_line_with_indented_logs_preserved(self):
+        # Fleet repro: ONE hunk-shaped line in non-diff output (no ---/+++ envelope)
+        # must NOT open the gate; indented log lines must survive verbatim.
+        from cozempic.strategies.standard import _minify_tool_content
+        content = (
+            "Replaying journal @@ -1 +1 @@ marker found:\n"
+            "   ERROR connection refused to db-primary\n"
+            "   ERROR connection refused to db-replica\n"
+            "   WARN retry budget exhausted\n"
+            "   INFO falling back to cache\n"
+            "   INFO request completed in 4.2s\n"
+            "done\n"
+        )
+        self.assertEqual(_minify_tool_content(content), content,
+                         "a lone hunk-shaped line must not trigger collapse of indented logs")
+
+    def test_git_log_p_second_commit_body_preserved(self):
+        # Fleet P1: content after a hunk (a git-log-p second commit's indented
+        # message body) must survive — in_hunk must reset after the hunk ends.
+        from cozempic.strategies.standard import _minify_tool_content
+        ctx = "".join(f" ctx line {i}\n" for i in range(12))
+        content = (
+            "commit abc123\n"
+            "--- a/x.py\n+++ b/x.py\n@@ -1,14 +1,14 @@\n" + ctx + "-old\n+new\n"
+            "\n"
+            "commit def456\n"
+            "Author: someone\n"
+            "\n"
+            "    SECOND_COMMIT_BODY_LINE_DO_NOT_LOSE\n"
+            "    more indented body text that must survive\n"
+        )
+        out = _minify_tool_content(content)
+        self.assertIn("unchanged lines", out, "the real hunk must still collapse")
+        self.assertIn("SECOND_COMMIT_BODY_LINE_DO_NOT_LOSE", out,
+                      "content after the hunk must NOT be collapsed away")
+
+    def test_indented_config_after_fake_hunk_preserved(self):
+        from cozempic.strategies.standard import _minify_tool_content
+        content = (
+            "@@ -1 +1 @@\n"
+            "   api_key = SECRET_DO_NOT_LOSE\n"
+            "   host = db-primary\n"
+            "   port = 5432\n"
+            "   timeout = 30\n"
+            "   retries = 5\n"
+        )
+        out = _minify_tool_content(content)
+        self.assertIn("SECRET_DO_NOT_LOSE", out, "indented config must never be collapsed away")
+        self.assertEqual(out, content)
+
+    def test_non_diff_with_at_at_substring_preserved(self):
+        # Prose/log that merely contains '@@' and space-indented lines must be
+        # returned VERBATIM — not run through the diff collapser.
+        from cozempic.strategies.standard import _minify_tool_content
+        content = (
+            "Decorator usage:\n"
+            "  @@app.route\n"           # '@@' but NOT a hunk header
+            "   indented code line one\n"  # leading spaces — would be collapsed by the old gate
+            "   indented code line two\n"
+            "   indented code line three\n"
+            "Done.\n"
+        )
+        self.assertEqual(_minify_tool_content(content), content,
+                         "non-diff content must be preserved verbatim, never collapsed")
+
+    def test_indented_prose_block_not_destroyed(self):
+        from cozempic.strategies.standard import _minify_tool_content
+        content = "Log output:\n" + "".join(f"   line {i}\n" for i in range(40)) + "@@ note @@\n"
+        self.assertEqual(_minify_tool_content(content), content)
+
+
 class TestToolResultAge(unittest.TestCase):
 
     def test_recent_results_untouched(self):
