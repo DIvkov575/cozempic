@@ -211,9 +211,25 @@ def _tr(idx: int, tool_use_id: str, text: str) -> tuple:
     return (idx, d, len(text))
 
 
-def _uc(idx: int, text: str) -> tuple:
-    """3-tuple for a user message with plain string content."""
+def _uc(idx: int, text: str, team_name: str | None = None) -> tuple:
+    """3-tuple for a user message with plain string content.
+
+    team_name: set a top-level teamName field — genuine harness teammate-message
+    carriers always do, and #134's H-1 gate only transitions an idle-notification
+    when it is present (so a user-typed <teammate-message> can't phantom-IDLE a
+    live agent).
+    """
     d = {"message": {"role": "user", "content": text}}
+    if team_name is not None:
+        d["teamName"] = team_name
+    return (idx, d, len(text))
+
+
+def _qo(idx: int, text: str) -> tuple:
+    """3-tuple for a queue-operation message — the ONLY surface #134 (C-2) parses
+    task-notifications from (a user-typed <task-notification> in plain content is
+    ignored to prevent phantom-terminating a live agent)."""
+    d = {"type": "queue-operation", "content": text}
     return (idx, d, len(text))
 
 
@@ -236,17 +252,63 @@ def _task_spawn_with_notif() -> list:
     )
     return [
         _tu(0, "finder@myteam", "Task", {"description": "find bugs"}),
-        _uc(1, notif_text),
+        _qo(1, notif_text),  # #134 C-2: task-notifications parse from queue-op only
     ]
 
 
-# NOTE: three tests that asserted notification/teammate-message transitions from
-# PLAIN user content were removed when this suite was salvaged from PR #132 onto
-# main: PR #134's C-2 narrowing parses task-notifications on the queue-operation
-# surface ONLY (team.py: _task_notif_content="" for non-queue-op), and reworked the
-# idle-notification path. The removed cases encoded the pre-#134 contract; their
-# failure direction was safe (teammate stays 'running' -> over-defer). The cap/ReDoS,
-# attribute-tolerance, and _constants-identity coverage below is unaffected.
+# Three of PR #132's cases originally asserted transitions from PLAIN user content.
+# PR #134 (merged after #132 was opened) narrowed the surfaces for security: task-
+# notifications parse from the queue-operation surface ONLY (C-2), and idle-
+# notifications transition only when the carrier sets a top-level teamName (H-1).
+# Below they are restored on the REAL current surfaces (queue-op / teamName) so they
+# still exercise the create/transition paths under the new contract.
+class TestNotificationSurfaceUnder134(unittest.TestCase):
+    """Salvaged #132 create/transition coverage, adapted to #134's C-2/H-1 surfaces."""
+
+    def _extract(self, msgs):
+        return _extract_isolated(msgs)
+
+    @staticmethod
+    def _agent_spawn():
+        return [
+            _tu(0, "tu-a1", "Agent", {"name": "finder", "description": "find bugs"}),
+            _tr(1, "tu-a1",
+                "Spawned successfully.\nagent_id: finder@myteam\nname: finder\nteam_name: myteam\n"),
+        ]
+
+    def test_queueop_notification_creates_new_subagent(self):
+        """A completed task-notification on the queue-operation surface for an
+        agent-spawned worker transitions it to 'completed' (C-2 path)."""
+        notif = ("<task-notification><task-id>finder@myteam</task-id>"
+                 "<status>completed</status><result>done</result></task-notification>")
+        state = self._extract(self._agent_spawn() + [_qo(2, notif)])
+        finder = next((s for s in (state.subagents or []) if "finder" in s.agent_id), None) \
+            or next((t for t in (state.teammates or []) if "finder" in (t.name or "")), None)
+        self.assertIsNotNone(finder, "queue-op notification must reach finder")
+        self.assertEqual(finder.status, "completed",
+                         f"queue-op task-notification must set status 'completed'; got {finder.status!r}")
+
+    def test_queueop_notification_transitions_existing_subagent(self):
+        """A queue-op task-notification transitions a pre-registered running subagent
+        (the if-branch). _task_spawn_with_notif now delivers via queue-op."""
+        state = self._extract(_task_spawn_with_notif())
+        finder = next((s for s in (state.subagents or []) if "finder" in s.agent_id), None)
+        self.assertIsNotNone(finder, "Task spawn must pre-register finder@myteam")
+        self.assertEqual(finder.status, "completed",
+                         f"queue-op task-notification must transition to 'completed'; got {finder.status!r}")
+
+    def test_teammate_idle_within_cap_transitions_with_teamname(self):
+        """An idle-notification WITHIN the cap, on a carrier with teamName (H-1),
+        transitions the teammate to idle — the cap doesn't break the happy path."""
+        idle = ('<teammate-message teammate_id="finder" summary="done">'
+                '{"type":"idle_notification","from":"finder"}</teammate-message>')
+        state = self._extract(self._agent_spawn() + [_uc(2, idle, team_name="myteam")])
+        worker = next((t for t in (state.teammates or [])
+                       if "finder" in t.agent_id or "finder" in (t.name or "")), None)
+        self.assertIsNotNone(worker, "finder teammate must be registered")
+        self.assertEqual((worker.status or "").lower(), "idle",
+                         f"idle-notification (teamName present, within cap) must transition to 'idle'; "
+                         f"got {worker.status!r}")
 class TestExtractTeamStateReDoSCap(unittest.TestCase):
     """team.py _TASK_NOTIF_BLOCK_RE.finditer(content) must be capped at _RELOAD_GATE_SCAN_CAP."""
 
