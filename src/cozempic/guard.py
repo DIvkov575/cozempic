@@ -850,20 +850,31 @@ def start_guard(
                 ):
                     # Defer: stay alive, keep cycling at backoff cap.
                     if not deferred_exit_announced:
-                        running_count = sum(
+                        running_subagents = sum(
                             1 for s in state.subagents
-                            if s.status in ("running", "unknown")
+                            if _is_active_subagent(s)
                         )
+                        running_teammates = sum(
+                            1 for t in (getattr(state, "teammates", None) or [])
+                            if _is_active_teammate(t)
+                        )
+                        running_count = running_subagents + running_teammates
                         worst_case_min = (
                             HARD_LOOP_HARD_EXIT_THRESHOLD
                             * HARD_LOOP_BACKOFF_CAP_SECONDS
                             // 60
                         )
+                        parts = []
+                        if running_subagents:
+                            parts.append(f"{running_subagents} subagent(s)")
+                        if running_teammates:
+                            parts.append(f"{running_teammates} teammate(s)")
+                        active_desc = " + ".join(parts) if parts else f"{running_count} agent(s)"
                         print(
                             f"  [{_now()}] K={consecutive_empty_hard_prunes} "
                             f"reached normal exit threshold "
                             f"({HARD_LOOP_EXIT_THRESHOLD}) but "
-                            f"{running_count} subagent(s) still active. "
+                            f"{active_desc} still active. "
                             f"Deferring daemon exit until agents quiesce "
                             f"or K reaches hard cap "
                             f"({HARD_LOOP_HARD_EXIT_THRESHOLD}, "
@@ -893,13 +904,14 @@ def start_guard(
                         # different diagnostic. Do NOT tell the
                         # operator to `/clear` (that destroys
                         # subagent state too).
+                        _hc_desc = _hard_cap_exit_desc(state)
                         print(
                             f"  [{_now()}] Guard hard-cap exit "
                             f"(K={consecutive_empty_hard_prunes} >= "
                             f"{HARD_LOOP_HARD_EXIT_THRESHOLD}). "
-                            f"Subagents are still active; their state "
+                            f"{_hc_desc} still active; their state "
                             f"may be lost on the next compaction. "
-                            f"Consider letting current subagents "
+                            f"Consider letting current agents "
                             f"finish then starting a fresh session.",
                             flush=True,
                         )
@@ -1055,13 +1067,10 @@ def start_guard(
                 if threshold_tokens is not None or soft_threshold_tokens is not None:
                     current_tokens = quick_token_estimate(session_path)
 
-                # Detect if agents are actively running (reload would kill them)
-                agents_active = False
-                if state and not state.is_empty():
-                    agents_active = any(
-                        s.status in ("running", "unknown")
-                        for s in state.subagents
-                    )
+                # Detect if agents are actively running (reload would kill them).
+                # Covers both subagents (Agent-tool spawns) and teammates (Agent-tool
+                # spawned team members tracked in state.teammates).
+                agents_active = _compute_agents_active(state)
                 last_agents_active = agents_active  # C2: remembered for the escalation gate
 
                 # ── E: interactive reload gating ──────────────────────────
@@ -2650,6 +2659,67 @@ _STATUS_TERMINAL = {"completed", "complete", "done", "failed", "cancelled",
 # wedge the gate (a teammate legitimately sits in these between tasks). Kept
 # minimal/conservative — anything not here AND not terminal blocks.
 _TEAMMATE_BENIGN = {"", "config", "idle", "unknown"}
+
+
+def _is_active_subagent(s) -> bool:
+    """Return True if a subagent entry represents an actively-executing task.
+
+    Uses the DENYLIST predicate (not in _STATUS_TERMINAL) rather than an
+    ALLOWLIST so any non-terminal status — including None, empty, or an
+    off-vocabulary working word like "busy" / "in-progress" — is treated as
+    active.  This matches safe_to_reload's subagent check and ensures
+    _compute_agents_active fails safe in the same direction.
+    """
+    return (s.status or "").strip().lower() not in _STATUS_TERMINAL
+
+
+def _is_active_teammate(t) -> bool:
+    """Return True if a teammate entry is actively working.
+
+    Uses the DENYLIST predicate: NOT in (_STATUS_TERMINAL | _TEAMMATE_BENIGN).
+    Mirrors the safe_to_reload teammate check and _compute_agents_active.
+    """
+    return (t.status or "").strip().lower() not in (_STATUS_TERMINAL | _TEAMMATE_BENIGN)
+
+
+def _hard_cap_exit_desc(state) -> str:
+    """Return a concise description of what is still active at hard-cap exit.
+
+    Mirrors the soft-K block active_desc logic so the hard-cap message accurately
+    names the active population (subagent(s), teammate(s), or both) rather than
+    unconditionally saying 'Subagents'.  Extracted for testability — Q-B.
+    """
+    hc_subagents = sum(1 for s in state.subagents if _is_active_subagent(s))
+    hc_teammates = sum(
+        1 for t in (getattr(state, "teammates", None) or [])
+        if _is_active_teammate(t)
+    )
+    parts = []
+    if hc_subagents:
+        parts.append(f"{hc_subagents} subagent(s)")
+    if hc_teammates:
+        parts.append(f"{hc_teammates} teammate(s)")
+    return " + ".join(parts) if parts else "active agent(s)"
+
+
+def _compute_agents_active(state) -> bool:
+    """Return True when any subagent OR teammate is actively running.
+
+    Both populations use DENYLIST predicates (not-in-terminal-set) that
+    mirror safe_to_reload and fail safe on unrecognized or off-vocabulary
+    working statuses (e.g. None, '', 'busy', 'in-progress').
+
+    Subagents: active when NOT in _STATUS_TERMINAL (via _is_active_subagent).
+    Teammates: active when NOT in (_STATUS_TERMINAL | _TEAMMATE_BENIGN) (via _is_active_teammate).
+    """
+    if state is None or state.is_empty():
+        return False
+    if any(_is_active_subagent(s) for s in state.subagents):  # always a list
+        return True
+    return any(
+        _is_active_teammate(t)
+        for t in (getattr(state, "teammates", None) or [])
+    )
 
 
 def _msg_dict(item) -> dict:

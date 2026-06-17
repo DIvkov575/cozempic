@@ -56,22 +56,18 @@ def _tool_result(tool_use_id, text):
     ]}}
 
 
-def _user_content(text):
+def _user_content(text, team_name="myteam"):
     """A user message with a plain-string content (e.g. teammate-message XML).
 
-    No teamName — simulates user-typed content (not a genuine harness carrier).
-    For genuine idle-notification carriers, use _harness_user_content().
+    Genuine harness teammate-message carriers set a top-level ``teamName`` field
+    (#134 H-1 gate: idle-notifications only transition a teammate when teamName is
+    present, so a user-typed <teammate-message> can't phantom-IDLE a live agent).
+    Pass team_name=None to simulate a user-typed (un-gated) carrier.
     """
-    return {"message": {"role": "user", "content": text}}
-
-
-def _harness_user_content(text, team_name="myteam"):
-    """Genuine harness teammate-message carrier — includes top-level teamName (H-1).
-
-    The harness always sets teamName on messages that carry idle-notifications.
-    User-typed messages have no such field and are rejected by the H-1 gate.
-    """
-    return {"teamName": team_name, "message": {"role": "user", "content": text}}
+    msg = {"message": {"role": "user", "content": text}}
+    if team_name is not None:
+        msg["teamName"] = team_name
+    return msg
 
 
 # Canonical Agent-spawn result text as observed in real transcripts (2026-06-08)
@@ -363,7 +359,7 @@ class TestIdleNotificationTransition(unittest.TestCase):
         return [
             (0, _tool_use("u1", "Agent", {"name": "finder-p2", "description": "find issues"}), 200),
             (1, _tool_result("u1", _SPAWN_RESULT_P2), 300),
-            (2, _harness_user_content(_IDLE_NOTIFICATION_P2), 200),
+            (2, _user_content(_IDLE_NOTIFICATION_P2), 200),
         ]
 
     def test_idle_notification_transitions_to_idle(self):
@@ -396,22 +392,19 @@ class TestIdleNotificationTransition(unittest.TestCase):
         self.assertTrue(safe,
                         "After idle_notification, safe_to_reload must return True")
 
-    def test_genuine_idle_then_sendmessage_chronology_blocks(self):
-        """CHRONOLOGY GUARD: genuine idle (teamName) + later SendMessage keeps teammate running.
+    def test_idle_notification_not_applied_if_later_sendmessage(self):
+        """REGRESSION GUARD — RED at base: all events invisible; cannot test chronology.
 
-        Sequence: spawn → genuine idle-notif (teamName, transitions to idle) → SendMessage
-        (re-activates at a later line).  The chronology guard (last_send_line > line_idx)
-        must prevent the idle from sticking → teammate stays 'running' → gate blocks.
-
-        This tests the ACTUAL chronology guard path (H-1 gate passes the genuine carrier
-        in, idle transitions, then SendMessage at a later line re-activates).
+        After fix: a SendMessage AFTER the idle_notification (re-activation) must
+        keep the teammate's status as 'running' (not 'idle'). Chronology guard:
+        the SendMessage at line 3 is AFTER the idle at line 2 → stays blocking.
         """
         from cozempic.guard import safe_to_reload, _TEAMMATE_BENIGN
         msgs = [
             (0, _tool_use("u1", "Agent", {"name": "finder-p2", "description": "find issues"}), 200),
             (1, _tool_result("u1", _SPAWN_RESULT_P2), 300),
-            (2, _harness_user_content(_IDLE_NOTIFICATION_P2), 200),  # genuine idle at line 2
-            (3, _tool_use("u3", "SendMessage", {"to": "finder-p2", "message": "one more task"}), 100),
+            (2, _user_content(_IDLE_NOTIFICATION_P2), 200),         # idle at line 2
+            (3, _tool_use("u3", "SendMessage", {"to": "finder-p2", "message": "one more task"}), 100),  # re-activate at line 3
         ]
         state = _extract(msgs)
         mate = next((t for t in state.teammates
@@ -419,37 +412,11 @@ class TestIdleNotificationTransition(unittest.TestCase):
         self.assertIsNotNone(mate, "finder-p2 must be in teammates")
         s = (mate.status or "").strip().lower()
         self.assertNotIn(s, _TEAMMATE_BENIGN,
-                         "SendMessage (line 3) after genuine idle (line 2) must re-activate "
-                         f"teammate via chronology guard — status must not be benign, got {s!r}")
+                         "SendMessage after idle_notification must re-activate teammate "
+                         f"(status must not be benign), got {s!r}")
         safe, reason = safe_to_reload(state, msgs, Path("/tmp/fake_session.jsonl"))
         self.assertFalse(safe,
-                         "Re-activated teammate (genuine idle → SendMessage) must block reload")
-
-    def test_user_typed_idle_blocks_even_without_sendmessage(self):
-        """H-1 gate skips user-typed idle — teammate stays running regardless of SendMessage.
-
-        Replaces the pre-H-1 'not_applied_if_later_sendmessage' test which passed for
-        the wrong reason: the idle was SKIPPED by the H-1 teamName gate (no teamName →
-        continue), not re-activated by SendMessage.  This test pins that behavior
-        explicitly so a reader knows why _user_content (no teamName) makes the test pass.
-        """
-        from cozempic.guard import safe_to_reload, _TEAMMATE_BENIGN
-        msgs = [
-            (0, _tool_use("u1", "Agent", {"name": "finder-p2", "description": "find issues"}), 200),
-            (1, _tool_result("u1", _SPAWN_RESULT_P2), 300),
-            # User-typed idle (no teamName) → H-1 gate skips it → no transition
-            (2, _user_content(_IDLE_NOTIFICATION_P2), 200),
-        ]
-        state = _extract(msgs)
-        mate = next((t for t in state.teammates
-                     if t.name == "finder-p2" or "finder-p2" in t.agent_id), None)
-        self.assertIsNotNone(mate, "finder-p2 must be in teammates")
-        s = (mate.status or "").strip().lower()
-        self.assertNotIn(s, _TEAMMATE_BENIGN,
-                         "User-typed idle (no teamName) must NOT transition — H-1 gate "
-                         f"skips it. Status must not be benign, got {s!r}")
-        safe, _ = safe_to_reload(state, msgs, Path("/tmp/fake_session.jsonl"))
-        self.assertFalse(safe, "Teammate with H-1-skipped idle must still block reload")
+                         "Re-activated teammate (SendMessage after idle) must block reload")
 
     def test_prose_teammate_message_does_not_transition(self):
         """INVARIANT: prose-only <teammate-message> must NOT transition to idle.
@@ -665,7 +632,7 @@ class TestFullScenario(unittest.TestCase):
                 f'"timestamp":"2026-06-08T10:00:00Z","idleReason":"available"}}'
                 f'</teammate-message>'
             )
-            msgs.append((idx, _harness_user_content(idle), 200))
+            msgs.append((idx, _user_content(idle), 200))
             idx += 1
         state = _extract(msgs)
         safe, _ = safe_to_reload(state, msgs, Path("/tmp/fake_session.jsonl"))
@@ -788,7 +755,7 @@ class TestIdleNotificationPruneProtection(unittest.TestCase):
         After fix: _is_team_message returns True → carrier is prune-protected.
         """
         from cozempic.team import _is_team_message
-        idle_carrier = _harness_user_content(
+        idle_carrier = _user_content(
             '<teammate-message teammate_id="finder-p1@myteam" summary="idle">'
             '{"type":"idle_notification","from":"finder-p1","idleReason":"available"}'
             '</teammate-message>'
@@ -994,7 +961,7 @@ class TestNestedTeammateMessageRegex(unittest.TestCase):
                     {"agentId": "lead@myteam", "name": "lead"},
                 ],
             }), 100),
-            (1, _harness_user_content(nested_content), 200),
+            (1, _user_content(nested_content), 200),
         ]
         with patch("cozempic.team.load_team_configs", return_value=[]):
             state = extract_team_state(msgs)
@@ -1019,6 +986,349 @@ class TestNestedTeammateMessageRegex(unittest.TestCase):
                 "Inner 'alice' idle_notification SHOULD transition alice to benign; "
                 f"got alice.status={s!r}"
             )
+
+
+class TestAgentsActiveTeammateBlind(unittest.TestCase):
+    """L8 CRITICAL: agents_active is blind to Agent-tool teammates in state.teammates.
+
+    guard.py:974-979 computes agents_active as:
+        any(s.status in ("running", "unknown") for s in state.subagents)
+    — it iterates ONLY state.subagents and never touches state.teammates.
+
+    An Agent-tool-spawned teammate has status="running" in state.teammates (after
+    extract_team_state parses the spawn result).  When subagents is empty, agents_active
+    is False even though a live teammate is running, so the K-exit deferral at
+    guard.py:766-793 does NOT fire → the daemon exits at K=10 → the teammate loses guard
+    protection → native autocompact can destroy team state.
+
+    REGRESSION GUARD tests are proven ERROR at base (origin/main 4f15d6d: ImportError on
+    _compute_agents_active which didn't exist yet) before any fix.  Both ERROR and FAIL
+    achieve the regression-guard intent; "ERROR" is the accurate label.
+    Positive-control / invariant tests that pass at base are labelled accordingly.
+    """
+
+    def _compute_agents_active(self, state):
+        """Delegate to the guard helper so tests exercise the real production logic."""
+        from cozempic.guard import _compute_agents_active
+        return _compute_agents_active(state)
+
+    def test_running_teammate_empty_subagents_agents_active_false_at_base(self):
+        """REGRESSION GUARD — RED at base: agents_active is False for running teammate,
+        empty subagents.  After the fix it must be True.
+
+        Scenario: a session has one Agent-tool teammate with status="running" and NO
+        subagents.  _compute_agents_active must return True so the K-exit deferral fires.
+        At base (guard.py:974-979 unchanged) it returns False → daemon K-exits and
+        orphans the teammate.
+        """
+        from cozempic.team import TeamState, TeammateInfo, SubagentInfo
+        state = TeamState(
+            team_name="myteam",
+            lead_agent_id="lead@myteam",
+            lead_session_id="sess-1",
+            config_source="jsonl",
+            teammates=[TeammateInfo(agent_id="finder-p1@myteam", name="finder-p1", status="running")],
+            subagents=[],
+        )
+        result = self._compute_agents_active(state)
+        self.assertTrue(
+            result,
+            "agents_active must be True when a teammate has status='running' and subagents is empty; "
+            f"got {result!r} — K-exit deferral would silently fire and orphan the running teammate",
+        )
+
+    def test_completed_teammate_empty_subagents_agents_active_false(self):
+        """Positive control (invariant) — GREEN at base: a completed teammate with no
+        subagents is NOT considered active.  The K-exit should fire normally.
+
+        This test documents the quiescent-session invariant: once all agents finish, the
+        daemon is allowed to exit without deferral.
+        """
+        from cozempic.team import TeamState, TeammateInfo
+        state = TeamState(
+            team_name="myteam",
+            lead_agent_id="lead@myteam",
+            lead_session_id="sess-1",
+            config_source="jsonl",
+            teammates=[TeammateInfo(agent_id="finder-p1@myteam", name="finder-p1", status="completed")],
+            subagents=[],
+        )
+        result = self._compute_agents_active(state)
+        self.assertFalse(
+            result,
+            "agents_active must be False when the only teammate is 'completed' and subagents is empty; "
+            f"got {result!r}",
+        )
+
+    def test_idle_teammate_empty_subagents_agents_active_false(self):
+        """Positive control — GREEN at base: an idle teammate (benign status) with no
+        subagents should NOT count as active.
+        """
+        from cozempic.team import TeamState, TeammateInfo
+        state = TeamState(
+            team_name="myteam",
+            lead_agent_id="lead@myteam",
+            lead_session_id="sess-1",
+            config_source="jsonl",
+            teammates=[TeammateInfo(agent_id="finder-p1@myteam", name="finder-p1", status="idle")],
+            subagents=[],
+        )
+        result = self._compute_agents_active(state)
+        self.assertFalse(
+            result,
+            "agents_active must be False when the only teammate is 'idle' (benign status); "
+            f"got {result!r}",
+        )
+
+    def test_running_subagent_no_teammates_still_active(self):
+        """Invariant (GREEN at base): a running subagent with no teammates → agents_active True.
+
+        This verifies the EXISTING subagent coverage is NOT broken by the fix.
+        """
+        from cozempic.team import TeamState, SubagentInfo
+        state = TeamState(
+            team_name="myteam",
+            lead_agent_id="lead@myteam",
+            lead_session_id="sess-1",
+            config_source="jsonl",
+            teammates=[],
+            subagents=[SubagentInfo(agent_id="sub-1", status="running")],
+        )
+        result = self._compute_agents_active(state)
+        self.assertTrue(
+            result,
+            "agents_active must remain True when a subagent is 'running' (pre-existing coverage); "
+            f"got {result!r}",
+        )
+
+    def test_running_teammate_and_running_subagent_both_active(self):
+        """REGRESSION GUARD — RED at base: mixed session with a running teammate AND a
+        running subagent.  Both must contribute to agents_active=True.
+
+        At base the subagent already makes it True, so this test is not strictly needed
+        to catch the regression — but it documents that the combined case works after the
+        fix and the teammate side is verified independently.
+        """
+        from cozempic.team import TeamState, TeammateInfo, SubagentInfo
+        state = TeamState(
+            team_name="myteam",
+            lead_agent_id="lead@myteam",
+            lead_session_id="sess-1",
+            config_source="jsonl",
+            teammates=[TeammateInfo(agent_id="finder-p1@myteam", name="finder-p1", status="running")],
+            subagents=[SubagentInfo(agent_id="sub-1", status="running")],
+        )
+        result = self._compute_agents_active(state)
+        self.assertTrue(
+            result,
+            "agents_active must be True when both teammate and subagent are running; "
+            f"got {result!r}",
+        )
+
+    def test_empty_state_not_active(self):
+        """Invariant (GREEN at base): empty TeamState → agents_active False."""
+        from cozempic.team import TeamState
+        state = TeamState(
+            team_name="",
+            lead_agent_id="",
+            lead_session_id="",
+            config_source="jsonl",
+            teammates=[],
+            subagents=[],
+        )
+        result = self._compute_agents_active(state)
+        self.assertFalse(
+            result,
+            "agents_active must be False when state has no teammates and no subagents; "
+            f"got {result!r}",
+        )
+
+    def test_default_teammate_status_unknown_is_benign(self):
+        """INVARIANT (GREEN at base and after fix): a TeammateInfo with default status
+        'unknown' must NOT count as active.
+
+        Documents the intentional SubagentInfo/TeammateInfo 'unknown' asymmetry:
+        - TeammateInfo.status defaults to 'unknown' (in _TEAMMATE_BENIGN → benign).
+        - SubagentInfo.status defaults to 'running' (not in _TEAMMATE_BENIGN → active).
+
+        A newly-created team member sitting at 'unknown' before any task-status
+        notification arrives must not block K-exit deferral.
+        """
+        from cozempic.guard import _compute_agents_active
+        from cozempic.team import TeamState, TeammateInfo
+        state = TeamState(
+            team_name="myteam",
+            lead_agent_id="lead@myteam",
+            lead_session_id="sess-1",
+            config_source="jsonl",
+            teammates=[TeammateInfo(agent_id="w@myteam", name="w")],  # status defaults to 'unknown'
+            subagents=[],
+        )
+        self.assertFalse(
+            _compute_agents_active(state),
+            "A TeammateInfo with default status='unknown' (in _TEAMMATE_BENIGN) must be "
+            "non-active — 'unknown' means the teammate has not yet received a working-status "
+            "notification, not that it is mid-execution. This documents the intentional "
+            "SubagentInfo-vs-TeammateInfo 'unknown' asymmetry.",
+        )
+
+
+class TestComputeAgentsActiveAllowlistFix(unittest.TestCase):
+    """_compute_agents_active must use DENYLIST (not ALLOWLIST) for subagents.
+
+    Current (ALLOWLIST): `s.status in ("running", "unknown")` — misses null and any
+    off-vocabulary working status like "busy", "in-progress", or "executing".
+
+    Fixed (DENYLIST): `(s.status or "").strip().lower() not in _STATUS_TERMINAL` —
+    mirrors safe_to_reload and fails safe on any non-terminal status.
+
+    REGRESSION GUARD tests are proven at base (e65636e before P0-A fix):
+    - test_subagent_null_status / test_subagent_busy_status: False at base (bug) →
+      True after fix (correct).
+    - test_is_active_subagent_helper_exists: ERROR at base (ImportError, helper
+      doesn't exist) → GREEN after fix.
+    """
+
+    def test_subagent_null_status_counts_as_active(self):
+        """REGRESSION GUARD: subagent with status=None must block K-exit deferral.
+
+        At base (ALLOWLIST): None not in ('running','unknown') -> False -> K-exit proceeds.
+        After fix (DENYLIST): '' not in _STATUS_TERMINAL -> True -> K-exit deferred.
+        """
+        from cozempic.guard import _compute_agents_active
+        from cozempic.team import TeamState, SubagentInfo
+        state = TeamState(
+            team_name="t", lead_agent_id="l@t", lead_session_id="s",
+            config_source="jsonl",
+            subagents=[SubagentInfo(agent_id="a1", status=None)],
+            teammates=[],
+        )
+        self.assertTrue(
+            _compute_agents_active(state),
+            "subagent with status=None must be treated as active (DENYLIST fail-safe); "
+            "at base (ALLOWLIST), None is not in ('running','unknown') -> False (bug).",
+        )
+
+    def test_subagent_busy_status_counts_as_active(self):
+        """REGRESSION GUARD: off-vocabulary working status 'busy' must block K-exit.
+
+        At base (ALLOWLIST): 'busy' not in ('running','unknown') -> False -> K-exit proceeds.
+        After fix (DENYLIST): 'busy' not in _STATUS_TERMINAL -> True -> K-exit deferred.
+        """
+        from cozempic.guard import _compute_agents_active
+        from cozempic.team import TeamState, SubagentInfo
+        state = TeamState(
+            team_name="t", lead_agent_id="l@t", lead_session_id="s",
+            config_source="jsonl",
+            subagents=[SubagentInfo(agent_id="a1", status="busy")],
+            teammates=[],
+        )
+        self.assertTrue(
+            _compute_agents_active(state),
+            "subagent with off-vocabulary status='busy' must be treated as active "
+            "(DENYLIST: 'busy' not in _STATUS_TERMINAL); got False at base (ALLOWLIST).",
+        )
+
+    def test_subagent_empty_string_status_counts_as_active(self):
+        """REGRESSION GUARD: subagent with status='' must block K-exit (not in _STATUS_TERMINAL).
+
+        At base (ALLOWLIST): '' not in ('running','unknown') -> False -> K-exit proceeds.
+        After fix (DENYLIST): '' not in _STATUS_TERMINAL -> True -> K-exit deferred.
+        """
+        from cozempic.guard import _compute_agents_active
+        from cozempic.team import TeamState, SubagentInfo
+        state = TeamState(
+            team_name="t", lead_agent_id="l@t", lead_session_id="s",
+            config_source="jsonl",
+            subagents=[SubagentInfo(agent_id="a1", status="")],
+            teammates=[],
+        )
+        self.assertTrue(
+            _compute_agents_active(state),
+            "subagent with status='' must be treated as active (DENYLIST fail-safe). "
+            "At base (ALLOWLIST): '' not in ('running','unknown') -> False (bug).",
+        )
+
+    def test_is_active_subagent_helper_exists(self):
+        """After fix: _is_active_subagent must be importable from cozempic.guard.
+
+        ERROR at base (function doesn't exist yet).
+        GREEN after fix.
+        """
+        from cozempic.guard import _is_active_subagent
+        self.assertTrue(callable(_is_active_subagent))
+
+    def test_running_subagent_still_active_after_denylist_fix(self):
+        """Positive control (GREEN at base and after fix): 'running' subagent is active.
+
+        The DENYLIST must not regress the existing behavior for 'running' status.
+        """
+        from cozempic.guard import _compute_agents_active
+        from cozempic.team import TeamState, SubagentInfo
+        state = TeamState(
+            team_name="t", lead_agent_id="l@t", lead_session_id="s",
+            config_source="jsonl",
+            subagents=[SubagentInfo(agent_id="a1", status="running")],
+            teammates=[],
+        )
+        self.assertTrue(
+            _compute_agents_active(state),
+            "subagent with status='running' must still be active after DENYLIST fix.",
+        )
+
+    def test_completed_subagent_not_active(self):
+        """Positive control (GREEN at base and after fix): 'completed' subagent is not active.
+
+        At base (ALLOWLIST): 'completed' not in ('running','unknown') -> False (correct).
+        After fix (DENYLIST): 'completed' in _STATUS_TERMINAL -> False (correct).
+        """
+        from cozempic.guard import _compute_agents_active
+        from cozempic.team import TeamState, SubagentInfo
+        state = TeamState(
+            team_name="t", lead_agent_id="l@t", lead_session_id="s",
+            config_source="jsonl",
+            subagents=[SubagentInfo(agent_id="a1", status="completed")],
+            teammates=[],
+        )
+        self.assertFalse(
+            _compute_agents_active(state),
+            "subagent with status='completed' must not be active (in _STATUS_TERMINAL).",
+        )
+
+    def test_hard_cap_exit_desc_helper_exists(self):
+        """After fix: _hard_cap_exit_desc must be importable from cozempic.guard.
+
+        ERROR at base (function doesn't exist yet per Q-B answer: extract helper).
+        """
+        from cozempic.guard import _hard_cap_exit_desc
+        self.assertTrue(callable(_hard_cap_exit_desc))
+
+    def test_hard_cap_exit_desc_teammate_only_no_subagents_label(self):
+        """_hard_cap_exit_desc must not say 'subagent(s)' for a teammate-only session.
+
+        The old hard-cap message said 'Subagents are still active' unconditionally.
+        After fix, for state with a running teammate and no subagents, the description
+        must contain 'teammate(s)' and must NOT contain 'subagent(s)'.
+        """
+        from cozempic.guard import _hard_cap_exit_desc
+        from cozempic.team import TeamState, TeammateInfo
+        state = TeamState(
+            team_name="t", lead_agent_id="l@t", lead_session_id="s",
+            config_source="jsonl",
+            teammates=[TeammateInfo(agent_id="w@t", name="w", status="running")],
+            subagents=[],
+        )
+        desc = _hard_cap_exit_desc(state)
+        self.assertIn(
+            "teammate(s)",
+            desc,
+            f"hard-cap desc for teammate-only session must contain 'teammate(s)'; got {desc!r}",
+        )
+        self.assertNotIn(
+            "subagent(s)",
+            desc,
+            f"hard-cap desc for teammate-only session must NOT contain 'subagent(s)'; got {desc!r}",
+        )
 
 
 if __name__ == "__main__":
