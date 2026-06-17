@@ -2550,6 +2550,15 @@ _AGENT_LAUNCH_RE = re.compile(r"Async agent launched successfully\.?\s*agentId:\
 _WF_LAUNCH_RE = re.compile(r"[Ww]orkflow launched in (?:the )?background[.,]?\s*(?:Task|Run) ID:\s*([A-Za-z0-9_-]+)", re.IGNORECASE)
 _BG_LAUNCH_RE = re.compile(r"running in (?:the )?background(?: with| \()?\s*ID[:=]?\s*([A-Za-z0-9_-]+)", re.IGNORECASE)
 _TN_BLOCK_RE = re.compile(r"<task-notification(?:\s[^>]*)?>(.*?)</task-notification>", re.DOTALL | re.IGNORECASE)
+# Maximum bytes of text fed into the block-regex scanners in detect_in_flight and
+# extract_team_state.  Both regexes use DOTALL lazy-star (.*?) which is
+# O(openers × len) when there are many openers without closers — catastrophic
+# backtracking that can freeze the 30-second checkpoint/reload-gate loop.
+# 64KB is ~64× the size of a real task-notification; a notification beyond this
+# cap is MISSED → the launch stays "in-flight" → the gate OVER-DEFERS the reload
+# (recoverable). It never UNDER-BLOCKS, which would SIGKILL.  Mirrors recap.py's
+# own DoS guard (text[:32768] and text[:8000]) introduced for system-reminder tags.
+_RELOAD_GATE_SCAN_CAP = 65536
 _TN_ID_RE = re.compile(r"<task-id>([^<]+)</task-id>", re.IGNORECASE)
 _TN_STATUS_RE = re.compile(r"<status>([^<]+)</status>", re.IGNORECASE)
 # Terminal completion vocabulary — broadened so a harness phrasing skew (success/
@@ -2595,21 +2604,28 @@ def _block_text(b: dict) -> str:
 
 
 def _completion_text(msg: dict) -> str:
-    """Text from a message's GENUINE harness-delivery surfaces only — the root
-    `content` string (queue-operation notifications, verified to be where real
-    task-notifications land) and a user message's top-level string content. It
-    deliberately EXCLUDES tool_result blocks and assistant text blocks, so a
-    <task-notification> merely quoted/echoed inside some tool's output or the
-    model's prose cannot CLEAR a genuinely in-flight launch (a false-negative →
-    SIGKILL). Mirror of the launch side's tool-type correlation."""
-    parts = []
+    """Text from a message's GENUINE harness-delivery surfaces only.
+
+    Genuine surfaces:
+      * root `content` string: queue-operation notifications (harness-written,
+        verified against tests/fixtures/harness/*.jsonl 2026-06-09).
+
+    EXCLUDED deliberately:
+      * `message.content` STRING: user-typed free text. A user can type any
+        <task-notification> string to phantom-clear a genuinely live launch
+        (→ SIGKILL). Principle: a completion-matcher must FAIL TOWARD over-block
+        (missed clear → defer reload → recoverable) NEVER under-block
+        (phantom-clear → SIGKILL live work → unrecoverable).
+      * tool_result blocks: handled by the launch-extractor loop (launch side).
+      * assistant text: not a completion-delivery surface.
+
+    Completions are scanned only on genuine harness-delivery surfaces
+    (queue-operation root content); user-typed text is excluded.
+    """
     root = msg.get("content")
     if isinstance(root, str):
-        parts.append(root)
-    c = (msg.get("message") or {}).get("content")
-    if isinstance(c, str):
-        parts.append(c)
-    return "\n".join(parts)
+        return root
+    return ""
 
 
 # Which tool a launch marker must be paired with to count as a REAL launch (vs a
@@ -2632,8 +2648,9 @@ def detect_in_flight(messages) -> dict:
     or in the model's prose can't fabricate a PHANTOM in-flight task that wedges
     the gate (verified against a live workflow run). A result whose tool_use was
     pruned away is credited conservatively, so a REAL launch is never missed (the
-    catastrophic direction). Completions are matched broadly — they only ever
-    CLEAR an id, so a quoted one is harmless.
+    catastrophic direction). Completions are scanned only on genuine
+    harness-delivery surfaces (queue-operation root content); user-typed
+    message.content is excluded to prevent phantom-clears (→ SIGKILL).
     """
     launched_wf: set[str] = set()
     launched_bg: set[str] = set()
@@ -2651,7 +2668,7 @@ def detect_in_flight(messages) -> dict:
             continue
         text = _completion_text(msg)   # genuine deliveries only (not quoted/echoed)
         if text:
-            for blk in _TN_BLOCK_RE.findall(text):
+            for blk in _TN_BLOCK_RE.findall(text[:_RELOAD_GATE_SCAN_CAP]):
                 ids = _TN_ID_RE.findall(blk)
                 sts = _TN_STATUS_RE.findall(blk)
                 if ids and sts and sts[-1].strip().lower() in _INFLIGHT_DONE:

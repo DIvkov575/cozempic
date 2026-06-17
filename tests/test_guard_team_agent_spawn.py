@@ -57,8 +57,21 @@ def _tool_result(tool_use_id, text):
 
 
 def _user_content(text):
-    """A user message with a plain-string content (e.g. teammate-message XML)."""
+    """A user message with a plain-string content (e.g. teammate-message XML).
+
+    No teamName — simulates user-typed content (not a genuine harness carrier).
+    For genuine idle-notification carriers, use _harness_user_content().
+    """
     return {"message": {"role": "user", "content": text}}
+
+
+def _harness_user_content(text, team_name="myteam"):
+    """Genuine harness teammate-message carrier — includes top-level teamName (H-1).
+
+    The harness always sets teamName on messages that carry idle-notifications.
+    User-typed messages have no such field and are rejected by the H-1 gate.
+    """
+    return {"teamName": team_name, "message": {"role": "user", "content": text}}
 
 
 # Canonical Agent-spawn result text as observed in real transcripts (2026-06-08)
@@ -350,7 +363,7 @@ class TestIdleNotificationTransition(unittest.TestCase):
         return [
             (0, _tool_use("u1", "Agent", {"name": "finder-p2", "description": "find issues"}), 200),
             (1, _tool_result("u1", _SPAWN_RESULT_P2), 300),
-            (2, _user_content(_IDLE_NOTIFICATION_P2), 200),
+            (2, _harness_user_content(_IDLE_NOTIFICATION_P2), 200),
         ]
 
     def test_idle_notification_transitions_to_idle(self):
@@ -383,19 +396,22 @@ class TestIdleNotificationTransition(unittest.TestCase):
         self.assertTrue(safe,
                         "After idle_notification, safe_to_reload must return True")
 
-    def test_idle_notification_not_applied_if_later_sendmessage(self):
-        """REGRESSION GUARD — RED at base: all events invisible; cannot test chronology.
+    def test_genuine_idle_then_sendmessage_chronology_blocks(self):
+        """CHRONOLOGY GUARD: genuine idle (teamName) + later SendMessage keeps teammate running.
 
-        After fix: a SendMessage AFTER the idle_notification (re-activation) must
-        keep the teammate's status as 'running' (not 'idle'). Chronology guard:
-        the SendMessage at line 3 is AFTER the idle at line 2 → stays blocking.
+        Sequence: spawn → genuine idle-notif (teamName, transitions to idle) → SendMessage
+        (re-activates at a later line).  The chronology guard (last_send_line > line_idx)
+        must prevent the idle from sticking → teammate stays 'running' → gate blocks.
+
+        This tests the ACTUAL chronology guard path (H-1 gate passes the genuine carrier
+        in, idle transitions, then SendMessage at a later line re-activates).
         """
         from cozempic.guard import safe_to_reload, _TEAMMATE_BENIGN
         msgs = [
             (0, _tool_use("u1", "Agent", {"name": "finder-p2", "description": "find issues"}), 200),
             (1, _tool_result("u1", _SPAWN_RESULT_P2), 300),
-            (2, _user_content(_IDLE_NOTIFICATION_P2), 200),         # idle at line 2
-            (3, _tool_use("u3", "SendMessage", {"to": "finder-p2", "message": "one more task"}), 100),  # re-activate at line 3
+            (2, _harness_user_content(_IDLE_NOTIFICATION_P2), 200),  # genuine idle at line 2
+            (3, _tool_use("u3", "SendMessage", {"to": "finder-p2", "message": "one more task"}), 100),
         ]
         state = _extract(msgs)
         mate = next((t for t in state.teammates
@@ -403,11 +419,37 @@ class TestIdleNotificationTransition(unittest.TestCase):
         self.assertIsNotNone(mate, "finder-p2 must be in teammates")
         s = (mate.status or "").strip().lower()
         self.assertNotIn(s, _TEAMMATE_BENIGN,
-                         "SendMessage after idle_notification must re-activate teammate "
-                         f"(status must not be benign), got {s!r}")
+                         "SendMessage (line 3) after genuine idle (line 2) must re-activate "
+                         f"teammate via chronology guard — status must not be benign, got {s!r}")
         safe, reason = safe_to_reload(state, msgs, Path("/tmp/fake_session.jsonl"))
         self.assertFalse(safe,
-                         "Re-activated teammate (SendMessage after idle) must block reload")
+                         "Re-activated teammate (genuine idle → SendMessage) must block reload")
+
+    def test_user_typed_idle_blocks_even_without_sendmessage(self):
+        """H-1 gate skips user-typed idle — teammate stays running regardless of SendMessage.
+
+        Replaces the pre-H-1 'not_applied_if_later_sendmessage' test which passed for
+        the wrong reason: the idle was SKIPPED by the H-1 teamName gate (no teamName →
+        continue), not re-activated by SendMessage.  This test pins that behavior
+        explicitly so a reader knows why _user_content (no teamName) makes the test pass.
+        """
+        from cozempic.guard import safe_to_reload, _TEAMMATE_BENIGN
+        msgs = [
+            (0, _tool_use("u1", "Agent", {"name": "finder-p2", "description": "find issues"}), 200),
+            (1, _tool_result("u1", _SPAWN_RESULT_P2), 300),
+            # User-typed idle (no teamName) → H-1 gate skips it → no transition
+            (2, _user_content(_IDLE_NOTIFICATION_P2), 200),
+        ]
+        state = _extract(msgs)
+        mate = next((t for t in state.teammates
+                     if t.name == "finder-p2" or "finder-p2" in t.agent_id), None)
+        self.assertIsNotNone(mate, "finder-p2 must be in teammates")
+        s = (mate.status or "").strip().lower()
+        self.assertNotIn(s, _TEAMMATE_BENIGN,
+                         "User-typed idle (no teamName) must NOT transition — H-1 gate "
+                         f"skips it. Status must not be benign, got {s!r}")
+        safe, _ = safe_to_reload(state, msgs, Path("/tmp/fake_session.jsonl"))
+        self.assertFalse(safe, "Teammate with H-1-skipped idle must still block reload")
 
     def test_prose_teammate_message_does_not_transition(self):
         """INVARIANT: prose-only <teammate-message> must NOT transition to idle.
@@ -623,7 +665,7 @@ class TestFullScenario(unittest.TestCase):
                 f'"timestamp":"2026-06-08T10:00:00Z","idleReason":"available"}}'
                 f'</teammate-message>'
             )
-            msgs.append((idx, _user_content(idle), 200))
+            msgs.append((idx, _harness_user_content(idle), 200))
             idx += 1
         state = _extract(msgs)
         safe, _ = safe_to_reload(state, msgs, Path("/tmp/fake_session.jsonl"))
@@ -746,7 +788,7 @@ class TestIdleNotificationPruneProtection(unittest.TestCase):
         After fix: _is_team_message returns True → carrier is prune-protected.
         """
         from cozempic.team import _is_team_message
-        idle_carrier = _user_content(
+        idle_carrier = _harness_user_content(
             '<teammate-message teammate_id="finder-p1@myteam" summary="idle">'
             '{"type":"idle_notification","from":"finder-p1","idleReason":"available"}'
             '</teammate-message>'
@@ -952,7 +994,7 @@ class TestNestedTeammateMessageRegex(unittest.TestCase):
                     {"agentId": "lead@myteam", "name": "lead"},
                 ],
             }), 100),
-            (1, _user_content(nested_content), 200),
+            (1, _harness_user_content(nested_content), 200),
         ]
         with patch("cozempic.team.load_team_configs", return_value=[]):
             state = extract_team_state(msgs)

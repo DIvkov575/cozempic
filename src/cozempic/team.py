@@ -404,6 +404,13 @@ _TEAM_EXTRACT_TOOL_NAMES = TEAM_TOOL_NAMES | {"Agent"}
 # a strict task-id→status regex misses → a COMPLETED background-Agent teammate is left
 # "running" forever → safe_to_reload wedges the guard inert. Mirrors detect_in_flight's
 # lenient _TN_*_RE so the two parsers agree on the same bytes.
+# Maximum bytes of content fed into the DOTALL lazy-star block-regex scanner in
+# extract_team_state's second pass.  Without a cap, many unmatched openers trigger
+# O(openers × len) catastrophic backtracking — same class as recap.py's DoS guard.
+# 64KB is ~64× a real notification; a missed notification → over-defers reload
+# (recoverable, not under-blocks / SIGKILL).  Mirrors guard._RELOAD_GATE_SCAN_CAP.
+_RELOAD_GATE_SCAN_CAP = 65536
+
 _TASK_NOTIF_BLOCK_RE = re.compile(
     r"<task-notification(?:\s[^>]*)?>(.*?)</task-notification>", re.DOTALL | re.IGNORECASE)
 _TASK_NOTIF_ID_RE = re.compile(r"<task-id(?:\s[^>]*)?>([^<]+)</task-id>", re.IGNORECASE)
@@ -922,28 +929,52 @@ def extract_team_state(messages: list[Message]) -> TeamState:
                         state.team_name = team_m.group(1).strip()
 
     # ── Second pass: scan for task-notifications and idle-notifications ──
-    # Both XML patterns live in string content (user messages or queue-operations).
-    # Combining them in one pass avoids a third full-transcript scan.
+    # Both XML patterns live in string content (user messages or queue-operations),
+    # but with different surface restrictions:
     #
-    # Sources:
-    #   task-notification — <task-notification>…</task-notification> (subagent done)
-    #   idle_notification — <teammate-message teammate_id="X">{"type":"idle_notification"…}
+    #   task-notification — QUEUE-OPERATION ROOT CONTENT ONLY.
+    #     Reason: a user can type (or paste) any <task-notification> string.  If the
+    #     second pass accepted user-typed message.content it would phantom-TERMINATE a
+    #     live teammate, making safe_to_reload return True → SIGKILL (PR-8 C-2 fix).
+    #     Fail-safe: a missed completion → teammate stays "running" → gate over-defers
+    #     (recoverable), never under-blocks (SIGKILL).
+    #
+    #   idle_notification — STRING message.content OR queue-operation, but ONLY from
+    #     genuine harness carriers (top-level teamName field required — H-1 fix).
+    #     Reason: a user can type <teammate-message teammate_id="X">{"type":"idle_
+    #     notification",...}</teammate-message> in plain content.  Without the teamName
+    #     gate, the idle-notif scan would transition the teammate to "idle" → gate
+    #     returns True → SIGKILL live work (phantom-IDLE, unrecoverable).
+    #     The harness always sets teamName on genuine teammate-message carriers
+    #     (confirmed: 220/220 genuine carriers have teamName; 0/220 user-typed do).
+    #     Fail-safe: a genuine idle-notif on a message without teamName is MISSED →
+    #     teammate stays "running" → gate over-defers (recoverable), never under-blocks.
     for line_idx, msg, byte_size in messages:
-        # Extract content string from either schema
         if msg.get("type") == "queue-operation":
-            content = msg.get("content", "")
+            _raw_content = msg.get("content", "")
+            # B: guard against JSON null (content=None) — coerce to "" so the
+            # finditer call below never sees a NoneType (TypeError).
+            _task_notif_content = _raw_content if isinstance(_raw_content, str) else ""
+            # D: queue-ops never carry teamName → H-1 gate will always skip the
+            # idle-notif scan for them.  Set "" explicitly rather than aliasing
+            # _task_notif_content to avoid a latent hazard if the gate is ever relaxed.
+            _idle_notif_content = ""
         else:
             inner = msg.get("message", {})
-            content = inner.get("content", "")
-
-        if not isinstance(content, str):
-            continue
+            raw = inner.get("content", "")
+            # task-notifications: queue-operation only (see comment above — C-2).
+            _task_notif_content = ""
+            # idle-notifications: string content, but only when teamName present (H-1).
+            _idle_notif_content = raw if isinstance(raw, str) else ""
 
         # ── task-notifications ────────────────────────────────────────────
         # Parse each notification block, then its fields INDEPENDENTLY (order- and
         # extra-tag tolerant) so the REAL format (<tool-use-id>/<output-file> between
         # <task-id> and <status>) still clears a completed teammate/subagent.
-        for _blk in _TASK_NOTIF_BLOCK_RE.finditer(content):
+        # Efficiency: _task_notif_content="" for every non-queue-op message (the
+        # common case) — skip the regex entirely rather than matching against "".
+        for _blk in (_TASK_NOTIF_BLOCK_RE.finditer(_task_notif_content[:_RELOAD_GATE_SCAN_CAP])
+                     if _task_notif_content else ()):
             _body = _blk.group(1)
             _id_m = _TASK_NOTIF_ID_RE.search(_body)
             _st_m = _TASK_NOTIF_STATUS_RE.search(_body)
@@ -983,12 +1014,31 @@ def extract_team_state(messages: list[Message]) -> TeamState:
                     seen_teammates[candidate].status = status
                     break
 
-            state.message_count += 1
+        state.message_count += 1
 
         # ── idle-notifications (P0-D) ────────────────────────────────────
         # <teammate-message teammate_id="X">{"type":"idle_notification",...}</teammate-message>
         # Transition status to "idle" UNLESS a later SendMessage re-activated it.
-        for tm_match in _TEAMMATE_MSG_RE.finditer(content):
+        # Fail-safe: a teammate-message beyond the cap is MISSED → teammate
+        # stays "running" → safe_to_reload/agents_active keep it protected →
+        # gate OVER-DEFERS (recoverable), never UNDER-BLOCKS (SIGKILL).
+        #
+        # H-1: require top-level teamName to authenticate the carrier.  Genuine
+        # harness idle-notification messages always carry teamName; user-typed
+        # messages never do.  A missing teamName → skip (over-defer, recoverable).
+        #
+        # H1-B RESIDUAL (DEFERRED): this is a presence-check, not a cryptographic
+        # authenticator.  A user who knows about teamName could craft a message with
+        # any teamName value and bypass this gate (e.g. user types a fake carrier with
+        # teamName="cozempic-pipeline").  Closing H1-B would require a harness-stamped
+        # sender field (like the C-3 residual which needs a structural nested_agent_id
+        # marker) that user-typed text cannot forge.  Until then H-1 raises the bar
+        # from zero knowledge (anyone can trigger it) to harness knowledge (only someone
+        # who knows and sets teamName) — a meaningful improvement in a trusted-user
+        # context.  Track: same follow-up PR as C-3.
+        if not msg.get("teamName"):
+            continue
+        for tm_match in _TEAMMATE_MSG_RE.finditer(_idle_notif_content[:_RELOAD_GATE_SCAN_CAP]):
             tm_id = tm_match.group(1).strip()
             tm_body = tm_match.group(2)
             resolved = _name_to_agent_id.get(tm_id, tm_id)
