@@ -157,7 +157,7 @@ def _lifetime_band(ledger: dict | None) -> str:
     )
     since = f" since {_esc(ledger['since'])}" if ledger.get("since") else ""
     return (
-        '<section class="lifetime"><div class="lt-title">Lifetime — All Time</div>'
+        '<section class="lifetime"><div class="lt-title">Lifetime</div>'
         f'<div class="lt-row">{cells}</div>'
         f'<div class="lt-since">Running totals from ~/.cozempic_savings.json{since}</div></section>'
     )
@@ -196,13 +196,19 @@ def render_html(data: dict, *, generated_ts: str, source_label: str = "",
             f"<td>{_fmt_int(a.get('committed', 0))}</td><td>{_esc(_fmt_tokens(a.get('tokens_reclaimed', 0)))}</td></tr>"
             for a in per_agent
         )
+        _SESS_CAP = 50
         sess_rows = "".join(
             f'<tr><td class="mono">{_esc((s.get("session") or "")[:14])}</td>'
             f'<td><span class="pill">{_esc(_pretty_label(s.get("agent")))}</span></td>'
             f"<td>{_fmt_int(s.get('prunes', 0))}</td>"
             f"<td>{_esc(_fmt_tokens(s.get('tokens_reclaimed', 0)))}</td>"
             f"<td>{_sparkline(s.get('timeline', []))}</td></tr>"
-            for s in per_session[:50]
+            for s in per_session[:_SESS_CAP]
+        )
+        sess_more = (
+            f'<div class="sub2">Showing the {_SESS_CAP} most-recently-active of '
+            f"{_fmt_int(len(per_session))} sessions.</div>"
+            if len(per_session) > _SESS_CAP else ""
         )
         body = f"""
         {_RECORDED_INTRO}
@@ -213,7 +219,7 @@ def render_html(data: dict, *, generated_ts: str, source_label: str = "",
           {agent_rows}</table></section>
         <section><h2>Sessions <span class="pill">Context % Over Time</span></h2><table>
           <tr><th>Session</th><th>Agent</th><th>Prunes</th><th>Reclaimed</th><th>Context Trend</th></tr>
-          {sess_rows}</table></section>
+          {sess_rows}</table>{sess_more}</section>
         """
 
     src = f" · {_esc(source_label)}" if source_label else ""
