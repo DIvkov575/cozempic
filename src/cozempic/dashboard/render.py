@@ -172,26 +172,21 @@ def render_html(data: dict, *, generated_ts: str, source_label: str = "",
     by_tier = data.get("by_tier", {}) or {}
     per_session = data.get("per_session", []) or []
 
-    _RECORDED_NOTE = ('<div class="sub2">Detailed per-prune history from receipts '
-                      "(~/.cozempic/receipts) — newer than, and separate from, the lifetime "
-                      'totals above. Fills in as cozempic prunes.</div>')
+    # Per-prune DETAIL (from receipts) — the lifetime band above is the single
+    # headline, so this section is the breakdown the ledger can't show (which
+    # strategies, tiers, sessions), NOT a second set of summary cards.
+    _RECORDED_INTRO = (
+        '<div class="sub2"><b style="color:var(--fg)">Recorded Prunes</b> — per-prune '
+        "detail from receipts (~/.cozempic/receipts), separate from the all-time totals "
+        "above; fills in as cozempic prunes.</div>"
+    )
     if not lt.get("prunes_total"):
         body = (
-            '<section><h2>Recorded Prunes</h2>' + _RECORDED_NOTE +
-            '<p class="empty">No prunes recorded yet. Run '
+            _RECORDED_INTRO +
+            '<section><p class="empty">No prunes recorded yet. Run '
             "<span class=\"mono\">cozempic treat --execute</span> and they'll appear here.</p></section>"
         )
     else:
-        cards = "".join(
-            f'<div class="card"><div class="n">{_esc(n)}</div><div class="l">{_esc(l)}</div></div>'
-            for n, l in (
-                (_fmt_tokens(lt.get("tokens_reclaimed", 0)), "Tokens Reclaimed"),
-                (_fmt_bytes(lt.get("bytes_reclaimed", 0)), "Bytes Reclaimed"),
-                (_fmt_int(lt.get("committed", 0)), "Prunes Applied"),
-                (_fmt_int(lt.get("sessions", 0)), "Sessions"),
-                (f"{(lt.get('deferral_rate') or 0) * 100:.0f}%", "Deferral Rate"),
-            )
-        )
         strat_bars = _bar_rows(per_strategy, "id", "tokens_reclaimed", _fmt_tokens)
         tier_rows = [{"tier": str(k), "count": v}
                      for k, v in sorted(by_tier.items(), key=lambda kv: str(kv[0]))]
@@ -210,7 +205,7 @@ def render_html(data: dict, *, generated_ts: str, source_label: str = "",
             for s in per_session[:50]
         )
         body = f"""
-        <section><h2>Recorded Prunes</h2>{_RECORDED_NOTE}<div class="cards">{cards}</div></section>
+        {_RECORDED_INTRO}
         <section><h2>Savings by Strategy</h2>{strat_bars}</section>
         <section><h2>Prunes by Tier</h2>{tier_bars}</section>
         <section><h2>By Agent</h2><table>

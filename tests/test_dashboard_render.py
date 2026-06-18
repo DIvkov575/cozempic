@@ -93,12 +93,12 @@ class TestRenderHtml(unittest.TestCase):
         self.assertIn("width:0.0%", h)
 
     def test_negative_values_formatted(self):
-        d = _data()
-        d["lifetime"]["tokens_reclaimed"] = -5000
-        d["lifetime"]["bytes_reclaimed"] = -2048
-        h = render_html(d, generated_ts="t")
-        self.assertIn("-5.0K", h)
-        self.assertIn("-2.0 KB", h)
+        # negative reclaim formats correctly (tested at the formatter level since
+        # the summary cards were removed as redundant with the lifetime band)
+        from cozempic.dashboard.render import _fmt_bytes, _fmt_tokens
+
+        self.assertEqual(_fmt_tokens(-5000), "-5.0K")
+        self.assertEqual(_fmt_bytes(-2048), "-2.0 KB")
 
     def test_deferral_rate_none_safe(self):
         d = _data()
