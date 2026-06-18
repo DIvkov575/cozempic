@@ -56,9 +56,9 @@ class TestRenderHtml(unittest.TestCase):
 
     def test_renders_metrics_and_chart(self):
         h = render_html(_data(), generated_ts="t")
-        self.assertIn("tokens reclaimed", h)
+        self.assertIn("Tokens Reclaimed", h)
         self.assertIn("1.5K", h)  # 1500 tokens formatted
-        self.assertIn("tool-output-trim", h)
+        self.assertIn("Tool Output Trim", h)  # strategy slug -> Title Case name
         self.assertIn("<svg", h)  # session sparkline rendered
         self.assertIn("polyline", h)
 
@@ -84,7 +84,7 @@ class TestRenderHtml(unittest.TestCase):
     def test_non_string_tier_key_does_not_crash(self):
         # D2 can emit a numeric tier key if a receipt's trigger.tier is a number
         h = render_html(_data(by_tier={5: 1, "gentle": 2}), generated_ts="t")
-        self.assertIn("gentle", h)  # no TypeError on sorted()
+        self.assertIn("Gentle", h)  # no TypeError on sorted(); tier slug -> Title Case
 
     def test_all_zero_bars_no_divzero(self):
         d = _data(per_strategy=[{"id": "a", "tier": "t", "tokens_reclaimed": 0,
@@ -142,7 +142,7 @@ class TestWriteDashboard(unittest.TestCase):
                                 ts="2026-06-16T09:00:00Z", receipt_id="r1")
             write_receipt(rec, base_dir=base)
             h = render_dashboard(base, generated_ts="now")
-            self.assertIn("tool-output-trim", h)
+            self.assertIn("Tool Output Trim", h)
             self.assertIn("500", h)  # tokens reclaimed shows up somewhere
 
     def test_write_failure_cleans_temp_and_reraises(self):
