@@ -150,7 +150,7 @@ class TestLifetimeBand(unittest.TestCase):
     def test_no_band_without_ledger(self):
         h = render_html({"lifetime": {"prunes_total": 0}}, generated_ts="t", ledger=None)
         self.assertNotIn('<section class="lifetime">', h)  # no band section emitted
-        self.assertNotIn("Lifetime — All Time", h)  # band header absent
+        self.assertNotIn("Running totals from", h)  # band footer absent (no band)
 
     def test_band_shows_session_multiplier_chip(self):
         h = render_html({"lifetime": {"prunes_total": 0}}, generated_ts="t",
