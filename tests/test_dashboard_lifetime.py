@@ -137,12 +137,12 @@ class TestLifetimeBand(unittest.TestCase):
     def test_band_rendered_with_ledger(self):
         h = render_html({"lifetime": {"prunes_total": 0}}, generated_ts="t", ledger=self._LEDGER)
         self.assertIn("456.2M", h)
-        self.assertIn("tokens reclaimed (lifetime)", h)
+        self.assertIn("Tokens Reclaimed", h)
         self.assertIn("3,309", h)
         self.assertIn("~23,394", h)  # tilde = estimate, not a hard count
-        self.assertIn("est. extra turns", h)
+        self.assertIn("Est. Extra Turns", h)
         self.assertIn("17.5%", h)
-        self.assertIn("reclaimed of processed", h)  # honest label, not "avg reclaimed"
+        self.assertIn("Reclaimed of Processed", h)  # honest label, not "avg reclaimed"
         self.assertIn("since 2026-04-09", h)
         # band shows even when there are no receipts yet
         self.assertIn("No prunes recorded yet", h)
@@ -150,13 +150,13 @@ class TestLifetimeBand(unittest.TestCase):
     def test_no_band_without_ledger(self):
         h = render_html({"lifetime": {"prunes_total": 0}}, generated_ts="t", ledger=None)
         self.assertNotIn('<section class="lifetime">', h)  # no band section emitted
-        self.assertNotIn("reclaimed (lifetime)", h)
+        self.assertNotIn("Lifetime — All Time", h)  # band header absent
 
     def test_band_shows_session_multiplier_chip(self):
         h = render_html({"lifetime": {"prunes_total": 0}}, generated_ts="t",
                         ledger={"tokens_saved": 1000, "session_multiplier_x": 1.35})
         self.assertIn("1.35×", h)
-        self.assertIn("longer per pruned session", h)
+        self.assertIn("Longer Per Pruned Session", h)
 
     def test_band_escapes_since(self):
         h = render_html({"lifetime": {"prunes_total": 0}}, generated_ts="t",

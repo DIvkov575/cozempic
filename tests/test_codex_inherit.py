@@ -110,8 +110,8 @@ class TestDashboardInheritance(unittest.TestCase):
             agents = {a["agent"] for a in data["per_agent"]}
             self.assertEqual(agents, {"claude", "codex"})
             html = render_dashboard(base, generated_ts="now")
-            self.assertIn("codex", html)
-            self.assertIn("claude", html)
+            self.assertIn("Codex", html)  # agent name rendered Title Case
+            self.assertIn("Claude", html)
 
     def test_agent_filter_isolates_codex(self):
         with tempfile.TemporaryDirectory() as home:

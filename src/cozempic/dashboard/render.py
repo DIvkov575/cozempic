@@ -51,6 +51,12 @@ def _fmt_bytes(n) -> str:
     return f"{n:.1f} GB"
 
 
+def _pretty_label(slug) -> str:
+    """Title Case a strategy/tier slug for display (tool-output-trim -> Tool Output Trim)."""
+    s = str(slug if slug not in (None, "") else "?").replace("_", "-")
+    return " ".join(w.capitalize() for w in s.split("-")) or "?"
+
+
 def _bar_rows(rows, label_key, value_key, fmt) -> str:
     """CSS horizontal bars; widths relative to the max value (guards div-by-zero)."""
     if not rows:
@@ -64,7 +70,7 @@ def _bar_rows(rows, label_key, value_key, fmt) -> str:
         pct = max(0.0, min(100.0, v / max_v * 100))
         out.append(
             '<div class="bar-row">'
-            f'<span class="bar-label">{_esc(r.get(label_key, "?"))}</span>'
+            f'<span class="bar-label">{_esc(_pretty_label(r.get(label_key, "?")))}</span>'
             f'<span class="bar-track"><span class="bar-fill" style="width:{pct:.1f}%"></span></span>'
             f'<span class="bar-val">{_esc(fmt(v))}</span>'
             "</div>"
@@ -124,6 +130,9 @@ th{color:var(--mut);font-weight:500;font-size:12px}td{font-variant-numeric:tabul
 .lt-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:18px}
 .lt-cell .lt-n{font-size:26px;font-weight:700;color:#7aa2ff}
 .lt-cell .lt-l{color:var(--mut);font-size:12px}.lt-since{color:var(--mut);font-size:12px;margin-top:12px}
+.lt-title{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:#7aa2ff;font-weight:700;margin:0 0 14px}
+.sub2{color:var(--mut);font-size:12px;margin:-4px 0 14px}
+.foot code{color:var(--acc);font-family:ui-monospace,monospace}
 """
 
 
@@ -131,16 +140,16 @@ def _lifetime_band(ledger: dict | None) -> str:
     """Header band of the user's TRUE lifetime totals (from the savings ledger)."""
     if not ledger or not ledger.get("tokens_saved"):
         return ""
-    chips = [(_fmt_tokens(ledger["tokens_saved"]), "tokens reclaimed (lifetime)")]
+    chips = [(_fmt_tokens(ledger["tokens_saved"]), "Tokens Reclaimed")]
     if ledger.get("prune_count"):
-        chips.append((_fmt_int(ledger["prune_count"]), "prunes applied"))
+        chips.append((_fmt_int(ledger["prune_count"]), "Prunes Applied"))
     if ledger.get("turns_gained"):
-        chips.append((f"~{_fmt_int(ledger['turns_gained'])}", "est. extra turns"))
+        chips.append((f"~{_fmt_int(ledger['turns_gained'])}", "Est. Extra Turns"))
     if ledger.get("savings_rate_pct") is not None:
         # saved/processed (processed is cumulative-with-overlap) — NOT a per-prune average
-        chips.append((f"{ledger['savings_rate_pct']:.1f}%", "reclaimed of processed"))
+        chips.append((f"{ledger['savings_rate_pct']:.1f}%", "Reclaimed of Processed"))
     if ledger.get("session_multiplier_x"):
-        chips.append((f"{ledger['session_multiplier_x']:.2f}×", "longer per pruned session"))
+        chips.append((f"{ledger['session_multiplier_x']:.2f}×", "Longer Per Pruned Session"))
     cells = "".join(
         f'<div class="lt-cell"><div class="lt-n">{_esc(n)}</div>'
         f'<div class="lt-l">{_esc(label)}</div></div>'
@@ -148,8 +157,9 @@ def _lifetime_band(ledger: dict | None) -> str:
     )
     since = f" since {_esc(ledger['since'])}" if ledger.get("since") else ""
     return (
-        f'<section class="lifetime"><div class="lt-row">{cells}</div>'
-        f'<div class="lt-since">Lifetime totals{since} · ~/.cozempic_savings.json</div></section>'
+        '<section class="lifetime"><div class="lt-title">Lifetime — All Time</div>'
+        f'<div class="lt-row">{cells}</div>'
+        f'<div class="lt-since">Running totals from ~/.cozempic_savings.json{since}</div></section>'
     )
 
 
@@ -162,20 +172,24 @@ def render_html(data: dict, *, generated_ts: str, source_label: str = "",
     by_tier = data.get("by_tier", {}) or {}
     per_session = data.get("per_session", []) or []
 
+    _RECORDED_NOTE = ('<div class="sub2">Detailed per-prune history from receipts '
+                      "(~/.cozempic/receipts) — newer than, and separate from, the lifetime "
+                      'totals above. Fills in as cozempic prunes.</div>')
     if not lt.get("prunes_total"):
         body = (
-            '<section><p class="empty">No prunes recorded yet. Run '
+            '<section><h2>Recorded Prunes</h2>' + _RECORDED_NOTE +
+            '<p class="empty">No prunes recorded yet. Run '
             "<span class=\"mono\">cozempic treat --execute</span> and they'll appear here.</p></section>"
         )
     else:
         cards = "".join(
             f'<div class="card"><div class="n">{_esc(n)}</div><div class="l">{_esc(l)}</div></div>'
             for n, l in (
-                (_fmt_tokens(lt.get("tokens_reclaimed", 0)), "tokens reclaimed"),
-                (_fmt_bytes(lt.get("bytes_reclaimed", 0)), "bytes reclaimed"),
-                (_fmt_int(lt.get("committed", 0)), "prunes applied"),
-                (_fmt_int(lt.get("sessions", 0)), "sessions"),
-                (f"{(lt.get('deferral_rate') or 0) * 100:.0f}%", "deferral rate"),
+                (_fmt_tokens(lt.get("tokens_reclaimed", 0)), "Tokens Reclaimed"),
+                (_fmt_bytes(lt.get("bytes_reclaimed", 0)), "Bytes Reclaimed"),
+                (_fmt_int(lt.get("committed", 0)), "Prunes Applied"),
+                (_fmt_int(lt.get("sessions", 0)), "Sessions"),
+                (f"{(lt.get('deferral_rate') or 0) * 100:.0f}%", "Deferral Rate"),
             )
         )
         strat_bars = _bar_rows(per_strategy, "id", "tokens_reclaimed", _fmt_tokens)
@@ -183,27 +197,27 @@ def render_html(data: dict, *, generated_ts: str, source_label: str = "",
                      for k, v in sorted(by_tier.items(), key=lambda kv: str(kv[0]))]
         tier_bars = _bar_rows(tier_rows, "tier", "count", _fmt_int)
         agent_rows = "".join(
-            f"<tr><td>{_esc(a.get('agent'))}</td><td>{_fmt_int(a.get('prunes', 0))}</td>"
+            f"<tr><td>{_esc(_pretty_label(a.get('agent')))}</td><td>{_fmt_int(a.get('prunes', 0))}</td>"
             f"<td>{_fmt_int(a.get('committed', 0))}</td><td>{_esc(_fmt_tokens(a.get('tokens_reclaimed', 0)))}</td></tr>"
             for a in per_agent
         )
         sess_rows = "".join(
             f'<tr><td class="mono">{_esc((s.get("session") or "")[:14])}</td>'
-            f'<td><span class="pill">{_esc(s.get("agent"))}</span></td>'
+            f'<td><span class="pill">{_esc(_pretty_label(s.get("agent")))}</span></td>'
             f"<td>{_fmt_int(s.get('prunes', 0))}</td>"
             f"<td>{_esc(_fmt_tokens(s.get('tokens_reclaimed', 0)))}</td>"
             f"<td>{_sparkline(s.get('timeline', []))}</td></tr>"
             for s in per_session[:50]
         )
         body = f"""
-        <div class="cards">{cards}</div>
-        <section><h2>Savings by strategy</h2>{strat_bars}</section>
-        <section><h2>Prunes by tier</h2>{tier_bars}</section>
-        <section><h2>By agent</h2><table>
-          <tr><th>Agent</th><th>Prunes</th><th>Applied</th><th>Tokens reclaimed</th></tr>
+        <section><h2>Recorded Prunes</h2>{_RECORDED_NOTE}<div class="cards">{cards}</div></section>
+        <section><h2>Savings by Strategy</h2>{strat_bars}</section>
+        <section><h2>Prunes by Tier</h2>{tier_bars}</section>
+        <section><h2>By Agent</h2><table>
+          <tr><th>Agent</th><th>Prunes</th><th>Applied</th><th>Tokens Reclaimed</th></tr>
           {agent_rows}</table></section>
-        <section><h2>Sessions <span class="pill">context % over time</span></h2><table>
-          <tr><th>Session</th><th>Agent</th><th>Prunes</th><th>Reclaimed</th><th>Context trend</th></tr>
+        <section><h2>Sessions <span class="pill">Context % Over Time</span></h2><table>
+          <tr><th>Session</th><th>Agent</th><th>Prunes</th><th>Reclaimed</th><th>Context Trend</th></tr>
           {sess_rows}</table></section>
         """
 
@@ -211,13 +225,13 @@ def render_html(data: dict, *, generated_ts: str, source_label: str = "",
     return f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>cozempic — prune value</title><style>{_STYLE}</style></head>
+<title>Cozempic Dashboard</title><style>{_STYLE}</style></head>
 <body><div class="wrap">
-<h1>cozempic — prune value</h1>
+<h1>Cozempic Dashboard</h1>
 <p class="sub">Generated {_esc(generated_ts)}{src}</p>
 {_lifetime_band(ledger)}
 {body}
-<p class="foot">Local-only · generated from ~/.cozempic/receipts · cozempic</p>
+<p class="foot">Local-only · ~/.cozempic · regenerate by running <code>cozempic dashboard</code></p>
 </div></body></html>"""
 
 
