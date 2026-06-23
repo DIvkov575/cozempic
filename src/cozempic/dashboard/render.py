@@ -91,7 +91,7 @@ def _fmt_bytes(n) -> str:
             sv = sign * v
             return f"{sv:.0f} {unit}" if unit == "B" else f"{sv:.1f} {unit}"
         v /= 1024
-    return f"{sign * v:.1f} GB"
+    return "0 B"  # unreachable — loop always returns; kept for type-checker
 
 
 def _pretty_label(slug) -> str:
