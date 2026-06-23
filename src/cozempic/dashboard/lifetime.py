@@ -30,8 +30,12 @@ def _num_or_zero(value) -> int:
     The `int(value)` call never raises for a Python arbitrary-precision int,
     so the `except (ValueError, OverflowError)` branch handles only
     float('nan') -> ValueError and float('inf') -> OverflowError.
-    After conversion we cap at _MAX_RECEIPT_INT so downstream float arithmetic
-    (round(saved / processed * 100, 1)) never overflows.
+
+    Out-of-bound values (> _MAX_RECEIPT_INT or < 0) return 0, mirroring
+    aggregate._int for sibling parity.  Returning 10**15 for a huge int
+    would fabricate a "1 billion M tokens" headline in the Lifetime band;
+    returning 0 causes the early-out in load_lifetime to suppress the band
+    entirely, which is the correct response to corrupt data.
     """
     if isinstance(value, bool):
         return 0
@@ -40,9 +44,9 @@ def _num_or_zero(value) -> int:
             result = int(value)
         except (ValueError, OverflowError):
             return 0
-        if result < 0:
+        if result < 0 or result > _MAX_RECEIPT_INT:
             return 0
-        return min(result, _MAX_RECEIPT_INT)
+        return result
     return 0
 
 
