@@ -440,6 +440,11 @@ def validate_receipt(receipt: dict) -> None:
         _val = _tokens.get(_key)
         if isinstance(_val, float) and not math.isfinite(_val):
             raise ValueError(f"tokens.{_key} must be finite, got {_val!r}")
+    _bytes = receipt.get("bytes", {})
+    for _key in ("before", "after", "reclaimed"):
+        _val = _bytes.get(_key)
+        if isinstance(_val, float) and not math.isfinite(_val):
+            raise ValueError(f"bytes.{_key} must be finite, got {_val!r}")
     _cw = receipt.get("model", {}).get("context_window")
     if isinstance(_cw, float) and not math.isfinite(_cw):
         raise ValueError(f"model.context_window must be finite, got {_cw!r}")
