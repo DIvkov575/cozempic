@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 
 from ._validation import _BOOL_FALSE_TOKENS, _BOOL_TRUE_TOKENS
@@ -92,6 +93,10 @@ def _session_stem(receipt: dict) -> str:
     for ch in ("/", "\\", os.sep, os.altsep or ""):
         if ch:
             stem = stem.replace(ch, "_")
+    # Strip control characters (U+0000–001F, U+007F) — a corrupt id_hash with
+    # \x00 would cause the kernel to reject the path (silently dropped by
+    # write_receipt's except); \n would create a file with a newline in its name.
+    stem = re.sub(r"[\x00-\x1f\x7f]", "", stem)
     stem = stem.lstrip(".")
     return stem[:32] or "unknown"
 

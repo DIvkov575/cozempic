@@ -197,10 +197,15 @@ def aggregate(receipts: list[dict]) -> dict:
             "context_pct_after": _context_pct(r),
         })
     for row in sessions.values():
-        row["timeline"].sort(key=lambda e: e.get("ts") or "")
+        # Coerce ts to str for sorting — a corrupt receipt with an int ts would
+        # cause TypeError when mixed with str ts values (Python 3 strict ordering).
+        row["timeline"].sort(key=lambda e: e.get("ts") if isinstance(e.get("ts"), str) else "")
     per_session = sorted(
         sessions.values(),
-        key=lambda x: (x["timeline"][-1].get("ts") if x["timeline"] else "") or "",
+        key=lambda x: (
+            (x["timeline"][-1].get("ts") if isinstance(x["timeline"][-1].get("ts"), str) else "")
+            if x["timeline"] else ""
+        ),
         reverse=True,
     )
 
