@@ -85,9 +85,7 @@ def _fmt_bytes(n) -> str:
         return "0 B"
     sign = -1 if i < 0 else 1
     mag = min(abs(i), _MAX_RECEIPT_INT)  # clamp int magnitude first, like _fmt_tokens
-    v = float(mag)  # _MAX_RECEIPT_INT=10**15 always fits in float
-    if not math.isfinite(v):
-        return "0 B"
+    v = float(mag)  # _MAX_RECEIPT_INT=10**15 is well within float range; always finite
     for unit in ("B", "KB", "MB", "GB"):
         if v < 1024 or unit == "GB":
             sv = sign * v

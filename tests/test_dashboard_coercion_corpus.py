@@ -189,15 +189,8 @@ class TestContextPct(unittest.TestCase):
 class TestNumOrZero(unittest.TestCase):
     """_num_or_zero must return 0 for huge ints/negatives/NaN/bool (sibling parity with _int)."""
 
-    def test_huge_int_clamped(self):
-        """10**400 must be clamped, not returned as a 401-digit int."""
-        r = _num_or_zero(_HUGE_INT)
-        self.assertIsInstance(r, int)
-        self.assertLessEqual(r, _MAX_RECEIPT_INT,
-                             f"huge int leaked: got {r!r}, expected <= {_MAX_RECEIPT_INT!r}")
-
     def test_huge_int_returns_zero(self):
-        """F-1: 10**400 must return 0, not 10**15 (sibling parity with _int huge->0)."""
+        """10**400 must return 0 (sibling parity with _int huge->0; subsumes the old assertLessEqual guard)."""
         r = _num_or_zero(_HUGE_INT)
         self.assertEqual(r, 0,
                          f"_num_or_zero(10**400) must be 0 (sibling parity with _int), got {r!r}")

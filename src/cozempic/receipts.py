@@ -58,9 +58,11 @@ def receipts_enabled() -> bool:
     opt out; silently re-enabling receipts would be a privacy regression.
     """
     raw = os.environ.get(_OPT_OUT_ENV)
-    if raw is None or raw.strip() == "":
-        return True  # unset / empty → ON (default)
+    if raw is None:
+        return True  # unset → ON (default)
     normalized = raw.strip().lower()
+    if not normalized:
+        return True  # empty / whitespace-only → ON (treated as absent)
     if normalized in _BOOL_FALSE_TOKENS:
         return True   # explicit falsy ("no, don't disable") → ON
     if normalized in _BOOL_TRUE_TOKENS:
