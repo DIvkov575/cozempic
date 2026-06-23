@@ -19,6 +19,7 @@ import json
 import os
 from pathlib import Path
 
+from ._validation import parse_env_bool
 from .metrics import (
     ProtectedInfo,
     TriggerInfo,
@@ -39,8 +40,18 @@ def receipts_dir(base_dir: Path | None = None) -> Path:
 
 
 def receipts_enabled() -> bool:
-    """False if the user opted out via ``COZEMPIC_NO_RECEIPTS``."""
-    return not os.environ.get(_OPT_OUT_ENV)
+    """False if the user opted out via ``COZEMPIC_NO_RECEIPTS``.
+
+    Uses ``parse_env_bool`` so ``COZEMPIC_NO_RECEIPTS=0`` / ``=false`` / ``=no``
+    / ``=off`` are treated as opt-IN (receipts enabled).  Only the truthy tokens
+    (``1``, ``true``, ``yes``, ``on``) trigger the opt-out.
+
+    ``warn=False`` because this function is called per-prune; emitting a
+    warning on every call for an unrecognized value would drown the output.
+    The module-level ``parse_env_bool`` call in ``_validation.py`` emits the
+    warning once at startup if the knob is unrecognized.
+    """
+    return not parse_env_bool(_OPT_OUT_ENV, default=False, warn=False)
 
 
 def _tool_version() -> str:
