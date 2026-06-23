@@ -19,6 +19,8 @@ import os
 import tempfile
 from pathlib import Path
 
+from .._constants import _MAX_RECEIPT_INT
+
 DEFAULT_FILENAME = "dashboard.html"
 
 
@@ -30,25 +32,66 @@ def _esc(value) -> str:
 
 
 def _fmt_int(n) -> str:
-    return f"{int(n):,}" if isinstance(n, (int, float)) else "0"
+    """Format an integer with thousands separators.
+
+    Guards NaN/inf (ValueError/OverflowError on int()) and huge ints
+    (clamp to _MAX_RECEIPT_INT so f-string stays finite).
+    """
+    if not isinstance(n, (int, float)) or isinstance(n, bool):
+        return "0"
+    try:
+        v = int(n)
+    except (ValueError, OverflowError):
+        return "0"
+    v = min(abs(v), _MAX_RECEIPT_INT)
+    return f"{v:,}"
 
 
 def _fmt_tokens(n) -> str:
-    n = int(n) if isinstance(n, (int, float)) else 0
-    if abs(n) >= 999_950:  # rolls 999,999 up to "1.0M" rather than "1000.0K"
-        return f"{n / 1_000_000:.1f}M"
-    if abs(n) >= 1_000:
-        return f"{n / 1_000:.1f}K"
-    return str(n)
+    """Format a token count as "1.2M" / "1.2K" / raw integer string.
+
+    Clamps magnitude to _MAX_RECEIPT_INT before float division to prevent
+    OverflowError on corrupt huge-int values.  Sign is preserved for
+    in-range values (negative reclaimed is unusual but must not crash).
+    """
+    if not isinstance(n, (int, float)) or isinstance(n, bool):
+        return "0"
+    try:
+        v = int(n)
+    except (ValueError, OverflowError):
+        return "0"
+    sign = -1 if v < 0 else 1
+    mag = min(abs(v), _MAX_RECEIPT_INT)
+    if mag >= 999_950:  # rolls 999,999 up to "1.0M" rather than "1000.0K"
+        return f"{sign * mag / 1_000_000:.1f}M"
+    if mag >= 1_000:
+        return f"{sign * mag / 1_000:.1f}K"
+    return str(sign * mag)
 
 
 def _fmt_bytes(n) -> str:
-    n = float(n) if isinstance(n, (int, float)) else 0.0
+    """Format a byte count as "1.2 GB" / "1.2 MB" / "1.2 KB" / "N B".
+
+    Clamps magnitude to _MAX_RECEIPT_INT before float conversion to prevent
+    OverflowError on corrupt huge-int values.  Sign is preserved for
+    in-range values.
+    """
+    if not isinstance(n, (int, float)) or isinstance(n, bool):
+        return "0 B"
+    try:
+        raw = float(n)
+    except (ValueError, OverflowError):
+        return "0 B"
+    if not math.isfinite(raw):
+        return "0 B"
+    sign = -1.0 if raw < 0 else 1.0
+    v = min(abs(raw), float(_MAX_RECEIPT_INT))
     for unit in ("B", "KB", "MB", "GB"):
-        if abs(n) < 1024 or unit == "GB":
-            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
-        n /= 1024
-    return f"{n:.1f} GB"
+        if v < 1024 or unit == "GB":
+            sv = sign * v
+            return f"{sv:.0f} {unit}" if unit == "B" else f"{sv:.1f} {unit}"
+        v /= 1024
+    return f"{sign * v:.1f} GB"
 
 
 def _pretty_label(slug) -> str:
