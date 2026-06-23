@@ -280,11 +280,16 @@ def build_receipt(
         if tokens_before is not None and tokens_after is not None
         else None
     )
-    reclaimed_pct = (
-        round(tokens_reclaimed / tokens_before * 100, 1)
-        if tokens_reclaimed is not None and tokens_before
-        else 0.0
-    )
+    # Guard against OverflowError (huge tokens_before from corrupt data) and
+    # ZeroDivisionError (tokens_before=0 edge case not caught by truthiness).
+    # math.isfinite guard handles any NaN/inf that could slip through.
+    reclaimed_pct = 0.0
+    if tokens_reclaimed is not None and tokens_before:
+        try:
+            candidate = round(tokens_reclaimed / tokens_before * 100, 1)
+            reclaimed_pct = candidate if math.isfinite(candidate) else 0.0
+        except (OverflowError, ZeroDivisionError):
+            reclaimed_pct = 0.0
     method = result.token_method or "unknown"
 
     bytes_before = result.original_total_bytes
@@ -300,13 +305,17 @@ def build_receipt(
     total_strategy_bytes = sum(strat_bytes)
     sr_token_alloc = [0] * len(strat_bytes)
     if tokens_reclaimed and tokens_reclaimed > 0 and total_strategy_bytes:
-        shares = [tokens_reclaimed * b / total_strategy_bytes for b in strat_bytes]
-        floors = [math.floor(s) for s in shares]
-        remainder = tokens_reclaimed - sum(floors)  # in [0, len) by construction
-        order = sorted(range(len(shares)), key=lambda i: shares[i] - floors[i], reverse=True)
-        for k in range(remainder):
-            floors[order[k]] += 1
-        sr_token_alloc = floors
+        try:
+            shares = [tokens_reclaimed * b / total_strategy_bytes for b in strat_bytes]
+            floors = [math.floor(s) for s in shares]
+            remainder = tokens_reclaimed - sum(floors)  # in [0, len) by construction
+            order = sorted(range(len(shares)), key=lambda i: shares[i] - floors[i], reverse=True)
+            for k in range(remainder):
+                floors[order[k]] += 1
+            sr_token_alloc = floors
+        except (OverflowError, ValueError):
+            # tokens_reclaimed is corrupt/huge — per-strategy allocation stays 0.
+            pass
 
     strategies = [
         {
