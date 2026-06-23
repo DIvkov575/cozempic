@@ -19,7 +19,7 @@ import json
 import os
 from pathlib import Path
 
-from ._validation import parse_env_bool
+from ._validation import _BOOL_FALSE_TOKENS, _BOOL_TRUE_TOKENS
 from .metrics import (
     ProtectedInfo,
     TriggerInfo,
@@ -42,16 +42,31 @@ def receipts_dir(base_dir: Path | None = None) -> Path:
 def receipts_enabled() -> bool:
     """False if the user opted out via ``COZEMPIC_NO_RECEIPTS``.
 
-    Uses ``parse_env_bool`` so ``COZEMPIC_NO_RECEIPTS=0`` / ``=false`` / ``=no``
-    / ``=off`` are treated as opt-IN (receipts enabled).  Only the truthy tokens
-    (``1``, ``true``, ``yes``, ``on``) trigger the opt-out.
+    Receipts are ON by default (``COZEMPIC_NO_RECEIPTS`` unset or empty).
 
-    ``warn=False`` because this function is called per-prune; emitting a
-    warning on every call for an unrecognized value would drown the output.
-    The module-level ``parse_env_bool`` call in ``_validation.py`` emits the
-    warning once at startup if the knob is unrecognized.
+    Truth table (case-insensitive, whitespace stripped):
+      * unset / empty / whitespace-only  → True  (receipts ON — treated as absent)
+      * explicit falsy: 0, false, no, off → True  (receipts ON — "no, don't disable")
+      * explicit truthy: 1, true, yes, on → False (receipts OFF — opted out)
+      * any other non-empty value         → False (receipts OFF — privacy fail-safe:
+                                                    ambiguous opt-out intent -> disabled)
+
+    Deliberate divergence from ``not parse_env_bool(...)`` (which would ENABLE
+    receipts for unrecognized values via its default=False fallback): for a
+    PRIVACY opt-out knob the fail-safe direction must be "disabled", not
+    "enabled".  A user who sets ``COZEMPIC_NO_RECEIPTS=disabled`` intends to
+    opt out; silently re-enabling receipts would be a privacy regression.
     """
-    return not parse_env_bool(_OPT_OUT_ENV, default=False, warn=False)
+    raw = os.environ.get(_OPT_OUT_ENV)
+    if raw is None or raw.strip() == "":
+        return True  # unset / empty → ON (default)
+    normalized = raw.strip().lower()
+    if normalized in _BOOL_FALSE_TOKENS:
+        return True   # explicit falsy ("no, don't disable") → ON
+    if normalized in _BOOL_TRUE_TOKENS:
+        return False  # explicit truthy ("yes, disable") → OFF
+    # Unrecognized non-empty value → privacy fail-safe: assume opt-out intent → OFF
+    return False
 
 
 def _tool_version() -> str:
