@@ -72,20 +72,22 @@ def _fmt_tokens(n) -> str:
 def _fmt_bytes(n) -> str:
     """Format a byte count as "1.2 GB" / "1.2 MB" / "1.2 KB" / "N B".
 
-    Clamps magnitude to _MAX_RECEIPT_INT before float conversion to prevent
-    OverflowError on corrupt huge-int values.  Sign is preserved for
-    in-range values.
+    Clamps integer magnitude to _MAX_RECEIPT_INT BEFORE float conversion
+    (mirroring _fmt_tokens) so huge ints (>= 10**309 overflow float) are
+    clamped to a finite value rather than hitting the OverflowError path.
+    Sign is preserved for in-range values.
     """
     if not isinstance(n, (int, float)) or isinstance(n, bool):
         return "0 B"
     try:
-        raw = float(n)
+        i = int(n)
     except (ValueError, OverflowError):
         return "0 B"
-    if not math.isfinite(raw):
+    sign = -1 if i < 0 else 1
+    mag = min(abs(i), _MAX_RECEIPT_INT)  # clamp int magnitude first, like _fmt_tokens
+    v = float(mag)  # _MAX_RECEIPT_INT=10**15 always fits in float
+    if not math.isfinite(v):
         return "0 B"
-    sign = -1.0 if raw < 0 else 1.0
-    v = min(abs(raw), float(_MAX_RECEIPT_INT))
     for unit in ("B", "KB", "MB", "GB"):
         if v < 1024 or unit == "GB":
             sv = sign * v
