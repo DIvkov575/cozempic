@@ -79,7 +79,11 @@ def load_lifetime(path: Path | None = None) -> dict | None:
     tracked_prunes = _num_or_zero(data.get("tracked_prunes"))
     multiplier = None
     if sessions >= 5 and rate is not None and tracked_prunes > 0:
-        multiplier = round(1 + (tracked_prunes / sessions) * (rate / 100), 2)
+        raw = round(1 + (tracked_prunes / sessions) * (rate / 100), 2)
+        # A multiplier >100,000× is nonsensical (e.g. tracked_prunes=10**15,
+        # sessions=5 → ~2×10**14); suppress it so the dashboard doesn't render
+        # garbage like "200000000000001.00×".
+        multiplier = raw if raw <= 100_000 else None
     since = data.get("since")
     return {
         "tokens_saved": saved,

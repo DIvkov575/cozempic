@@ -145,10 +145,13 @@ def aggregate(receipts: list[dict]) -> dict:
         for s in strategies if isinstance(strategies, list) else []:
             if not isinstance(s, dict):
                 continue
+            # s.get("id") returns None for an explicit JSON null — `or "unknown"`
+            # handles both missing key (default) and explicit null.
+            sid = s.get("id") or "unknown"
+            tier = s.get("tier") or "unknown"
             row = strat.setdefault(
-                s.get("id", "unknown"),
-                {"id": s.get("id", "unknown"), "tier": s.get("tier", "unknown"),
-                 "tokens_reclaimed": 0, "bytes_reclaimed": 0, "count": 0},
+                sid,
+                {"id": sid, "tier": tier, "tokens_reclaimed": 0, "bytes_reclaimed": 0, "count": 0},
             )
             row["tokens_reclaimed"] += _int(s.get("tokens_reclaimed"))
             row["bytes_reclaimed"] += _int(s.get("bytes_reclaimed"))

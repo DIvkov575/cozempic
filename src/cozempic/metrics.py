@@ -305,17 +305,25 @@ def build_receipt(
     total_strategy_bytes = sum(strat_bytes)
     sr_token_alloc = [0] * len(strat_bytes)
     if tokens_reclaimed and tokens_reclaimed > 0 and total_strategy_bytes:
-        try:
-            shares = [tokens_reclaimed * b / total_strategy_bytes for b in strat_bytes]
-            floors = [math.floor(s) for s in shares]
-            remainder = tokens_reclaimed - sum(floors)  # in [0, len) by construction
-            order = sorted(range(len(shares)), key=lambda i: shares[i] - floors[i], reverse=True)
-            for k in range(remainder):
-                floors[order[k]] += 1
-            sr_token_alloc = floors
-        except (OverflowError, ValueError):
-            # tokens_reclaimed is corrupt/huge — per-strategy allocation stays 0.
-            pass
+        # Integer arithmetic only — Python ints are arbitrary-precision so
+        # tokens_reclaimed * b never overflows, even for huge tokens_reclaimed
+        # (e.g. 10**400). The old float path raised OverflowError on huge values,
+        # zeroing ALL strategy attributions. Total_strategy_bytes is always a
+        # non-negative int (sum of non-negative ints above), so no ValueError.
+        #
+        # Hamilton (largest-remainder) in int:
+        #   floor_share[i]   = tokens_reclaimed * b[i] // total_strategy_bytes
+        #   fractional[i]    = tokens_reclaimed * b[i] %  total_strategy_bytes
+        # Distribute leftover (tokens_reclaimed - sum(floors)) to strategies with
+        # the largest fractional parts so the per-strategy values sum EXACTLY to
+        # tokens_reclaimed.
+        floors = [tokens_reclaimed * b // total_strategy_bytes for b in strat_bytes]
+        remainders = [tokens_reclaimed * b % total_strategy_bytes for b in strat_bytes]
+        leftover = tokens_reclaimed - sum(floors)  # non-negative by construction
+        order = sorted(range(len(strat_bytes)), key=lambda i: remainders[i], reverse=True)
+        for k in range(leftover):
+            floors[order[k]] += 1
+        sr_token_alloc = floors
 
     strategies = [
         {
@@ -397,8 +405,15 @@ _REQUIRED_TOP_KEYS = (
 
 
 def serialize_receipt(receipt: dict) -> str:
-    """One compact JSON line (JSONL), trailing newline excluded."""
-    return json.dumps(receipt, separators=(",", ":"), ensure_ascii=False)
+    """One compact JSON line (JSONL), trailing newline excluded.
+
+    ``allow_nan=False`` raises ``ValueError`` on NaN/inf rather than writing
+    the non-standard Python literals ``NaN`` / ``Infinity`` that are invalid
+    JSON for any non-Python consumer.  ``validate_receipt`` is a standalone
+    contract validator (used by tests / external callers); this is the
+    production output-boundary guard.
+    """
+    return json.dumps(receipt, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
 
 
 def validate_receipt(receipt: dict) -> None:

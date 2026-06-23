@@ -190,11 +190,13 @@ def _lifetime_band(ledger: dict | None) -> str:
         chips.append((_fmt_int(ledger["prune_count"]), "Prunes Applied"))
     if ledger.get("turns_gained"):
         chips.append((f"~{_fmt_int(ledger['turns_gained'])}", "Est. Extra Turns"))
-    if ledger.get("savings_rate_pct") is not None:
+    _rate = ledger.get("savings_rate_pct")
+    if isinstance(_rate, (int, float)) and not isinstance(_rate, bool) and math.isfinite(_rate):
         # saved/processed (processed is cumulative-with-overlap) — NOT a per-prune average
-        chips.append((f"{ledger['savings_rate_pct']:.1f}%", "Reclaimed of Processed"))
-    if ledger.get("session_multiplier_x"):
-        chips.append((f"{ledger['session_multiplier_x']:.2f}×", "Longer Per Pruned Session"))
+        chips.append((f"{_rate:.1f}%", "Reclaimed of Processed"))
+    _mult = ledger.get("session_multiplier_x")
+    if isinstance(_mult, (int, float)) and not isinstance(_mult, bool) and math.isfinite(_mult):
+        chips.append((f"{_mult:.2f}×", "Longer Per Pruned Session"))
     cells = "".join(
         f'<div class="lt-cell"><div class="lt-n">{_esc(n)}</div>'
         f'<div class="lt-l">{_esc(label)}</div></div>'
