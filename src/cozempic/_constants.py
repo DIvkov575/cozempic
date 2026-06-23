@@ -14,3 +14,14 @@ modules must agree on lives here.
 # OVER-DEFERS the reload (recoverable, not UNDER-BLOCKS / SIGKILL).
 # Mirrors recap.py's own DoS guard (text[:32768] / text[:8000]).
 _RELOAD_GATE_SCAN_CAP: int = 65536
+
+# Upper bound on any single-receipt numeric field (token count, byte count).
+# No real Claude session can produce token or byte counts near 1 quadrillion:
+# the largest context windows are ~4 M tokens; the heaviest sessions produce
+# at most ~10 GB of transcript bytes (≈10^10).  10**15 is 5–12 orders of
+# magnitude above any legitimate value, yet stays far below the float-overflow
+# threshold (~1.8e308), so float(10**15) is exact and keeps
+# "huge / small * 100" finite.  Values above this cap indicate corruption or
+# tampering in a receipt file; all dashboard coercion helpers clamp to 0 or
+# this value to prevent OverflowError from bubbling up to the user.
+_MAX_RECEIPT_INT: int = 10 ** 15
