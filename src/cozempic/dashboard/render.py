@@ -31,6 +31,11 @@ def _esc(value) -> str:
     return html.escape("" if value is None else str(value))
 
 
+def _is_finite_num(v) -> bool:
+    """True iff v is a non-bool finite int or float — safe for :.Nf formatting."""
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
 def _fmt_int(n) -> str:
     """Format an integer with thousands separators.
 
@@ -128,7 +133,7 @@ def _sparkline(timeline) -> str:
     vals = []
     for e in timeline:
         p = e.get("context_pct_after")
-        if isinstance(p, (int, float)) and not isinstance(p, bool) and math.isfinite(p):
+        if _is_finite_num(p):
             vals.append(p)
     if len(vals) < 2:
         return '<span class="spark-na">—</span>'
@@ -191,11 +196,11 @@ def _lifetime_band(ledger: dict | None) -> str:
     if ledger.get("turns_gained"):
         chips.append((f"~{_fmt_int(ledger['turns_gained'])}", "Est. Extra Turns"))
     _rate = ledger.get("savings_rate_pct")
-    if isinstance(_rate, (int, float)) and not isinstance(_rate, bool) and math.isfinite(_rate):
+    if _is_finite_num(_rate):
         # saved/processed (processed is cumulative-with-overlap) — NOT a per-prune average
         chips.append((f"{_rate:.1f}%", "Reclaimed of Processed"))
     _mult = ledger.get("session_multiplier_x")
-    if isinstance(_mult, (int, float)) and not isinstance(_mult, bool) and math.isfinite(_mult):
+    if _is_finite_num(_mult):
         chips.append((f"{_mult:.2f}×", "Longer Per Pruned Session"))
     cells = "".join(
         f'<div class="lt-cell"><div class="lt-n">{_esc(n)}</div>'

@@ -33,6 +33,9 @@ RECEIPTS_DIRNAME = "receipts"
 INDEX_FILENAME = "index.jsonl"
 _OPT_OUT_ENV = "COZEMPIC_NO_RECEIPTS"
 
+# Pre-compiled: called on every write_receipt path; compiling per-call is wasted work.
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+
 
 def receipts_dir(base_dir: Path | None = None) -> Path:
     """Directory receipts live in (``~/.cozempic/receipts`` by default)."""
@@ -96,7 +99,7 @@ def _session_stem(receipt: dict) -> str:
     # Strip control characters (U+0000–001F, U+007F) — a corrupt id_hash with
     # \x00 would cause the kernel to reject the path (silently dropped by
     # write_receipt's except); \n would create a file with a newline in its name.
-    stem = re.sub(r"[\x00-\x1f\x7f]", "", stem)
+    stem = _CONTROL_CHARS_RE.sub("", stem)
     stem = stem.lstrip(".")
     return stem[:32] or "unknown"
 
@@ -149,7 +152,9 @@ def _append_index(directory: Path, receipt: dict) -> None:
             "tokens_reclaimed": receipt["tokens"]["reclaimed"],
             "bytes_reclaimed": receipt["bytes"]["reclaimed"],
         }
-        _append_line(directory / INDEX_FILENAME, json.dumps(summary, separators=(",", ":")))
+        # allow_nan=False: same guard as serialize_receipt — invalid JSON in the
+        # index would cause the aggregator to silently skip that entry on load.
+        _append_line(directory / INDEX_FILENAME, json.dumps(summary, separators=(",", ":"), allow_nan=False))
     except Exception:
         pass  # index is an optimization; its loss must not fail the receipt
 

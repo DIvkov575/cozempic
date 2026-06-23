@@ -317,8 +317,10 @@ def build_receipt(
         # Distribute leftover (tokens_reclaimed - sum(floors)) to strategies with
         # the largest fractional parts so the per-strategy values sum EXACTLY to
         # tokens_reclaimed.
-        floors = [tokens_reclaimed * b // total_strategy_bytes for b in strat_bytes]
-        remainders = [tokens_reclaimed * b % total_strategy_bytes for b in strat_bytes]
+        # divmod computes floor and remainder in one multiplication per strategy.
+        pairs = [divmod(tokens_reclaimed * b, total_strategy_bytes) for b in strat_bytes]
+        floors = [q for q, _ in pairs]
+        remainders = [r for _, r in pairs]
         leftover = tokens_reclaimed - sum(floors)  # non-negative by construction
         order = sorted(range(len(strat_bytes)), key=lambda i: remainders[i], reverse=True)
         for k in range(leftover):
