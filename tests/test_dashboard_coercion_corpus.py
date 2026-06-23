@@ -134,9 +134,15 @@ class TestContextPct(unittest.TestCase):
             "tokens": {"after": _HUGE_INT},
             "model": {"context_window": 200000},
         })
-        # Must not raise — if it returns a value it must be finite
-        if r is not None:
-            self.assertTrue(math.isfinite(r), f"leaked non-finite: {r!r}")
+        self.assertIsNone(r, f"huge after leaked through _context_pct as {r!r}")
+
+    def test_negative_after_returns_none(self):
+        """F-5: negative after must return None (not a negative %)."""
+        r = _context_pct({
+            "tokens": {"after": -5},
+            "model": {"context_window": 100},
+        })
+        self.assertIsNone(r, f"negative after leaked through _context_pct as {r!r}")
 
     def test_huge_window_returns_none(self):
         """OVERFLOW: window=10**400 must not raise; must return None."""
@@ -181,7 +187,7 @@ class TestContextPct(unittest.TestCase):
 # ── TestNumOrZero ──────────────────────────────────────────────────────────────
 
 class TestNumOrZero(unittest.TestCase):
-    """_num_or_zero must clamp huge ints and return 0 for negatives/NaN/bool."""
+    """_num_or_zero must return 0 for huge ints/negatives/NaN/bool (sibling parity with _int)."""
 
     def test_huge_int_clamped(self):
         """10**400 must be clamped, not returned as a 401-digit int."""
@@ -189,6 +195,12 @@ class TestNumOrZero(unittest.TestCase):
         self.assertIsInstance(r, int)
         self.assertLessEqual(r, _MAX_RECEIPT_INT,
                              f"huge int leaked: got {r!r}, expected <= {_MAX_RECEIPT_INT!r}")
+
+    def test_huge_int_returns_zero(self):
+        """F-1: 10**400 must return 0, not 10**15 (sibling parity with _int huge->0)."""
+        r = _num_or_zero(_HUGE_INT)
+        self.assertEqual(r, 0,
+                         f"_num_or_zero(10**400) must be 0 (sibling parity with _int), got {r!r}")
 
     def test_negative_returns_zero(self):
         self.assertEqual(_num_or_zero(-1), 0)
@@ -230,6 +242,17 @@ class TestLoadLifetime(unittest.TestCase):
             # Must not raise — if it returns something it must be a dict or None
             result = load_lifetime(p)
             self.assertIn(type(result), (dict, type(None)))
+
+    def test_huge_tokens_saved_returns_none(self):
+        """F-1: huge tokens_saved -> _num_or_zero returns 0 -> load_lifetime hits saved<=0 early-out -> None."""
+        with tempfile.TemporaryDirectory() as tmp:
+            p = self._write_ledger(tmp, {
+                "tokens_saved": _HUGE_INT,
+                "tokens_processed": 200_000_000,
+            })
+            result = load_lifetime(p)
+            self.assertIsNone(result,
+                              f"load_lifetime with huge tokens_saved must return None (not a fabricated dict), got {result!r}")
 
     def test_huge_tokens_processed_does_not_raise(self):
         """tokens_processed=10**400 must not raise."""
@@ -397,6 +420,30 @@ class TestValidateReceiptNanInf(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_receipt(r)
 
+    def test_rejects_nan_bytes_before(self):
+        """F-4: validate_receipt must reject bytes.before=NaN (same class as tokens.*)."""
+        r = _make_minimal_receipt()
+        r["bytes"]["before"] = float("nan")
+        with self.assertRaises(ValueError,
+                               msg="bytes.before=NaN must raise ValueError"):
+            validate_receipt(r)
+
+    def test_rejects_nan_bytes_after(self):
+        """F-4: validate_receipt must reject bytes.after=NaN."""
+        r = _make_minimal_receipt()
+        r["bytes"]["after"] = float("nan")
+        with self.assertRaises(ValueError,
+                               msg="bytes.after=NaN must raise ValueError"):
+            validate_receipt(r)
+
+    def test_rejects_inf_bytes_reclaimed(self):
+        """F-4: validate_receipt must reject bytes.reclaimed=inf."""
+        r = _make_minimal_receipt()
+        r["bytes"]["reclaimed"] = float("inf")
+        with self.assertRaises(ValueError,
+                               msg="bytes.reclaimed=inf must raise ValueError"):
+            validate_receipt(r)
+
     def test_serialize_does_not_emit_nan_literal(self):
         """After validate + build pipeline, serialize must not produce 'NaN' string."""
         r = _make_minimal_receipt()
@@ -411,7 +458,13 @@ class TestValidateReceiptNanInf(unittest.TestCase):
 # ── TestReceiptsEnabled ────────────────────────────────────────────────────────
 
 class TestReceiptsEnabled(unittest.TestCase):
-    """receipts_enabled must use parse_env_bool semantics for COZEMPIC_NO_RECEIPTS."""
+    """receipts_enabled full truth table — privacy fail-safe direction.
+
+    Opt-OUT env: any non-empty TRUTHY token ({1,true,yes,on}) disables.
+    Explicit FALSY token ({0,false,no,off}) and unrecognized/garbage values
+    must NOT disable (privacy fail-safe: ambiguous opt-out -> receipts OFF).
+    Unset/empty/whitespace-only -> ON (default).
+    """
 
     def test_zero_value_does_not_disable(self):
         """COZEMPIC_NO_RECEIPTS=0 means 'no, don't disable' -> receipts enabled."""
@@ -429,9 +482,72 @@ class TestReceiptsEnabled(unittest.TestCase):
                 "COZEMPIC_NO_RECEIPTS=false must leave receipts enabled",
             )
 
+    def test_no_value_does_not_disable(self):
+        """F-2: COZEMPIC_NO_RECEIPTS=no -> receipts enabled (explicit falsy = keep ON)."""
+        with patch.dict(os.environ, {"COZEMPIC_NO_RECEIPTS": "no"}):
+            self.assertTrue(
+                receipts_enabled(),
+                "COZEMPIC_NO_RECEIPTS=no must leave receipts enabled",
+            )
+
+    def test_off_value_does_not_disable(self):
+        """F-2: COZEMPIC_NO_RECEIPTS=off -> receipts enabled (explicit falsy = keep ON)."""
+        with patch.dict(os.environ, {"COZEMPIC_NO_RECEIPTS": "off"}):
+            self.assertTrue(
+                receipts_enabled(),
+                "COZEMPIC_NO_RECEIPTS=off must leave receipts enabled",
+            )
+
+    def test_disabled_string_disables(self):
+        """F-2: COZEMPIC_NO_RECEIPTS=disabled -> False (privacy fail-safe: unrecognized opt-out -> OFF)."""
+        with patch.dict(os.environ, {"COZEMPIC_NO_RECEIPTS": "disabled"}):
+            self.assertFalse(
+                receipts_enabled(),
+                "COZEMPIC_NO_RECEIPTS=disabled must disable receipts (privacy fail-safe: unrecognized -> OFF)",
+            )
+
+    def test_garbage_value_disables(self):
+        """F-2: COZEMPIC_NO_RECEIPTS=nope -> False (privacy fail-safe: unrecognized opt-out -> OFF)."""
+        with patch.dict(os.environ, {"COZEMPIC_NO_RECEIPTS": "nope"}):
+            self.assertFalse(
+                receipts_enabled(),
+                "COZEMPIC_NO_RECEIPTS=nope must disable receipts (privacy fail-safe)",
+            )
+
+    def test_digit_two_disables(self):
+        """F-2: COZEMPIC_NO_RECEIPTS=2 -> False (privacy fail-safe: unrecognized -> OFF)."""
+        with patch.dict(os.environ, {"COZEMPIC_NO_RECEIPTS": "2"}):
+            self.assertFalse(
+                receipts_enabled(),
+                "COZEMPIC_NO_RECEIPTS=2 must disable receipts (privacy fail-safe)",
+            )
+
+    def test_whitespace_only_enables(self):
+        """F-2: COZEMPIC_NO_RECEIPTS='  ' (whitespace-only) -> True (treated as absent)."""
+        with patch.dict(os.environ, {"COZEMPIC_NO_RECEIPTS": "  "}):
+            self.assertTrue(
+                receipts_enabled(),
+                "COZEMPIC_NO_RECEIPTS=whitespace-only must leave receipts enabled (treated as absent)",
+            )
+
     def test_one_still_disables(self):
         """Regression guard: COZEMPIC_NO_RECEIPTS=1 must still disable receipts."""
         with patch.dict(os.environ, {"COZEMPIC_NO_RECEIPTS": "1"}):
+            self.assertFalse(receipts_enabled())
+
+    def test_true_disables(self):
+        """Regression guard: COZEMPIC_NO_RECEIPTS=true must disable receipts."""
+        with patch.dict(os.environ, {"COZEMPIC_NO_RECEIPTS": "true"}):
+            self.assertFalse(receipts_enabled())
+
+    def test_yes_disables(self):
+        """Regression guard: COZEMPIC_NO_RECEIPTS=yes must disable receipts."""
+        with patch.dict(os.environ, {"COZEMPIC_NO_RECEIPTS": "yes"}):
+            self.assertFalse(receipts_enabled())
+
+    def test_on_disables(self):
+        """Regression guard: COZEMPIC_NO_RECEIPTS=on must disable receipts."""
+        with patch.dict(os.environ, {"COZEMPIC_NO_RECEIPTS": "on"}):
             self.assertFalse(receipts_enabled())
 
     def test_absent_is_enabled(self):
@@ -439,6 +555,14 @@ class TestReceiptsEnabled(unittest.TestCase):
         env = {k: v for k, v in os.environ.items() if k != "COZEMPIC_NO_RECEIPTS"}
         with patch.dict(os.environ, env, clear=True):
             self.assertTrue(receipts_enabled())
+
+    def test_empty_string_is_enabled(self):
+        """F-2: COZEMPIC_NO_RECEIPTS='' -> True (empty treated as absent)."""
+        with patch.dict(os.environ, {"COZEMPIC_NO_RECEIPTS": ""}):
+            self.assertTrue(
+                receipts_enabled(),
+                "COZEMPIC_NO_RECEIPTS='' must leave receipts enabled (treated as absent)",
+            )
 
 
 # ── TestFmtHelpersCorpus ───────────────────────────────────────────────────────
@@ -463,6 +587,19 @@ class TestFmtHelpersCorpus(unittest.TestCase):
                 result = _fmt_bytes(v)
                 self.assertIsInstance(result, str)
                 self.assertTrue(len(result) > 0, "returned empty string")
+
+    def test_fmt_bytes_huge_int_consistent_format(self):
+        """F-3: _fmt_bytes(10**400) must return a GB string, not '0 B' (parity with _fmt_tokens)."""
+        result = _fmt_bytes(_HUGE_INT)
+        self.assertNotEqual(
+            result, "0 B",
+            f"_fmt_bytes(10**400) returned '0 B' — must clamp before float() like _fmt_tokens does",
+        )
+        # Must end with a unit suffix (not just "0 B")
+        self.assertTrue(
+            any(result.endswith(unit) for unit in (" B", " KB", " MB", " GB")),
+            f"_fmt_bytes(10**400) returned unexpected format: {result!r}",
+        )
 
     def test_fmt_int_nan_does_not_raise(self):
         """_fmt_int(float('nan')) must not raise ValueError."""
