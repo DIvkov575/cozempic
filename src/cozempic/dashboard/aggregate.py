@@ -100,7 +100,10 @@ def _context_pct(receipt: dict):
         and after <= _MAX_RECEIPT_INT
         and window <= _MAX_RECEIPT_INT
     ):
-        return round(after / window * 100, 1)
+        # Cap at 100%: a corrupt receipt with after > window would otherwise
+        # return a huge % that blows out the sparkline scale (one spike erases
+        # every other bar). Context usage can never exceed the window.
+        return round(min(after / window * 100, 100.0), 1)
     return None
 
 

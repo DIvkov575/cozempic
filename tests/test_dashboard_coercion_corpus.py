@@ -225,17 +225,6 @@ class TestLoadLifetime(unittest.TestCase):
         p.write_text(json.dumps(data), encoding="utf-8")
         return p
 
-    def test_huge_tokens_saved_does_not_raise(self):
-        """load_lifetime with tokens_saved=10**400 must not raise OverflowError."""
-        with tempfile.TemporaryDirectory() as tmp:
-            p = self._write_ledger(tmp, {
-                "tokens_saved": _HUGE_INT,
-                "tokens_processed": 200_000_000,
-            })
-            # Must not raise — if it returns something it must be a dict or None
-            result = load_lifetime(p)
-            self.assertIn(type(result), (dict, type(None)))
-
     def test_huge_tokens_saved_returns_none(self):
         """F-1: huge tokens_saved -> _num_or_zero returns 0 -> load_lifetime hits saved<=0 early-out -> None."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -274,12 +263,13 @@ class TestLoadLifetime(unittest.TestCase):
 class TestInt(unittest.TestCase):
     """aggregate._int must clamp huge ints and return 0 for negatives/bools."""
 
-    def test_huge_int_clamped_not_leaked(self):
-        """10**400 must be clamped, not returned as a 401-digit int."""
+    def test_huge_int_returns_zero(self):
+        """10**400 -> 0 (corruption sentinel), sibling-consistent with
+        _num_or_zero. assertEqual(0), NOT assertLessEqual(_MAX_RECEIPT_INT):
+        the latter would also pass a clamp-to-_MAX regression that leaks a
+        1-quadrillion lifetime total onto the dashboard."""
         r = _int(_HUGE_INT)
-        self.assertIsInstance(r, int)
-        self.assertLessEqual(r, _MAX_RECEIPT_INT,
-                             f"huge int leaked from _int: {r!r}")
+        self.assertEqual(r, 0, f"huge int not zeroed from _int: {r!r}")
 
     def test_negative_returns_zero(self):
         self.assertEqual(_int(-1), 0)
@@ -544,9 +534,11 @@ class TestReceiptsEnabled(unittest.TestCase):
             self.assertFalse(receipts_enabled())
 
     def test_absent_is_enabled(self):
-        """Regression guard: absent env var -> receipts enabled."""
-        env = {k: v for k, v in os.environ.items() if k != "COZEMPIC_NO_RECEIPTS"}
-        with patch.dict(os.environ, env, clear=True):
+        """Regression guard: absent env var -> receipts enabled. Targeted pop
+        (not clear=True full-env-copy) so the test stays hermetic and can't be
+        perturbed by other env vars read during the call."""
+        with patch.dict(os.environ):
+            os.environ.pop("COZEMPIC_NO_RECEIPTS", None)
             self.assertTrue(receipts_enabled())
 
     def test_empty_string_is_enabled(self):

@@ -43,7 +43,9 @@ def _fmt_int(n) -> str:
         v = int(n)
     except (ValueError, OverflowError):
         return "0"
-    v = min(abs(v), _MAX_RECEIPT_INT)
+    # Bound magnitude (display length) but PRESERVE sign, consistent with
+    # _fmt_tokens/_fmt_bytes which keep the sign of in-range values.
+    v = max(-_MAX_RECEIPT_INT, min(v, _MAX_RECEIPT_INT))
     return f"{v:,}"
 
 
