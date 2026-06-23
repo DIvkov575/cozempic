@@ -95,6 +95,7 @@ def _context_pct(receipt: dict):
     if (
         isinstance(after, int) and not isinstance(after, bool)
         and isinstance(window, int) and not isinstance(window, bool)
+        and after >= 0  # negative after -> nonsensical negative %; same class as negative window
         and window > 0
         and after <= _MAX_RECEIPT_INT
         and window <= _MAX_RECEIPT_INT
