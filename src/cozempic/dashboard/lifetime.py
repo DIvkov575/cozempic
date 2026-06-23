@@ -15,6 +15,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from .._constants import _MAX_RECEIPT_INT
+
 
 def lifetime_path() -> Path:
     """Where helpers.record_savings writes the lifetime ledger."""
@@ -22,14 +24,25 @@ def lifetime_path() -> Path:
 
 
 def _num_or_zero(value) -> int:
-    """Coerce a numeric ledger field to int (bool/garbage -> 0; floats truncated)."""
+    """Coerce a numeric ledger field to int (bool/garbage/huge/negative -> 0;
+    floats truncated).
+
+    The `int(value)` call never raises for a Python arbitrary-precision int,
+    so the `except (ValueError, OverflowError)` branch handles only
+    float('nan') -> ValueError and float('inf') -> OverflowError.
+    After conversion we cap at _MAX_RECEIPT_INT so downstream float arithmetic
+    (round(saved / processed * 100, 1)) never overflows.
+    """
     if isinstance(value, bool):
         return 0
     if isinstance(value, (int, float)):
         try:
-            return int(value)
+            result = int(value)
         except (ValueError, OverflowError):
             return 0
+        if result < 0:
+            return 0
+        return min(result, _MAX_RECEIPT_INT)
     return 0
 
 
