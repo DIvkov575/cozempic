@@ -431,3 +431,15 @@ def validate_receipt(receipt: dict) -> None:
     for s in receipt["strategies"]:
         if not isinstance(s, dict) or "id" not in s:
             raise ValueError("each strategy must be a dict with an 'id'")
+    # Numeric fields must not contain NaN/inf — json.dumps emits non-standard
+    # Python-specific literals ("NaN", "Infinity") that are invalid JSON for
+    # any non-Python consumer.  Check the float fields that build_receipt can
+    # produce; ints are not affected (JSON integers are always finite).
+    _tokens = receipt.get("tokens", {})
+    for _key in ("before", "after", "reclaimed", "reclaimed_pct"):
+        _val = _tokens.get(_key)
+        if isinstance(_val, float) and not math.isfinite(_val):
+            raise ValueError(f"tokens.{_key} must be finite, got {_val!r}")
+    _cw = receipt.get("model", {}).get("context_window")
+    if isinstance(_cw, float) and not math.isfinite(_cw):
+        raise ValueError(f"model.context_window must be finite, got {_cw!r}")
