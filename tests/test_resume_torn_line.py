@@ -174,6 +174,27 @@ class TestCliAutoHeal(unittest.TestCase):
             json.loads(l)  # file is now resumable
         self.assertTrue((self.tmp / "sess.jsonl.torn.bak").exists())
 
+    def test_cmd_diagnose_does_NOT_heal_FRESH_torn_session(self):
+        # safety property through the REAL cli wrapper: a torn line on a fresh
+        # (mtime=now) file may be a live mid-write — cmd_diagnose must NOT touch it.
+        from cozempic import cli
+        from types import SimpleNamespace
+
+        p = self.tmp / "live.jsonl"
+        _write(p, [_valid("a"), _valid("b", "a")])
+        with open(p, "a") as f:
+            f.write('{"torn')  # mtime is now -> looks live
+        before = p.read_bytes()
+        with patch("cozempic.cli.resolve_session", return_value=p), \
+                patch("cozempic.cli.load_config"), \
+                patch("cozempic.cli.print_diagnosis"), patch("cozempic.cli.diagnose_session", return_value={}):
+            try:
+                cli.cmd_diagnose(SimpleNamespace(session="x", project=None))
+            except Exception:
+                pass
+        self.assertEqual(p.read_bytes(), before)  # untouched — live write never raced
+        self.assertFalse((self.tmp / "live.jsonl.torn.bak").exists())
+
 
 class TestDoctorUnresumable(unittest.TestCase):
     def setUp(self):

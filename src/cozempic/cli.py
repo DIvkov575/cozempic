@@ -1147,9 +1147,68 @@ def cmd_doctor(args):
     print()
 
 
+def cmd_uninstall(args):
+    """Reverse `cozempic init` — remove hooks, the slash command, and markers.
+
+    Default scope is GLOBAL (~/.claude). Keeps the user's data (savings ledger,
+    receipts) unless --purge. Sets the auto-init opt-out so init won't re-wire.
+    """
+    from .init import preview_uninstall, run_uninstall
+
+    scope = "all" if getattr(args, "all", False) else ("project" if getattr(args, "project", False) else "global")
+    purge = getattr(args, "purge", False)
+
+    print("\n  COZEMPIC UNINSTALL")
+    print("  ═══════════════════════════════════════════════════════════════════")
+    print(f"  Scope: {scope}" + ("  (+ purge data)" if purge else ""))
+
+    if getattr(args, "dry_run", False):
+        prev = preview_uninstall(scope, purge)
+        print("  Dry run — nothing will be changed.\n")
+        print(f"    Hooks would be removed from: {prev['hooks_in'] or '(none)'}")
+        print(f"    Slash command (~/.claude/commands/cozempic.md): "
+              f"{'remove' if prev['slash_command'] else '(not present / not ours)'}")
+        print(f"    Remind counter: {'remove' if prev['remind_counter'] else '(none)'}")
+        if purge:
+            print(f"    Purge data: {prev['purge_data'] or '(none)'}")
+        print()
+        return
+
+    if purge:
+        print("  --purge will DELETE your savings ledger + receipts (~/.cozempic). This is irreversible.")
+        try:
+            if input("  Continue? [y/N] ").strip().lower() != "y":
+                print("  Aborted.\n")
+                return
+        except EOFError:
+            print("  Aborted (no confirmation).\n")
+            return
+
+    result = run_uninstall(scope, purge)
+    n_hooks = sum(len(h.get("removed", [])) for h in result["hooks"])
+    print(f"  Removed {n_hooks} hook(s) across {len(result['hooks'])} settings file(s).")
+    for h in result["hooks"]:
+        if h.get("removed"):
+            print(f"    - {h['settings_path']}: {', '.join(h['removed'])}"
+                  + (f"  (backup: {h['backup_path']})" if h.get("backup_path") else ""))
+    sc = result.get("slash_command")
+    if sc and sc.get("removed"):
+        print(f"  Removed slash command: {sc['path']}"
+              + (f"  (backup: {sc['backup_path']})" if sc.get("backup_path") else ""))
+    elif sc and sc.get("skipped_foreign"):
+        print(f"  Left {sc['path']} in place (not a cozempic command).")
+    if result.get("purged"):
+        print(f"  Purged data: {', '.join(result['purged'])}")
+    if result.get("opt_out_set"):
+        print("  Auto-init disabled. Re-run `cozempic init` to reinstall.")
+    print()
+
+
 def cmd_init(args):
     """Wire cozempic hooks and slash command into the current project (or globally)."""
     if getattr(args, "uninstall_global", False):
+        # Deprecated alias → `cozempic uninstall --global`.
+        print("  Note: `init --uninstall-global` is deprecated; use `cozempic uninstall`.", file=sys.stderr)
         from .init import uninstall_hooks
         result = uninstall_hooks(str(Path.home()))
         print("\n  COZEMPIC INIT — UNINSTALL GLOBAL")
@@ -1732,7 +1791,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_init.add_argument("--cwd", help="Project directory (default: current)")
     p_init.add_argument("--no-slash-command", action="store_true", help="Skip installing /cozempic slash command")
     p_init.add_argument("--global", dest="global_install", action="store_true", help="Wire hooks into ~/.claude/settings.json so every Claude Code session in every project is protected")
-    p_init.add_argument("--uninstall-global", action="store_true", help="Remove cozempic hooks from ~/.claude/settings.json")
+    p_init.add_argument("--uninstall-global", action="store_true", help="(deprecated) use `cozempic uninstall`")
+
+    p_uninstall = sub.add_parser("uninstall", help="Reverse `cozempic init` — remove hooks, slash command, markers (global by default)")
+    p_uninstall.add_argument("--project", action="store_true", help="Uninstall from THIS project's .claude/settings.json (default is global ~/.claude)")
+    p_uninstall.add_argument("--all", action="store_true", help="Uninstall from both global and project")
+    p_uninstall.add_argument("--purge", action="store_true", help="ALSO delete ~/.cozempic data + savings ledger (irreversible; prompts)")
+    p_uninstall.add_argument("--dry-run", action="store_true", help="Show what would be removed without changing anything")
 
     # doctor
     p_doctor = sub.add_parser("doctor", help="Check for known Claude Code issues and fix them")
@@ -1783,7 +1848,7 @@ def build_parser() -> argparse.ArgumentParser:
 _SUBCOMMANDS = {
     "list", "current", "diagnose", "treat", "strategy", "reload",
     "checkpoint", "post-compact", "guard", "init", "doctor", "formulary", "completions",
-    "digest", "self-update", "remind", "guard-watchdog", "dashboard",
+    "digest", "self-update", "remind", "guard-watchdog", "dashboard", "uninstall",
 }
 
 
@@ -1872,6 +1937,7 @@ _AUTO_INIT_SKIP_CMDS = frozenset({
     "doctor",        # diagnostic-only; doctor surfaces missing init via its own check
     "nudge",         # Stop-hook protocol command; never mutate state as a side effect
     "guard-watchdog",  # read-only log scan; never mutate project state
+    "uninstall",     # the whole point is to REMOVE wiring — must never auto-init
     "dashboard",     # report-only; reads/writes only ~/.cozempic, never project state
 })
 
@@ -2288,6 +2354,7 @@ def main():
         "post-compact": cmd_post_compact,
         "guard": cmd_guard,
         "init": cmd_init,
+        "uninstall": cmd_uninstall,
         "doctor": cmd_doctor,
         "guard-watchdog": cmd_guard_watchdog,
         "formulary": cmd_formulary,
