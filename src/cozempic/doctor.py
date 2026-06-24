@@ -1397,6 +1397,79 @@ def fix_zombie_teams() -> str:
 # ─── Registry ────────────────────────────────────────────────────────────────
 
 # (name, check_fn, fix_fn_or_None)
+def _has_torn_trailing_line(path: Path) -> bool:
+    """True if the session's last non-empty line is not valid JSON — a torn
+    write left when the writer was killed mid-append, which makes
+    ``claude --resume`` fail to parse the transcript (#147). Read-only."""
+    try:
+        raw = path.read_text(encoding="utf-8", errors="surrogateescape")
+    except OSError:
+        return False
+    lines = raw.splitlines()
+    last = next((i for i in range(len(lines) - 1, -1, -1) if lines[i].strip()), None)
+    if last is None or last == 0:
+        return False  # empty file, or a single torn line we won't blank out
+    try:
+        json.loads(lines[last])
+        return False
+    except (ValueError, json.JSONDecodeError):
+        return True
+
+
+def check_unresumable_session() -> CheckResult:
+    """Check for sessions with a torn trailing line that breaks ``claude --resume``.
+
+    A process killed mid-append (e.g. a guard terminate-first reload that
+    SIGTERM'd Claude Code mid-line) leaves a partial last line. Claude then
+    can't parse the transcript: ``Failed to resume session <id>``. The torn line
+    is data the writer never finished, so dropping it is safe and restores
+    resume. Ref: Ruya-AI/cozempic#147.
+    """
+    sessions = find_sessions()
+    torn = []
+    for sess in sessions:
+        try:
+            if _has_torn_trailing_line(sess["path"]):
+                torn.append(sess)
+        except (OSError, UnicodeDecodeError):
+            continue
+
+    if not torn:
+        return CheckResult(
+            name="unresumable-session",
+            status="ok",
+            message=f"No sessions with a torn trailing line ({len(sessions)} checked)",
+        )
+
+    details = ", ".join(f"{s['session_id'][:8]}…" for s in torn[:5])
+    return CheckResult(
+        name="unresumable-session",
+        status="issue",
+        message=(
+            f"{len(torn)} session(s) with a torn trailing line: {details}. "
+            f"These fail `claude --resume` (#147)."
+        ),
+        fix_description="Drop the torn trailing line so the session resumes (a .torn.bak is kept)",
+    )
+
+
+def fix_unresumable_session() -> str:
+    """Repair sessions with a torn trailing line (drops the partial last line)."""
+    from .session import repair_torn_trailing_line
+
+    sessions = find_sessions()
+    repaired = 0
+    for sess in sessions:
+        try:
+            if _has_torn_trailing_line(sess["path"]) and repair_torn_trailing_line(sess["path"]):
+                repaired += 1
+        except (OSError, UnicodeDecodeError):
+            continue
+    if repaired == 0:
+        return "No torn trailing lines to repair."
+    return f"Repaired {repaired} session(s) (torn trailing line dropped; .torn.bak kept)."
+
+
 ALL_CHECKS: list[tuple[str, callable, callable | None]] = [
     ("trust-dialog-hang", check_trust_dialog_hang, fix_trust_dialog_hang),
     ("hooks-trust-flag", check_hooks_trust_flag, fix_hooks_trust_flag),
@@ -1406,6 +1479,7 @@ ALL_CHECKS: list[tuple[str, callable, callable | None]] = [
     ("claude-json-corruption", check_claude_json_corruption, fix_claude_json_corruption),
     ("corrupted-tool-use", check_corrupted_tool_use, fix_corrupted_tool_use),
     ("orphaned-tool-results", check_orphaned_tool_results, fix_orphaned_tool_results),
+    ("unresumable-session", check_unresumable_session, fix_unresumable_session),
     ("zombie-teams", check_zombie_teams, fix_zombie_teams),
     ("agent-model-mismatch", check_agent_model_mismatch, None),
     ("oversized-sessions", check_oversized_sessions, None),

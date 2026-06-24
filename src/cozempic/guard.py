@@ -213,6 +213,7 @@ from .session import (
     load_messages,
     load_messages_and_snapshot,
     load_messages_incremental,
+    repair_torn_trailing_line,
     save_messages,
     snapshot_session,
 )
@@ -1842,6 +1843,20 @@ def guard_prune_cycle(
     # full file — safe). Invoked by _terminate_and_resume after _wait_for_exit.
     _write_holder = {"backup": None, "written": False, "error": None}
 
+    def _repair_after_terminate():
+        """#147: when the deferred write is skipped (conflict) or fails, the
+        on-disk file is the one Claude held — and a terminate-first reload may
+        have SIGTERM'd Claude mid-append, leaving a torn trailing line that makes
+        ``claude --resume`` fail. We don't rewrite the file (per #106), but we DO
+        repair a single torn trailing line so the resume the guard is about to
+        trigger can actually succeed. Fully exception-isolated."""
+        try:
+            if repair_torn_trailing_line(session_path):
+                print(f"  [{_now()}] Repaired a torn trailing line for resume (#147).",
+                      file=sys.stderr)
+        except Exception:
+            pass
+
     def _write_pruned_after_exit():
         try:
             with _PruneLock(session_path):
@@ -1870,6 +1885,7 @@ def guard_prune_cycle(
         except (PruneConflictError, PruneLockError) as exc:
             _write_holder["error"] = "conflict"
             print(f"  [{_now()}] Deferred prune write skipped — {exc}", file=sys.stderr)
+            _repair_after_terminate()
         except OSError as exc:
             _write_holder["error"] = "oserror"
             # Disk-full / EIO / permission at the post-kill write instant. The
@@ -1880,6 +1896,7 @@ def guard_prune_cycle(
             # daemon, leaving Claude killed-but-not-resumed. Contain it: leave the
             # full file for resume (written stays False) and let the reload proceed.
             print(f"  [{_now()}] Deferred prune write failed ({exc}) — resuming from full file.", file=sys.stderr)
+            _repair_after_terminate()
 
     result = {
         "saved_mb": saved_bytes / 1024 / 1024,
