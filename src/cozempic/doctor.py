@@ -1405,7 +1405,8 @@ def _has_torn_trailing_line(path: Path) -> bool:
         raw = path.read_text(encoding="utf-8", errors="surrogateescape")
     except OSError:
         return False
-    lines = raw.splitlines()
+    from .session import _split_physical_lines  # \n-only split (NOT splitlines:
+    lines = _split_physical_lines(raw)          # U+2028/2029/0085 are legal in JSON)
     last = next((i for i in range(len(lines) - 1, -1, -1) if lines[i].strip()), None)
     if last is None or last == 0:
         return False  # empty file, or a single torn line we won't blank out

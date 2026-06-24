@@ -60,6 +60,34 @@ class TestRepairHelper(unittest.TestCase):
         self.assertTrue(repair_torn_trailing_line(p))
         self.assertEqual(p.read_text().splitlines(), [_valid("a")])
 
+    def test_valid_last_line_with_unicode_separators_NOT_touched(self):
+        # CC's JS JSON.stringify emits U+2028/U+2029/U+0085 raw inside strings.
+        # str.splitlines() would tear such a VALID last line into fragments and
+        # corrupt it; _split_physical_lines must not. (Fleet HIGH regression.)
+        from cozempic.doctor import _has_torn_trailing_line
+
+        for sep in (chr(0x2028), chr(0x2029), chr(0x85), chr(0x0b), chr(0x1e)):
+            p = self.tmp / f"u{ord(sep)}.jsonl"
+            valid_last = json.dumps({"type": "user", "uuid": "z", "text": f"a{sep}b"},
+                                    ensure_ascii=False)
+            p.write_text(_valid("a") + "\n" + valid_last + "\n", encoding="utf-8")
+            before = p.read_bytes()
+            self.assertFalse(_has_torn_trailing_line(p), f"U+{ord(sep):04X} mis-flagged as torn")
+            self.assertFalse(repair_torn_trailing_line(p), f"U+{ord(sep):04X} wrongly repaired")
+            self.assertEqual(p.read_bytes(), before)  # byte-identical, untouched
+            self.assertFalse((self.tmp / f"u{ord(sep)}.jsonl.torn.bak").exists())
+
+    def test_multibyte_truncation_torn_line_repaired(self):
+        # a realistic torn write: valid non-ASCII line + a line truncated mid-UTF8
+        p = self.tmp / "mb.jsonl"
+        good = json.dumps({"type": "user", "uuid": "g", "text": "café 日本語"}, ensure_ascii=False)
+        data = (good + "\n").encode("utf-8") + '{"type":"user","text":"中'.encode("utf-8")[:-1]  # chop a multibyte
+        p.write_bytes(data)
+        self.assertTrue(repair_torn_trailing_line(p))
+        lines = p.read_text(encoding="utf-8", errors="surrogateescape").splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(json.loads(lines[0])["text"], "café 日本語")  # non-ASCII preserved exactly
+
     def test_missing_file_returns_false(self):
         self.assertFalse(repair_torn_trailing_line(self.tmp / "nope.jsonl"))
 

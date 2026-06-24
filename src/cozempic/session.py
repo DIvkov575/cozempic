@@ -1175,7 +1175,11 @@ def repair_torn_trailing_line(path: Path) -> bool:
         return False
     if not raw:
         return False
-    lines = raw.splitlines()
+    # MUST use _split_physical_lines, NOT str.splitlines(): the latter also breaks
+    # on U+2028/U+2029/U+0085 + C0 controls, which are LEGAL raw inside JSON strings
+    # (CC's JS JSON.stringify emits them unescaped). splitlines() would tear a VALID
+    # last line into fragments → false "torn" → drop real data on a healthy session.
+    lines = _split_physical_lines(raw)
     last = next((i for i in range(len(lines) - 1, -1, -1) if lines[i].strip()), None)
     if last is None:
         return False
