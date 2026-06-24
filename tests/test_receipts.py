@@ -50,6 +50,16 @@ class TestWriteReceipt(unittest.TestCase):
     def tearDown(self):
         self._patch.stop()
 
+    def test_receipt_files_and_dir_are_user_only(self):
+        # de-identified but local provenance — must not be world-readable on a
+        # shared host (receipt file 0o600, receipts dir 0o700).
+        import stat
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _emit(tmp)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode) & 0o077, 0)  # no group/other
+            self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode) & 0o077, 0)
+
     def test_emit_creates_session_file_and_index(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = _emit(tmp)

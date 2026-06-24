@@ -1147,6 +1147,57 @@ def save_messages(
     return backup_path
 
 
+def repair_torn_trailing_line(path: Path) -> bool:
+    """Make a session resumable after a writer was killed mid-append.
+
+    If the file's last non-empty line is not valid JSON — the signature of a
+    write torn off when Claude Code was SIGTERM'd mid-line (e.g. by a guard
+    terminate-first reload), which makes ``claude --resume`` fail to parse the
+    transcript — atomically drop that ONE line so the file parses again. The
+    torn line is data the writer never finished flushing, so it is already
+    unrecoverable; removing it is strictly safe and strictly improves resume.
+
+    Conservative by design:
+      * Only a SINGLE torn trailing line is removed (Claude appends one line at
+        a time, so only the in-flight line can be torn).
+      * If the last line is valid JSON, nothing changes (corruption — if any —
+        is elsewhere, and this helper must never mask a deeper problem).
+      * A file whose ONLY line is torn is left untouched (blanking it can't help
+        resume and would be needlessly destructive).
+      * A ``.torn.bak`` copy of the original is written first (best-effort).
+
+    Returns True iff a repair was written. Never raises.
+    """
+    try:
+        raw = path.read_text(encoding="utf-8", errors="surrogateescape")
+    except OSError:
+        return False
+    if not raw:
+        return False
+    lines = raw.splitlines()
+    last = next((i for i in range(len(lines) - 1, -1, -1) if lines[i].strip()), None)
+    if last is None:
+        return False
+    try:
+        json.loads(lines[last])
+        return False  # trailing line parses → nothing torn to repair
+    except (ValueError, json.JSONDecodeError):
+        pass
+    kept = lines[:last]  # drop the torn line (and any trailing blank lines)
+    if not kept:
+        return False  # only line is torn — don't blank the file
+    try:
+        from .helpers import atomic_write_text
+        try:
+            shutil.copy2(path, path.with_suffix(path.suffix + ".torn.bak"))
+        except OSError:
+            pass
+        atomic_write_text(path, "\n".join(kept) + "\n", errors="surrogateescape")
+        return True
+    except Exception:
+        return False
+
+
 def cleanup_old_backups(session_path: Path, keep: int = 3) -> int:
     """Delete old timestamped .jsonl.bak files for this session, keeping the newest `keep`.
 

@@ -80,7 +80,9 @@ def _append_line(path: Path, line: str) -> None:
     any unparseable line and the prune itself is never affected.
     """
     data = (line + "\n").encode("utf-8")
-    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    # 0o600: receipts are de-identified but still local provenance — keep them
+    # user-only so another local user on a shared host can't read them.
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
     try:
         os.write(fd, data)
     finally:
@@ -95,6 +97,10 @@ def write_receipt(receipt: dict, *, base_dir: Path | None = None) -> Path | None
     try:
         directory = receipts_dir(base_dir)
         directory.mkdir(parents=True, exist_ok=True)
+        try:
+            directory.chmod(0o700)  # user-only (best-effort; harmless if unsupported)
+        except OSError:
+            pass
         path = directory / f"{_session_stem(receipt)}.jsonl"
         _append_line(path, serialize_receipt(receipt))
         _append_index(directory, receipt)
