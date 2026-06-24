@@ -168,6 +168,47 @@ class TestGuardRepairsOnTerminate(unittest.TestCase):
             json.loads(l)
         self.assertEqual(len(lines), 2)
 
+    def test_oserror_skip_repairs_torn_line(self):
+        # the OSError branch (disk-full/EIO at the post-kill write) also leaves
+        # Claude's file in place -> it must repair the torn line too, and must
+        # not raise (it runs after terminate, before the resume watcher spawns).
+        from cozempic.guard import guard_prune_cycle
+        from cozempic.team import TeamState
+        from types import SimpleNamespace
+
+        team = MagicMock(spec=TeamState)
+        team.is_empty.return_value = True
+        team.team_name = None
+        team.message_count = 0
+        orig = [(0, {"type": "user"}, 100_000)]
+        pruned = [(0, {"type": "user"}, 40_000)]
+        totals = iter([100_000, 40_000])
+
+        def est(*a, **k):
+            try:
+                t = next(totals)
+            except StopIteration:
+                t = 40_000
+            return SimpleNamespace(total=t, context_pct=0.0, method="exact",
+                                   confidence="high", model="claude-opus-4-8", context_window=200000)
+
+        with patch("cozempic.guard._guard_tmp_root", return_value=self.tmp), \
+                patch("cozempic.guard.load_messages_and_snapshot", return_value=(orig, MagicMock())), \
+                patch("cozempic.guard.load_messages", return_value=orig), \
+                patch("cozempic.guard.prune_with_team_protect", return_value=(pruned, [], team)), \
+                patch("cozempic.guard.snapshot_session", return_value=MagicMock()), \
+                patch("cozempic.tokens.estimate_session_tokens", side_effect=est), \
+                patch("cozempic.tokens.calibrate_ratio", return_value=0.5), \
+                patch("cozempic.guard.save_messages", side_effect=OSError("disk full")):
+            result = guard_prune_cycle(session_path=self.session, rx_name="gentle",
+                                       config=None, auto_reload=False)
+            result.get("_deferred_writer")()  # OSError -> skip write -> repair, must not raise
+
+        lines = self.session.read_text().splitlines()
+        for l in lines:
+            json.loads(l)
+        self.assertEqual(len(lines), 2)
+
 
 if __name__ == "__main__":
     unittest.main()
