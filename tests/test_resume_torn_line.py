@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import shutil
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -66,6 +67,84 @@ class TestRepairHelper(unittest.TestCase):
         p = self.tmp / "e.jsonl"
         p.write_text("")
         self.assertFalse(repair_torn_trailing_line(p))
+
+
+class TestAutoRepairIdleGate(unittest.TestCase):
+    """The critical safety property: auto-repair must NEVER race a live write."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="cz147a_"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _torn(self):
+        p = self.tmp / "s.jsonl"
+        _write(p, [_valid("a")])
+        with open(p, "a") as f:
+            f.write('{"type":"user","par')  # torn, no newline
+        return p
+
+    def test_repairs_when_idle(self):
+        from cozempic.session import auto_repair_unresumable
+        import os as _os
+
+        p = self._torn()
+        old = time.time() - 3600
+        _os.utime(p, (old, old))  # make it stale (dead session)
+        self.assertTrue(auto_repair_unresumable(p, min_idle_seconds=10))
+        for l in p.read_text().splitlines():
+            json.loads(l)
+
+    def test_does_NOT_repair_fresh_file(self):
+        # a torn line on a just-written file may be Claude mid-append — must NOT
+        # be touched (would race/clobber a live write, #106).
+        from cozempic.session import auto_repair_unresumable
+
+        p = self._torn()  # mtime = now
+        self.assertFalse(auto_repair_unresumable(p, min_idle_seconds=10))
+        self.assertIn('{"type":"user","par', p.read_text())  # left intact
+        self.assertFalse((self.tmp / "s.jsonl.torn.bak").exists())
+
+    def test_idle_valid_file_untouched(self):
+        from cozempic.session import auto_repair_unresumable
+        import os as _os
+
+        p = self.tmp / "ok.jsonl"
+        _write(p, [_valid("a"), _valid("b", "a")])
+        old = time.time() - 3600
+        _os.utime(p, (old, old))
+        self.assertFalse(auto_repair_unresumable(p))  # nothing torn
+
+
+class TestCliAutoHeal(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="cz147c_"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_cmd_diagnose_heals_idle_torn_session(self):
+        import os as _os
+        from cozempic import cli
+
+        p = self.tmp / "sess.jsonl"
+        _write(p, [_valid("a"), _valid("b", "a")])
+        with open(p, "a") as f:
+            f.write('{"torn')
+        old = time.time() - 3600
+        _os.utime(p, (old, old))  # idle/dead
+        with patch("cozempic.cli.resolve_session", return_value=p), \
+                patch("cozempic.cli.load_config"), \
+                patch("cozempic.cli.print_diagnosis"), patch("cozempic.cli.diagnose_session", return_value={}):
+            from types import SimpleNamespace
+            try:
+                cli.cmd_diagnose(SimpleNamespace(session="x", project=None))
+            except Exception:
+                pass  # downstream printing may need more; we only assert the heal
+        for l in p.read_text().splitlines():
+            json.loads(l)  # file is now resumable
+        self.assertTrue((self.tmp / "sess.jsonl.torn.bak").exists())
 
 
 class TestDoctorUnresumable(unittest.TestCase):

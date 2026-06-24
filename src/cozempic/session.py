@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -1196,6 +1197,29 @@ def repair_torn_trailing_line(path: Path) -> bool:
         return True
     except Exception:
         return False
+
+
+def auto_repair_unresumable(path: Path, min_idle_seconds: float = 10.0) -> bool:
+    """Auto-repair a torn trailing line, but ONLY when no live writer is active.
+
+    A torn trailing line on a freshly-written file is almost always Claude Code
+    **mid-append** — it will be a complete line milliseconds later. Repairing
+    THAT would race and clobber a live write (the #106 data-loss class we exist
+    to prevent). So we only repair when the file has been idle for at least
+    ``min_idle_seconds`` (mtime staleness = no active writer): a real crash
+    artifact (a session Claude can no longer resume) is always stale, while a
+    live mid-write is not. This makes recovery automatic for silently-affected
+    users (any cozempic command that touches the dead session heals it) without
+    ever risking a healthy live session.
+
+    Returns True iff a repair was written. Never raises.
+    """
+    try:
+        if time.time() - path.stat().st_mtime < min_idle_seconds:
+            return False  # possibly a live mid-write — never race it
+    except OSError:
+        return False
+    return repair_torn_trailing_line(path)
 
 
 def cleanup_old_backups(session_path: Path, keep: int = 3) -> int:

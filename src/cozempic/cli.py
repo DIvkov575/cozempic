@@ -247,6 +247,19 @@ def cmd_list(args):
     print()
 
 
+def _auto_heal_session(path):
+    """#147: silently repair a torn trailing line on an IDLE (dead) session so a
+    user troubleshooting a 'Failed to resume' just by running a cozempic command
+    auto-recovers — without ever racing a live write (gated on mtime staleness).
+    Best-effort; never raises."""
+    try:
+        from .session import auto_repair_unresumable
+        if path and auto_repair_unresumable(path):
+            print(f"  Repaired a torn trailing line — this session can resume again (.torn.bak kept). (#147)")
+    except Exception:
+        pass
+
+
 def cmd_current(args):
     cwd = args.cwd or None
     match_text = getattr(args, "match", None)
@@ -260,6 +273,7 @@ def cmd_current(args):
     print(f"    ID:      {sess['session_id']}")
     print(f"    Size:    {fmt_bytes(sess['size'])} ({sess['lines']} messages)")
 
+    _auto_heal_session(sess["path"])
     from .tokens import detect_context_window, detect_model
     messages_for_model = load_messages(sess["path"])
     context_window = detect_context_window(messages_for_model)
@@ -306,6 +320,7 @@ def cmd_current(args):
 
 def cmd_diagnose(args):
     path = resolve_session(args.session, getattr(args, "project", None))
+    _auto_heal_session(path)
     messages = load_messages(path)
     diag = diagnose_session(messages)
     print_diagnosis(diag, path)
