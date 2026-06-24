@@ -1,6 +1,6 @@
 # Cozempic
 
-![Downloads](https://img.shields.io/badge/downloads-150k%2B-brightgreen) ![Version](https://img.shields.io/badge/version-1.8.34-blue) ![License](https://img.shields.io/badge/license-MIT-lightgrey)
+![Downloads](https://img.shields.io/badge/downloads-150k%2B-brightgreen) ![Version](https://img.shields.io/badge/version-1.8.35-blue) ![License](https://img.shields.io/badge/license-MIT-lightgrey)
 
 **50,000+ power users** trust Cozempic to keep their Claude Code sessions lean.
 
