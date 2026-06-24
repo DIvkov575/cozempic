@@ -477,6 +477,151 @@ def run_init(project_dir: str, skip_slash: bool = False) -> dict:
     }
 
 
+# ── Uninstall (reverse of init) ───────────────────────────────────────────────
+
+# Stable content signature of cozempic's /cozempic slash command, used to avoid
+# clobbering an unrelated user-authored ~/.claude/commands/cozempic.md.
+_SLASH_SIGNATURE = "prune bloated Claude Code context"
+_GLOBAL_INIT_MARKER = Path.home() / ".cozempic_global_initialized"
+_REMIND_COUNTER = Path.home() / ".cozempic_remind_counter"
+
+
+def _global_slash_path() -> Path:
+    from .session import get_claude_dir
+    return get_claude_dir() / "commands" / "cozempic.md"
+
+
+def _slash_is_ours(content: str) -> bool:
+    """True if this cozempic.md is cozempic's (vs a user's unrelated command)."""
+    return _SLASH_SIGNATURE in content or content.lower().count("cozempic") >= 5
+
+
+def uninstall_slash_command() -> dict:
+    """Remove the GLOBAL /cozempic slash command (~/.claude/commands/cozempic.md),
+    but only when it is cozempic's (content signature) so a user's unrelated
+    cozempic.md is never deleted. Backs it up (.md.bak) first. Idempotent;
+    never raises destructively.
+
+    Returns: {removed: bool, path: str|None, backup_path: str|None, skipped_foreign: bool}
+    """
+    target = _global_slash_path()
+    out = {"removed": False, "path": str(target), "backup_path": None, "skipped_foreign": False}
+    if not target.exists():
+        out["path"] = None
+        return out
+    try:
+        content = target.read_text(encoding="utf-8", errors="surrogateescape")
+    except OSError:
+        return out
+    if not _slash_is_ours(content):
+        out["skipped_foreign"] = True
+        return out
+    try:
+        backup = target.with_suffix(".md.bak")
+        shutil.copy2(target, backup)
+        out["backup_path"] = str(backup)
+    except OSError:
+        pass
+    try:
+        target.unlink()
+        out["removed"] = True
+    except OSError:
+        pass
+    return out
+
+
+def preview_uninstall(scope: str = "global", purge: bool = False) -> dict:
+    """Read-only: report what `run_uninstall(scope, purge)` WOULD remove. No writes."""
+    scopes = {"global": [str(Path.home())], "project": ["."],
+              "all": [str(Path.home()), "."]}.get(scope, [str(Path.home())])
+    hook_targets = []
+    for d in scopes:
+        p = _settings_path(d)
+        if p.exists() and _settings_has_cozempic_hooks(p):
+            hook_targets.append(str(p))
+    slash = _global_slash_path()
+    slash_present = False
+    if scope in ("global", "all") and slash.exists():
+        try:
+            slash_present = _slash_is_ours(slash.read_text(encoding="utf-8", errors="surrogateescape"))
+        except OSError:
+            slash_present = False
+    data = []
+    if purge:
+        for p in (Path.home() / ".cozempic", Path.home() / ".cozempic_savings.json"):
+            if p.exists():
+                data.append(str(p))
+    return {"hooks_in": hook_targets, "slash_command": slash_present,
+            "remind_counter": _REMIND_COUNTER.exists(), "purge_data": data}
+
+
+def _settings_has_cozempic_hooks(path: Path) -> bool:
+    try:
+        settings = _load_settings(path)
+    except (OSError, json.JSONDecodeError):
+        return False
+    hooks = settings.get("hooks", {})
+    if not isinstance(hooks, dict):
+        return False
+    for entries in hooks.values():
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if isinstance(entry, dict):
+                for h in entry.get("hooks", []) or []:
+                    if isinstance(h, dict) and _is_cozempic_command(h.get("command", "")):
+                        return True
+    return False
+
+
+def run_uninstall(scope: str = "global", purge: bool = False) -> dict:
+    """Reverse cozempic init. scope: 'global' | 'project' | 'all'.
+
+    Removes hooks (per scope), the global slash command (global/all), the remind
+    counter, and — with purge — the ~/.cozempic data dir + savings ledger. ALWAYS
+    leaves the global-init marker in place as the auto-init opt-out, so init does
+    not silently re-wire on the next run (explicit `cozempic init` still works).
+    """
+    dirs = {"global": [str(Path.home())], "project": ["."],
+            "all": [str(Path.home()), "."]}.get(scope, [str(Path.home())])
+    result: dict = {"scope": scope, "hooks": [], "slash_command": None,
+                    "remind_counter_removed": False, "purged": [], "opt_out_set": False}
+
+    for d in dirs:
+        result["hooks"].append(uninstall_hooks(d))
+
+    if scope in ("global", "all"):
+        result["slash_command"] = uninstall_slash_command()
+
+    # Cleanup the nudge counter (cosmetic, safe).
+    try:
+        if _REMIND_COUNTER.exists():
+            _REMIND_COUNTER.unlink()
+            result["remind_counter_removed"] = True
+    except OSError:
+        pass
+
+    # Opt-out: keep auto-init from re-wiring after uninstall.
+    try:
+        _GLOBAL_INIT_MARKER.touch()
+        result["opt_out_set"] = True
+    except OSError:
+        pass
+
+    if purge:
+        import shutil as _sh
+        for p in (Path.home() / ".cozempic", Path.home() / ".cozempic_savings.json"):
+            try:
+                if p.is_dir():
+                    _sh.rmtree(p); result["purged"].append(str(p))
+                elif p.exists():
+                    p.unlink(); result["purged"].append(str(p))
+            except OSError:
+                pass
+
+    return result
+
+
 def uninstall_hooks(project_dir: str) -> dict:
     """Remove cozempic-installed hooks from a settings.json. Idempotent.
 
