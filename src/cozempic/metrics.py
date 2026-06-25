@@ -280,11 +280,16 @@ def build_receipt(
         if tokens_before is not None and tokens_after is not None
         else None
     )
-    reclaimed_pct = (
-        round(tokens_reclaimed / tokens_before * 100, 1)
-        if tokens_reclaimed is not None and tokens_before
-        else 0.0
-    )
+    # Guard against OverflowError (huge tokens_before from corrupt data) and
+    # ZeroDivisionError (tokens_before=0 edge case not caught by truthiness).
+    # math.isfinite guard handles any NaN/inf that could slip through.
+    reclaimed_pct = 0.0
+    if tokens_reclaimed is not None and tokens_before:
+        try:
+            candidate = round(tokens_reclaimed / tokens_before * 100, 1)
+            reclaimed_pct = candidate if math.isfinite(candidate) else 0.0
+        except (OverflowError, ZeroDivisionError):
+            reclaimed_pct = 0.0
     method = result.token_method or "unknown"
 
     bytes_before = result.original_total_bytes
@@ -300,11 +305,25 @@ def build_receipt(
     total_strategy_bytes = sum(strat_bytes)
     sr_token_alloc = [0] * len(strat_bytes)
     if tokens_reclaimed and tokens_reclaimed > 0 and total_strategy_bytes:
-        shares = [tokens_reclaimed * b / total_strategy_bytes for b in strat_bytes]
-        floors = [math.floor(s) for s in shares]
-        remainder = tokens_reclaimed - sum(floors)  # in [0, len) by construction
-        order = sorted(range(len(shares)), key=lambda i: shares[i] - floors[i], reverse=True)
-        for k in range(remainder):
+        # Integer arithmetic only — Python ints are arbitrary-precision so
+        # tokens_reclaimed * b never overflows, even for huge tokens_reclaimed
+        # (e.g. 10**400). The old float path raised OverflowError on huge values,
+        # zeroing ALL strategy attributions. Total_strategy_bytes is always a
+        # non-negative int (sum of non-negative ints above), so no ValueError.
+        #
+        # Hamilton (largest-remainder) in int:
+        #   floor_share[i]   = tokens_reclaimed * b[i] // total_strategy_bytes
+        #   fractional[i]    = tokens_reclaimed * b[i] %  total_strategy_bytes
+        # Distribute leftover (tokens_reclaimed - sum(floors)) to strategies with
+        # the largest fractional parts so the per-strategy values sum EXACTLY to
+        # tokens_reclaimed.
+        # divmod computes floor and remainder in one multiplication per strategy.
+        pairs = [divmod(tokens_reclaimed * b, total_strategy_bytes) for b in strat_bytes]
+        floors = [q for q, _ in pairs]
+        remainders = [r for _, r in pairs]
+        leftover = tokens_reclaimed - sum(floors)  # non-negative by construction
+        order = sorted(range(len(strat_bytes)), key=lambda i: remainders[i], reverse=True)
+        for k in range(leftover):
             floors[order[k]] += 1
         sr_token_alloc = floors
 
@@ -388,8 +407,15 @@ _REQUIRED_TOP_KEYS = (
 
 
 def serialize_receipt(receipt: dict) -> str:
-    """One compact JSON line (JSONL), trailing newline excluded."""
-    return json.dumps(receipt, separators=(",", ":"), ensure_ascii=False)
+    """One compact JSON line (JSONL), trailing newline excluded.
+
+    ``allow_nan=False`` raises ``ValueError`` on NaN/inf rather than writing
+    the non-standard Python literals ``NaN`` / ``Infinity`` that are invalid
+    JSON for any non-Python consumer.  ``validate_receipt`` is a standalone
+    contract validator (used by tests / external callers); this is the
+    production output-boundary guard.
+    """
+    return json.dumps(receipt, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
 
 
 def validate_receipt(receipt: dict) -> None:
@@ -422,3 +448,18 @@ def validate_receipt(receipt: dict) -> None:
     for s in receipt["strategies"]:
         if not isinstance(s, dict) or "id" not in s:
             raise ValueError("each strategy must be a dict with an 'id'")
+    # Numeric fields must not contain NaN/inf — json.dumps emits non-standard
+    # Python-specific literals ("NaN", "Infinity") that are invalid JSON for
+    # any non-Python consumer.  Check the float fields that build_receipt can
+    # produce; ints are not affected (JSON integers are always finite).
+    def _assert_finite(section: str, key: str, val) -> None:
+        if isinstance(val, float) and not math.isfinite(val):
+            raise ValueError(f"{section}.{key} must be finite, got {val!r}")
+
+    _tokens = receipt.get("tokens", {})
+    for _key in ("before", "after", "reclaimed", "reclaimed_pct"):
+        _assert_finite("tokens", _key, _tokens.get(_key))
+    _bytes = receipt.get("bytes", {})
+    for _key in ("before", "after", "reclaimed"):
+        _assert_finite("bytes", _key, _bytes.get(_key))
+    _assert_finite("model", "context_window", receipt.get("model", {}).get("context_window"))

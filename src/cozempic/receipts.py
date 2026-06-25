@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 
+from ._validation import _BOOL_FALSE_TOKENS, _BOOL_TRUE_TOKENS
 from .metrics import (
     ProtectedInfo,
     TriggerInfo,
@@ -31,6 +33,9 @@ RECEIPTS_DIRNAME = "receipts"
 INDEX_FILENAME = "index.jsonl"
 _OPT_OUT_ENV = "COZEMPIC_NO_RECEIPTS"
 
+# Pre-compiled: called on every write_receipt path; compiling per-call is wasted work.
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+
 
 def receipts_dir(base_dir: Path | None = None) -> Path:
     """Directory receipts live in (``~/.cozempic/receipts`` by default)."""
@@ -39,8 +44,35 @@ def receipts_dir(base_dir: Path | None = None) -> Path:
 
 
 def receipts_enabled() -> bool:
-    """False if the user opted out via ``COZEMPIC_NO_RECEIPTS``."""
-    return not os.environ.get(_OPT_OUT_ENV)
+    """False if the user opted out via ``COZEMPIC_NO_RECEIPTS``.
+
+    Receipts are ON by default (``COZEMPIC_NO_RECEIPTS`` unset or empty).
+
+    Truth table (case-insensitive, whitespace stripped):
+      * unset / empty / whitespace-only  → True  (receipts ON — treated as absent)
+      * explicit falsy: 0, false, no, off → True  (receipts ON — "no, don't disable")
+      * explicit truthy: 1, true, yes, on → False (receipts OFF — opted out)
+      * any other non-empty value         → False (receipts OFF — privacy fail-safe:
+                                                    ambiguous opt-out intent -> disabled)
+
+    Deliberate divergence from ``not parse_env_bool(...)`` (which would ENABLE
+    receipts for unrecognized values via its default=False fallback): for a
+    PRIVACY opt-out knob the fail-safe direction must be "disabled", not
+    "enabled".  A user who sets ``COZEMPIC_NO_RECEIPTS=disabled`` intends to
+    opt out; silently re-enabling receipts would be a privacy regression.
+    """
+    raw = os.environ.get(_OPT_OUT_ENV)
+    if raw is None:
+        return True  # unset → ON (default)
+    normalized = raw.strip().lower()
+    if not normalized:
+        return True  # empty / whitespace-only → ON (treated as absent)
+    if normalized in _BOOL_FALSE_TOKENS:
+        return True   # explicit falsy ("no, don't disable") → ON
+    if normalized in _BOOL_TRUE_TOKENS:
+        return False  # explicit truthy ("yes, disable") → OFF
+    # Unrecognized non-empty value → privacy fail-safe: assume opt-out intent → OFF
+    return False
 
 
 def _tool_version() -> str:
@@ -64,6 +96,10 @@ def _session_stem(receipt: dict) -> str:
     for ch in ("/", "\\", os.sep, os.altsep or ""):
         if ch:
             stem = stem.replace(ch, "_")
+    # Strip control characters (U+0000–001F, U+007F) — a corrupt id_hash with
+    # \x00 would cause the kernel to reject the path (silently dropped by
+    # write_receipt's except); \n would create a file with a newline in its name.
+    stem = _CONTROL_CHARS_RE.sub("", stem)
     stem = stem.lstrip(".")
     return stem[:32] or "unknown"
 
@@ -122,7 +158,9 @@ def _append_index(directory: Path, receipt: dict) -> None:
             "tokens_reclaimed": receipt["tokens"]["reclaimed"],
             "bytes_reclaimed": receipt["bytes"]["reclaimed"],
         }
-        _append_line(directory / INDEX_FILENAME, json.dumps(summary, separators=(",", ":")))
+        # allow_nan=False: same guard as serialize_receipt — invalid JSON in the
+        # index would cause the aggregator to silently skip that entry on load.
+        _append_line(directory / INDEX_FILENAME, json.dumps(summary, separators=(",", ":"), allow_nan=False))
     except Exception:
         pass  # index is an optimization; its loss must not fail the receipt
 

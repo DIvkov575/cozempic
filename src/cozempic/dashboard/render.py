@@ -19,6 +19,8 @@ import os
 import tempfile
 from pathlib import Path
 
+from .._constants import _MAX_RECEIPT_INT
+
 DEFAULT_FILENAME = "dashboard.html"
 
 
@@ -29,26 +31,74 @@ def _esc(value) -> str:
     return html.escape("" if value is None else str(value))
 
 
+def _is_finite_num(v) -> bool:
+    """True iff v is a non-bool finite int or float — safe for :.Nf formatting."""
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
 def _fmt_int(n) -> str:
-    return f"{int(n):,}" if isinstance(n, (int, float)) else "0"
+    """Format an integer with thousands separators.
+
+    Guards NaN/inf (ValueError/OverflowError on int()) and huge ints
+    (clamp to _MAX_RECEIPT_INT so f-string stays finite).
+    """
+    if not isinstance(n, (int, float)) or isinstance(n, bool):
+        return "0"
+    try:
+        v = int(n)
+    except (ValueError, OverflowError):
+        return "0"
+    # Bound magnitude (display length) but PRESERVE sign, consistent with
+    # _fmt_tokens/_fmt_bytes which keep the sign of in-range values.
+    v = max(-_MAX_RECEIPT_INT, min(v, _MAX_RECEIPT_INT))
+    return f"{v:,}"
 
 
 def _fmt_tokens(n) -> str:
-    n = int(n) if isinstance(n, (int, float)) else 0
-    if abs(n) >= 999_950:  # rolls 999,999 up to "1.0M" rather than "1000.0K"
-        return f"{n / 1_000_000:.1f}M"
-    if abs(n) >= 1_000:
-        return f"{n / 1_000:.1f}K"
-    return str(n)
+    """Format a token count as "1.2M" / "1.2K" / raw integer string.
+
+    Clamps magnitude to _MAX_RECEIPT_INT before float division to prevent
+    OverflowError on corrupt huge-int values.  Sign is preserved for
+    in-range values (negative reclaimed is unusual but must not crash).
+    """
+    if not isinstance(n, (int, float)) or isinstance(n, bool):
+        return "0"
+    try:
+        v = int(n)
+    except (ValueError, OverflowError):
+        return "0"
+    sign = -1 if v < 0 else 1
+    mag = min(abs(v), _MAX_RECEIPT_INT)
+    if mag >= 999_950:  # rolls 999,999 up to "1.0M" rather than "1000.0K"
+        return f"{sign * mag / 1_000_000:.1f}M"
+    if mag >= 1_000:
+        return f"{sign * mag / 1_000:.1f}K"
+    return str(sign * mag)
 
 
 def _fmt_bytes(n) -> str:
-    n = float(n) if isinstance(n, (int, float)) else 0.0
+    """Format a byte count as "1.2 GB" / "1.2 MB" / "1.2 KB" / "N B".
+
+    Clamps integer magnitude to _MAX_RECEIPT_INT BEFORE float conversion
+    (mirroring _fmt_tokens) so huge ints (>= 10**309 overflow float) are
+    clamped to a finite value rather than hitting the OverflowError path.
+    Sign is preserved for in-range values.
+    """
+    if not isinstance(n, (int, float)) or isinstance(n, bool):
+        return "0 B"
+    try:
+        i = int(n)
+    except (ValueError, OverflowError):
+        return "0 B"
+    sign = -1 if i < 0 else 1
+    mag = min(abs(i), _MAX_RECEIPT_INT)  # clamp int magnitude first, like _fmt_tokens
+    v = float(mag)  # _MAX_RECEIPT_INT=10**15 is well within float range; always finite
     for unit in ("B", "KB", "MB", "GB"):
-        if abs(n) < 1024 or unit == "GB":
-            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
-        n /= 1024
-    return f"{n:.1f} GB"
+        if v < 1024 or unit == "GB":
+            sv = sign * v
+            return f"{sv:.0f} {unit}" if unit == "B" else f"{sv:.1f} {unit}"
+        v /= 1024
+    return "0 B"  # unreachable — loop always returns; kept for type-checker
 
 
 def _pretty_label(slug) -> str:
@@ -83,7 +133,7 @@ def _sparkline(timeline) -> str:
     vals = []
     for e in timeline:
         p = e.get("context_pct_after")
-        if isinstance(p, (int, float)) and not isinstance(p, bool) and math.isfinite(p):
+        if _is_finite_num(p):
             vals.append(p)
     if len(vals) < 2:
         return '<span class="spark-na">—</span>'
@@ -145,11 +195,13 @@ def _lifetime_band(ledger: dict | None) -> str:
         chips.append((_fmt_int(ledger["prune_count"]), "Prunes Applied"))
     if ledger.get("turns_gained"):
         chips.append((f"~{_fmt_int(ledger['turns_gained'])}", "Est. Extra Turns"))
-    if ledger.get("savings_rate_pct") is not None:
+    _rate = ledger.get("savings_rate_pct")
+    if _is_finite_num(_rate):
         # saved/processed (processed is cumulative-with-overlap) — NOT a per-prune average
-        chips.append((f"{ledger['savings_rate_pct']:.1f}%", "Reclaimed of Processed"))
-    if ledger.get("session_multiplier_x"):
-        chips.append((f"{ledger['session_multiplier_x']:.2f}×", "Longer Per Pruned Session"))
+        chips.append((f"{_rate:.1f}%", "Reclaimed of Processed"))
+    _mult = ledger.get("session_multiplier_x")
+    if _is_finite_num(_mult):
+        chips.append((f"{_mult:.2f}×", "Longer Per Pruned Session"))
     cells = "".join(
         f'<div class="lt-cell"><div class="lt-n">{_esc(n)}</div>'
         f'<div class="lt-l">{_esc(label)}</div></div>'

@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from .._constants import _MAX_RECEIPT_INT
 from ..receipts import INDEX_FILENAME, receipts_dir
 
 # Minimal shape a line must have to be treated as a receipt (forward-compatible:
@@ -59,8 +60,19 @@ def load_receipts(base_dir: Path | None = None) -> list[dict]:
 
 
 def _int(value) -> int:
-    """Coerce a possibly-None / non-int metric to int (unknown or bool -> 0)."""
-    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+    """Coerce a possibly-None / non-int metric to int.
+
+    Returns 0 for: non-int, bool, negative, or values exceeding _MAX_RECEIPT_INT
+    (corruption/tampering sentinel).  Sign is preserved for in-range positives.
+    Negative reclaimed values must not subtract from lifetime totals — callers
+    that need the reclaimed SUM to stay non-negative use max(0, sum(_int(...)));
+    see aggregate() below.
+    """
+    if not isinstance(value, int) or isinstance(value, bool):
+        return 0
+    if value < 0 or value > _MAX_RECEIPT_INT:
+        return 0
+    return value
 
 
 def _d(obj, key) -> dict:
@@ -72,11 +84,26 @@ def _d(obj, key) -> dict:
 
 
 def _context_pct(receipt: dict):
-    """Post-prune context usage %, if both numbers are present."""
+    """Post-prune context usage %, if both numbers are present and valid.
+
+    Returns None (renders as "—") when either value is a bool, negative,
+    zero, or exceeds _MAX_RECEIPT_INT — any of those would produce a
+    meaningless or overflow-inducing result from the float division.
+    """
     after = _d(receipt, "tokens").get("after")
     window = _d(receipt, "model").get("context_window")
-    if isinstance(after, int) and isinstance(window, int) and window:
-        return round(after / window * 100, 1)
+    if (
+        isinstance(after, int) and not isinstance(after, bool)
+        and isinstance(window, int) and not isinstance(window, bool)
+        and after >= 0  # negative after -> nonsensical negative %; same class as negative window
+        and window > 0
+        and after <= _MAX_RECEIPT_INT
+        and window <= _MAX_RECEIPT_INT
+    ):
+        # Cap at 100%: a corrupt receipt with after > window would otherwise
+        # return a huge % that blows out the sparkline scale (one spike erases
+        # every other bar). Context usage can never exceed the window.
+        return round(min(after / window * 100, 100.0), 1)
     return None
 
 
@@ -102,8 +129,10 @@ def aggregate(receipts: list[dict]) -> dict:
         # auto-prune deferrals do NOT yet — so this rate currently reflects mostly
         # the manual path. Wiring guard deferrals is a tracked follow-up.
         "deferral_rate": round(deferred / total, 3) if total else 0.0,
-        "tokens_reclaimed": sum(_int(_d(r, "tokens").get("reclaimed")) for r in committed),
-        "bytes_reclaimed": sum(_int(_d(r, "bytes").get("reclaimed")) for r in committed),
+        # max(0, ...) is belt-and-suspenders: _int already returns 0 for negatives,
+        # but an empty sum() legitimately returns 0 and max(0, 0) == 0.
+        "tokens_reclaimed": max(0, sum(_int(_d(r, "tokens").get("reclaimed")) for r in committed)),
+        "bytes_reclaimed":  max(0, sum(_int(_d(r, "bytes").get("reclaimed")) for r in committed)),
         "sessions": len({_d(r, "session").get("id_hash") or "unknown" for r in receipts}),
         "first_ts": min(timestamps) if timestamps else None,
         "last_ts": max(timestamps) if timestamps else None,
@@ -116,10 +145,13 @@ def aggregate(receipts: list[dict]) -> dict:
         for s in strategies if isinstance(strategies, list) else []:
             if not isinstance(s, dict):
                 continue
+            # s.get("id") returns None for an explicit JSON null — `or "unknown"`
+            # handles both missing key (default) and explicit null.
+            sid = s.get("id") or "unknown"
+            tier = s.get("tier") or "unknown"
             row = strat.setdefault(
-                s.get("id", "unknown"),
-                {"id": s.get("id", "unknown"), "tier": s.get("tier", "unknown"),
-                 "tokens_reclaimed": 0, "bytes_reclaimed": 0, "count": 0},
+                sid,
+                {"id": sid, "tier": tier, "tokens_reclaimed": 0, "bytes_reclaimed": 0, "count": 0},
             )
             row["tokens_reclaimed"] += _int(s.get("tokens_reclaimed"))
             row["bytes_reclaimed"] += _int(s.get("bytes_reclaimed"))
@@ -168,10 +200,15 @@ def aggregate(receipts: list[dict]) -> dict:
             "context_pct_after": _context_pct(r),
         })
     for row in sessions.values():
-        row["timeline"].sort(key=lambda e: e.get("ts") or "")
+        # Coerce ts to str for sorting — a corrupt receipt with an int ts would
+        # cause TypeError when mixed with str ts values (Python 3 strict ordering).
+        row["timeline"].sort(key=lambda e: e.get("ts") if isinstance(e.get("ts"), str) else "")
     per_session = sorted(
         sessions.values(),
-        key=lambda x: (x["timeline"][-1].get("ts") if x["timeline"] else "") or "",
+        key=lambda x: (
+            (x["timeline"][-1].get("ts") if isinstance(x["timeline"][-1].get("ts"), str) else "")
+            if x["timeline"] else ""
+        ),
         reverse=True,
     )
 

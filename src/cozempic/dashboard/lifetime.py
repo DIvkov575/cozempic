@@ -15,6 +15,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from .._constants import _MAX_RECEIPT_INT
+
 
 def lifetime_path() -> Path:
     """Where helpers.record_savings writes the lifetime ledger."""
@@ -22,14 +24,29 @@ def lifetime_path() -> Path:
 
 
 def _num_or_zero(value) -> int:
-    """Coerce a numeric ledger field to int (bool/garbage -> 0; floats truncated)."""
+    """Coerce a numeric ledger field to int (bool/garbage/huge/negative -> 0;
+    floats truncated).
+
+    The `int(value)` call never raises for a Python arbitrary-precision int,
+    so the `except (ValueError, OverflowError)` branch handles only
+    float('nan') -> ValueError and float('inf') -> OverflowError.
+
+    Out-of-bound values (> _MAX_RECEIPT_INT or < 0) return 0, mirroring
+    aggregate._int for sibling parity.  Returning 10**15 for a huge int
+    would fabricate a "1 billion M tokens" headline in the Lifetime band;
+    returning 0 causes the early-out in load_lifetime to suppress the band
+    entirely, which is the correct response to corrupt data.
+    """
     if isinstance(value, bool):
         return 0
     if isinstance(value, (int, float)):
         try:
-            return int(value)
+            result = int(value)
         except (ValueError, OverflowError):
             return 0
+        if result < 0 or result > _MAX_RECEIPT_INT:
+            return 0
+        return result
     return 0
 
 
@@ -62,7 +79,11 @@ def load_lifetime(path: Path | None = None) -> dict | None:
     tracked_prunes = _num_or_zero(data.get("tracked_prunes"))
     multiplier = None
     if sessions >= 5 and rate is not None and tracked_prunes > 0:
-        multiplier = round(1 + (tracked_prunes / sessions) * (rate / 100), 2)
+        raw = round(1 + (tracked_prunes / sessions) * (rate / 100), 2)
+        # A multiplier >100,000× is nonsensical (e.g. tracked_prunes=10**15,
+        # sessions=5 → ~2×10**14); suppress it so the dashboard doesn't render
+        # garbage like "200000000000001.00×".
+        multiplier = raw if raw <= 100_000 else None
     since = data.get("since")
     return {
         "tokens_saved": saved,
