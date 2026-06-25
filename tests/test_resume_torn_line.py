@@ -40,6 +40,31 @@ class TestRepairHelper(unittest.TestCase):
         # original preserved as .torn.bak
         self.assertTrue((self.tmp / "s.jsonl.torn.bak").exists())
 
+    def test_second_repair_is_noop(self):
+        # repair, then call again — the file is already valid, so the second call
+        # must be a no-op (return False) and must NOT overwrite the .torn.bak with
+        # the now-repaired content (last-repair-wins only when there's a real tear).
+        p = self.tmp / "s.jsonl"
+        _write(p, [_valid("a"), _valid("b", "a"), '{"type":"user","uuid":"c","par'])
+        self.assertTrue(repair_torn_trailing_line(p))
+        bak = self.tmp / "s.jsonl.torn.bak"
+        bak_bytes = bak.read_bytes()           # backup holds the original (3-line) torn file
+        repaired_bytes = p.read_bytes()
+        self.assertFalse(repair_torn_trailing_line(p))  # already valid -> no-op
+        self.assertEqual(p.read_bytes(), repaired_bytes)  # file unchanged
+        self.assertEqual(bak.read_bytes(), bak_bytes)     # backup NOT overwritten on a no-op
+
+    def test_repair_overwrites_preexisting_bak(self):
+        # a torn -> healed -> torn-again file: the new repair overwrites the prior
+        # .torn.bak with the CURRENT original (documented last-repair-wins policy).
+        p = self.tmp / "s.jsonl"
+        bak = self.tmp / "s.jsonl.torn.bak"
+        bak.write_text("stale prior backup")
+        _write(p, [_valid("a"), '{"torn second time'])
+        self.assertTrue(repair_torn_trailing_line(p))
+        self.assertIn('{"torn second time', bak.read_text())  # bak = the current original
+        self.assertNotIn("stale prior backup", bak.read_text())
+
     def test_noop_when_last_line_valid(self):
         p = self.tmp / "s.jsonl"
         _write(p, [_valid("a"), _valid("b", "a")])
