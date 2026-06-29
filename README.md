@@ -35,7 +35,11 @@ Cozempic removes it with **18 composable strategies** across 3 prescription tier
 Pick your package manager. `uvx`/`pipx`/`npm`/`pip` are the lowest-friction (no Homebrew trust prompt — see the note below):
 
 ```bash
-# uv / uvx — no install needed, run on demand (recommended)
+# uv — persistent install, always on PATH (recommended)
+uv tool install cozempic
+
+# uvx — run once without installing (handy to try it, but the guard daemon
+# can't auto-start from an ephemeral env — use `uv tool install` for that)
 uvx cozempic --help
 
 # pipx — isolated user install, always on PATH

@@ -10,6 +10,7 @@ This module automates both so `cozempic init` is the only setup step.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 from datetime import datetime
@@ -314,6 +315,50 @@ class _SettingsLock:
             pass
 
 
+def _resolve_cozempic_python() -> tuple[str, bool]:
+    """Return (abs_python, ephemeral) for baking into hook commands (#158).
+
+    abs_python is the absolute interpreter currently running cozempic
+    (``sys.executable``), used as the hook fallback so the guard daemon resolves
+    even when bare ``cozempic`` isn't on the hook's PATH and the *system*
+    ``python3`` lacks cozempic (the exact failure on a uvx/non-PATH install).
+    ``ephemeral`` is True when that interpreter lives in a throwaway env (uvx /
+    uv-run cache / temp) that won't exist next session — in which case baking it
+    can't help and the caller should warn the user to ``uv tool install``.
+    """
+    # Use sys.executable AS-IS — do NOT realpath it. A uv-tool / pipx / venv
+    # install's sys.executable is that venv's python (whose site-packages HAS
+    # cozempic); resolving the symlink to the shared base interpreter would drop
+    # cozempic from `-m cozempic` and break the very install we recommend.
+    exe = sys.executable or ""
+    ephemeral = any(m in exe for m in (
+        "/.cache/uv/", "/cache/uv/", "/environments-v", "/uv-run", "/tmp/", "/var/folders/",
+    ))
+    return exe, ephemeral
+
+
+def _bake_cozempic_path(hooks: dict, abs_python: str) -> dict:
+    """Deep-copy ``hooks`` and replace the bare ``python3 -m cozempic`` fallback in
+    every command with an absolute ``<abs_python> -m cozempic``, so the hook
+    resolves cozempic regardless of the runtime PATH/system-python (#158). The
+    primary ``cozempic`` (on-PATH) invocation is left first; this only hardens the
+    fallback. Never mutates the canonical module constant. The schema marker is
+    untouched, so cozempic-hook detection/idempotency is unaffected."""
+    import copy
+    import shlex
+    q = shlex.quote(abs_python)
+    out = copy.deepcopy(hooks)
+    for entries in out.values():
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            for h in entry.get("hooks", []) if isinstance(entry, dict) else []:
+                cmd = h.get("command") if isinstance(h, dict) else None
+                if isinstance(cmd, str) and "python3 -m cozempic" in cmd:
+                    h["command"] = cmd.replace("python3 -m cozempic", f"{q} -m cozempic")
+    return out
+
+
 def wire_hooks(project_dir: str) -> dict:
     """Add cozempic checkpoint hooks to .claude/settings.json.
 
@@ -355,7 +400,12 @@ def wire_hooks(project_dir: str) -> dict:
         updated: list[str] = []
         skipped: list[str] = []
 
-        for event_name, hook_entries in COZEMPIC_HOOKS.items():
+        # #158: bake the absolute interpreter into the hook fallback so the guard
+        # resolves even when bare `cozempic` isn't on the hook's PATH.
+        abs_python, ephemeral = _resolve_cozempic_python()
+        canonical_hooks = _bake_cozempic_path(COZEMPIC_HOOKS, abs_python)
+
+        for event_name, hook_entries in canonical_hooks.items():
             existing = hooks.get(event_name, [])
 
             for new_entry in hook_entries:
@@ -422,6 +472,8 @@ def wire_hooks(project_dir: str) -> dict:
         "skipped": skipped,
         "settings_path": str(path),
         "backup_path": str(backup) if backup else None,
+        "ephemeral": ephemeral,        # #158: True if cozempic runs from a throwaway env
+        "cozempic_python": abs_python,
     }
 
 
