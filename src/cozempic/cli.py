@@ -397,6 +397,52 @@ def _emit_prune_receipt(path, pr, *, source, outcome, session_id=None, cwd=None,
         pass
 
 
+# Prescription ladder, lightest → heaviest. gentle ⊂ standard ⊂ aggressive
+# (strict strategy subsets), so a lighter prescription removes strictly less and
+# is monotonically MORE likely to pass post-prune validation (e.g. the C3
+# conversation-survival check). That monotonicity is what makes graceful
+# fall-back sound: try the requested tier, then progressively lighter ones.
+_RX_LADDER = ["gentle", "standard", "aggressive"]
+
+
+def _fallback_order(rx_name):
+    """Requested prescription first, then each lighter one (heaviest-safe-first).
+
+    e.g. 'aggressive' → ['aggressive', 'standard', 'gentle']; 'gentle' → ['gentle'].
+    A custom (non-ladder) prescription has no lighter sibling → just itself.
+    """
+    if rx_name not in _RX_LADDER:
+        return [rx_name]
+    i = _RX_LADDER.index(rx_name)
+    return [_RX_LADDER[j] for j in range(i, -1, -1)]
+
+
+def run_prescription_with_fallback(messages, rx_name, config, *, strict=False):
+    """Run ``rx_name``; if it fails post-prune validation (e.g. C3 would wipe the
+    conversation), fall back to the heaviest LIGHTER prescription that validates.
+
+    Returns a dict: ``{messages, results, applied_rx, requested_rx, fell_back,
+    error}``. On total failure (even the lightest prescription would wipe the
+    conversation — a genuinely too-thin / freshly-compacted session), ``messages``
+    is None and ``error`` is the last PruneValidationError. ``strict=True`` disables
+    fall-back (only the requested tier is tried) for deterministic scripts/CI.
+    """
+    order = [rx_name] if strict else _fallback_order(rx_name)
+    last_err = None
+    for rx in order:
+        names = PRESCRIPTIONS.get(rx)
+        if not names:
+            continue
+        try:
+            new_messages, results = run_prescription(messages, names, config)
+            return {"messages": new_messages, "results": results, "applied_rx": rx,
+                    "requested_rx": rx_name, "fell_back": rx != rx_name, "error": None}
+        except PruneValidationError as exc:
+            last_err = exc
+    return {"messages": None, "results": None, "applied_rx": None,
+            "requested_rx": rx_name, "fell_back": False, "error": last_err}
+
+
 def cmd_treat(args):
     path = resolve_session(args.session, getattr(args, "project", None), strict=getattr(args, "execute", False))
     # Take snapshot BEFORE load so append-conflict detection in save_messages
@@ -429,18 +475,22 @@ def cmd_treat(args):
         tag_pattern_matches(messages, protect_patterns)
 
     try:
-        new_messages, strategy_results = run_prescription(messages, strategy_names, config)
-    except PruneValidationError as ve:
-        check = ve.evidence.get("failed_check", "?")
-        print(
-            f"  Prune validation failed ({check}): {ve.reason}",
-            file=sys.stderr,
-        )
-        print(
-            "  Session file was not modified. Fix the structural issue or choose a different prescription.",
-            file=sys.stderr,
-        )
-        sys.exit(5)
+        _fb = run_prescription_with_fallback(messages, rx_name, config,
+                                             strict=getattr(args, "strict", False))
+        if _fb["error"] is not None:
+            ve = _fb["error"]
+            check = ve.evidence.get("failed_check", "?")
+            print(f"  This session can't be pruned safely — every prescription would "
+                  f"remove the conversation ({check}: {ve.reason}).", file=sys.stderr)
+            print("  Nothing to do (this usually means a very thin / freshly-compacted "
+                  "session). The session file was not modified.", file=sys.stderr)
+            return
+        new_messages, strategy_results = _fb["messages"], _fb["results"]
+        if _fb["fell_back"]:
+            print(f"  Note: '{_fb['requested_rx']}' would have wiped the conversation here "
+                  f"— applied the safe maximum '{_fb['applied_rx']}' instead.")
+            rx_name = _fb["applied_rx"]  # reflect what was actually applied downstream
+            strategy_names = PRESCRIPTIONS[rx_name]
     finally:
         # Strip the transient tag from EVERY message (crash-safe), so it can never
         # persist into the saved session.
@@ -748,18 +798,22 @@ def cmd_reload(args):
             tag_pattern_matches(messages, protect_patterns)
 
         try:
-            new_messages, strategy_results = run_prescription(messages, strategy_names, config)
-        except PruneValidationError as ve:
-            check = ve.evidence.get("failed_check", "?")
-            print(
-                f"  Prune validation failed ({check}): {ve.reason}",
-                file=sys.stderr,
-            )
-            print(
-                "  Session file was not modified. Fix the structural issue or choose a different prescription.",
-                file=sys.stderr,
-            )
-            sys.exit(5)
+            _fb = run_prescription_with_fallback(messages, rx_name, config,
+                                                 strict=getattr(args, "strict", False))
+            if _fb["error"] is not None:
+                ve = _fb["error"]
+                check = ve.evidence.get("failed_check", "?")
+                print(f"  This session can't be pruned safely — every prescription would "
+                      f"remove the conversation ({check}: {ve.reason}).", file=sys.stderr)
+                print("  Reload skipped — nothing to do (very thin / freshly-compacted "
+                      "session). The session was not modified or terminated.", file=sys.stderr)
+                return
+            new_messages, strategy_results = _fb["messages"], _fb["results"]
+            if _fb["fell_back"]:
+                print(f"  Note: '{_fb['requested_rx']}' would have wiped the conversation here "
+                      f"— applied the safe maximum '{_fb['applied_rx']}' instead.")
+                rx_name = _fb["applied_rx"]
+                strategy_names = PRESCRIPTIONS[rx_name]
         finally:
             if protect_patterns:
                 strip_pattern_tags(messages)
@@ -1727,6 +1781,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_treat = sub.add_parser("treat", help="Run prescription (dry-run by default)")
     p_treat.add_argument("session", help=session_help)
     p_treat.add_argument("-rx", help="Prescription: gentle, standard, aggressive")
+    p_treat.add_argument("--strict", action="store_true", help="Fail (exit 5) if the prescription can't be applied, instead of falling back to a lighter one")
     p_treat.add_argument("--execute", action="store_true", help="Apply changes (default is dry-run)")
     p_treat.add_argument("--project", help="Filter by project name")
     p_treat.add_argument("--thinking-mode", choices=["remove", "truncate", "signature-only"], help="Thinking block mode")
@@ -1746,6 +1801,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_reload = sub.add_parser("reload", help="Treat current session and auto-resume after exit")
     p_reload.add_argument("--cwd", help="Working directory (default: current)")
     p_reload.add_argument("-rx", help="Prescription: gentle, standard, aggressive (default: standard)")
+    p_reload.add_argument("--strict", action="store_true", help="Fail (exit 5) if the prescription can't be applied, instead of falling back to a lighter one")
     p_reload.add_argument("--thinking-mode", choices=["remove", "truncate", "signature-only"])
     p_reload.add_argument("--session", help="Explicit session ID, UUID prefix, or .jsonl path (bypasses auto-detection)")
     p_reload.add_argument("--protect-pattern", action="append", metavar="REGEX",
