@@ -4,7 +4,6 @@ guard daemon resolves even when bare `cozempic` isn't on the hook's PATH."""
 from __future__ import annotations
 
 import json
-import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -54,6 +53,19 @@ class TestResolveAndBake(unittest.TestCase):
             with patch("cozempic.init.sys.executable", p):
                 _, eph = cz._resolve_cozempic_python()
                 self.assertTrue(eph, f"{p} should be ephemeral")
+
+    def test_resolve_degrades_when_sys_executable_empty(self):
+        # exotic frozen interpreters can have an empty sys.executable — must NOT
+        # return "" (which would bake an empty `'' -m cozempic` no-op command).
+        with patch("cozempic.init.sys.executable", ""), \
+                patch("cozempic.init.shutil.which", return_value="/usr/bin/python3"):
+            got, _ = cz._resolve_cozempic_python()
+            self.assertEqual(got, "/usr/bin/python3")
+
+    def test_bake_skips_when_abs_python_empty(self):
+        hooks = {"E": [{"hooks": [{"command": "python3 -m cozempic x"}]}]}
+        out = cz._bake_cozempic_path(hooks, "")
+        self.assertEqual(out["E"][0]["hooks"][0]["command"], "python3 -m cozempic x")  # untouched
 
     def test_resolve_flags_persistent_not_ephemeral(self):
         for p in ("/Users/x/.local/share/uv/tools/cozempic/bin/python3.12",

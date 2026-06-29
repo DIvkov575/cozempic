@@ -10,7 +10,6 @@ This module automates both so `cozempic init` is the only setup step.
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import sys
 from datetime import datetime
@@ -330,7 +329,9 @@ def _resolve_cozempic_python() -> tuple[str, bool]:
     # install's sys.executable is that venv's python (whose site-packages HAS
     # cozempic); resolving the symlink to the shared base interpreter would drop
     # cozempic from `-m cozempic` and break the very install we recommend.
-    exe = sys.executable or ""
+    # Degrade to a real `python3` if sys.executable is empty (exotic frozen
+    # interpreters) so the baked fallback is never an empty command.
+    exe = sys.executable or shutil.which("python3") or "python3"
     ephemeral = any(m in exe for m in (
         "/.cache/uv/", "/cache/uv/", "/environments-v", "/uv-run", "/tmp/", "/var/folders/",
     ))
@@ -346,8 +347,10 @@ def _bake_cozempic_path(hooks: dict, abs_python: str) -> dict:
     untouched, so cozempic-hook detection/idempotency is unaffected."""
     import copy
     import shlex
-    q = shlex.quote(abs_python)
     out = copy.deepcopy(hooks)
+    if not abs_python:
+        return out  # never bake an empty command — keep the original fallback
+    q = shlex.quote(abs_python)
     for entries in out.values():
         if not isinstance(entries, list):
             continue
