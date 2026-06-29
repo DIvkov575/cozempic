@@ -56,9 +56,10 @@ STORM_TRIP = 5
 # The guard's back-off cap (HARD_LOOP_BACKOFF_CAP), recorded for diagnostics.
 BACKOFF_CAP_S = 300
 
-# The token-count group must tolerate the K/M/G suffix and comma grouping that
-# guard._fmt_prune_result emits ("210.0K tokens freed", "1.2M tokens freed") for
-# any prune >= 1000 tokens — WITHOUT this, every productive prune line is
+# The token-count group must tolerate the suffix guard._fmt_prune_result emits:
+# in practice only "K" (e.g. "210.0K tokens freed") or a bare integer — a 1.2M-token
+# prune renders as "1200.0K", never "1.2M". The regex stays permissive ([KMG]?,
+# commas) as a harmless superset. WITHOUT this, every productive prune line is
 # unparsed, so the futile-dominance ratio skews to ~1.0 and the watchdog
 # FALSE-FLAGS a healthy daemon as looping (and --fix would SIGTERM it). The count
 # is matched but NOT captured (the percent is the only capture group, group 1, and

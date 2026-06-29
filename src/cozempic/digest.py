@@ -857,8 +857,10 @@ def _sanitize_for_injection(text: str, limit: int = 300) -> str:
     text = re.sub(r"[\x00-\x1f\x7f]+", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     # Defang a leading markdown-structural char so the value can't render as a
-    # header/quote/list/fence at the start of its line.
-    if text[:1] in "#>-*`|":
+    # header/quote/list/fence at the start of its line. Guard on a non-empty
+    # first char: `"" in "#>-*`|"` is True (empty str is a substring of every
+    # str), which would prepend a stray backslash to an emptied rule.
+    if text and text[0] in "#>-*`|":
         text = "\\" + text
     if len(text) > limit:
         text = text[:limit] + "…"
