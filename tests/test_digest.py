@@ -259,6 +259,16 @@ class TestInjectionSanitization(unittest.TestCase):
         self.assertTrue(san("> quote").startswith("\\>"))
         self.assertTrue(san("```fence").startswith("\\`"))
 
+    def test_sanitizer_empty_or_control_input_is_not_backslash(self):
+        # an emptied rule (all whitespace/control) must sanitize to "" — NOT a lone
+        # backslash. `"" in "#>-*`|"` is True (empty str ⊂ every str), the trap the
+        # codebase warns about; guard on a non-empty first char.
+        from cozempic.digest import _sanitize_for_injection as san
+        self.assertEqual(san(""), "")
+        self.assertEqual(san("   "), "")
+        self.assertEqual(san("\x00\x01"), "")
+        self.assertEqual(san("\t\n  \r"), "")
+
     def test_injection_text_has_no_extra_lines_from_rule(self):
         from cozempic.digest import build_injection_text, DigestStore, DigestRule
         # A rule whose text tries to add fake markdown lines/instructions.

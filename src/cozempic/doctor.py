@@ -675,7 +675,13 @@ def fix_corrupted_tool_use() -> str:
                         delta = None
                     if delta is not None:
                         from .helpers import atomic_write_text
-                        atomic_write_text(path, "".join(lines) + "".join(delta))
+                        # errors="surrogateescape": the appended delta is decoded
+                        # with surrogateescape (_parse_delta_lines), so a valid
+                        # JSONL line with a raw non-UTF-8 byte carries lone
+                        # surrogates — a strict write would raise UnicodeEncodeError
+                        # and abort the run. Round-trip them like every other write.
+                        atomic_write_text(path, "".join(lines) + "".join(delta),
+                                          errors="surrogateescape")
                         total_fixed += fixed_in_session
                         sessions_fixed += 1
                 else:  # "unchanged" — safe to write our repaired buffer
