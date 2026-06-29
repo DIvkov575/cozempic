@@ -1323,6 +1323,17 @@ def cmd_init(args):
         for h in hooks["skipped"]:
             print(f"    ~ {h} (current, skipped)")
 
+    # #158: if cozempic is running from a throwaway env (uvx / uv run), the path
+    # baked into the hooks won't exist next session, so the guard daemon can't
+    # auto-start. Warn loudly and point at a persistent install.
+    if hooks.get("ephemeral"):
+        print()
+        print("  ⚠ cozempic is running from an EPHEMERAL environment (e.g. `uvx`).")
+        print("    The guard daemon will NOT auto-start on the next session — the hook")
+        print("    can't find cozempic. Install persistently so it lands on PATH:")
+        print("        uv tool install cozempic")
+        print("    then re-run `cozempic init`.")
+
     print()
 
     # Report slash command
