@@ -1756,9 +1756,9 @@ def cmd_digest(args):
     from .digest import (
         clear_digest_store, flush_digest,
         load_digest_store, recover_digest,
-        save_digest_store, show_digest, update_digest,
+        save_digest_store, show_digest,
     )
-    from .session import load_messages, save_messages
+    from .session import load_messages
 
     action = getattr(args, "digest_action", "show") or "show"
 
@@ -1766,12 +1766,13 @@ def cmd_digest(args):
         print(show_digest())
 
     elif action == "update":
-        session_path, session_id, cwd = _digest_session(args)
-        messages = load_messages(session_path)
-        added, upvoted, rejected = update_digest(
-            messages, project_dir=cwd, session_id=session_id,
-        )
-        print(f"Digest updated: {added} new, {upvoted} reinforced, {rejected} rejected.")
+        print("digest update is retired; memory is now extracted via the memory subsystem")
+
+    elif action == "migrate":
+        from .memory.migrate import migrate_digest_rules
+        session_id = getattr(args, "session", None) or "digest-migration"
+        n = migrate_digest_rules(session_id)
+        print(f"Migrated {n} active digest rule(s) to memories.")
 
     elif action == "clear":
         clear_digest_store()
@@ -1965,8 +1966,8 @@ def build_parser() -> argparse.ArgumentParser:
     # digest
     p_digest = sub.add_parser("digest", help="Manage behavioral correction rules")
     p_digest.add_argument("digest_action", nargs="?", default="show",
-                          choices=["show", "update", "clear", "flush", "recover", "inject"],
-                          help="Action: show (default), update, clear, flush, recover, inject")
+                          choices=["show", "update", "migrate", "clear", "flush", "recover", "inject"],
+                          help="Action: show (default), update (retired), migrate, clear, flush, recover, inject")
     p_digest.add_argument("--session", help=session_help)
     p_digest.add_argument("--cwd", help="Working directory (default: current)")
 

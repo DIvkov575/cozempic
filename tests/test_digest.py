@@ -24,9 +24,7 @@ from cozempic.digest import (
     _to_prohibition,
     admit_rule,
     build_injection_text,
-    classify_turn,
     clear_digest_store,
-    extract_corrections,
     load_digest_store,
     save_digest_store,
     score_rule,
@@ -89,63 +87,7 @@ def make_sidechain_assistant(line_idx: int, text: str) -> tuple[int, dict, int]:
 
 
 # ---------------------------------------------------------------------------
-# classify_turn
-# ---------------------------------------------------------------------------
-
-class TestClassifyTurn(unittest.TestCase):
-
-    def test_explicit_no(self):
-        self.assertEqual(classify_turn("No, don't do that"), "EXPLICIT_CORRECTION")
-
-    def test_explicit_dont(self):
-        self.assertEqual(classify_turn("don't add Co-Authored-By"), "EXPLICIT_CORRECTION")
-
-    def test_explicit_do_not(self):
-        self.assertEqual(classify_turn("do not use Write on existing files"), "EXPLICIT_CORRECTION")
-
-    def test_explicit_stop(self):
-        self.assertEqual(classify_turn("stop adding comments to every function"), "EXPLICIT_CORRECTION")
-
-    def test_explicit_never(self):
-        self.assertEqual(classify_turn("never push to main without asking"), "EXPLICIT_CORRECTION")
-
-    def test_explicit_please_dont(self):
-        self.assertEqual(classify_turn("please don't summarize after each change"), "EXPLICIT_CORRECTION")
-
-    def test_implicit_actually(self):
-        self.assertEqual(classify_turn("actually, use the other approach"), "IMPLICIT_CORRECTION")
-
-    def test_implicit_instead(self):
-        self.assertEqual(classify_turn("instead, use Edit not Write"), "IMPLICIT_CORRECTION")
-
-    def test_implicit_thats_not(self):
-        self.assertEqual(classify_turn("that's not what I meant"), "IMPLICIT_CORRECTION")
-
-    def test_preference_always(self):
-        self.assertEqual(classify_turn("always use snake_case for variables"), "PREFERENCE")
-
-    def test_preference_from_now_on(self):
-        self.assertEqual(classify_turn("from now on, run tests after each change"), "PREFERENCE")
-
-    def test_preference_remember(self):
-        self.assertEqual(classify_turn("remember to check for null values"), "PREFERENCE")
-
-    def test_apology_follow_up(self):
-        result = classify_turn("use the correct import path", "sorry about that mistake")
-        self.assertEqual(result, "APOLOGY_FOLLOW_UP")
-
-    def test_none_normal(self):
-        self.assertEqual(classify_turn("can you read that file?"), "NONE")
-
-    def test_none_short(self):
-        self.assertEqual(classify_turn("ok"), "NONE")
-
-    def test_none_empty(self):
-        self.assertEqual(classify_turn(""), "NONE")
-
-
-# ---------------------------------------------------------------------------
-# _to_prohibition
+# _to_prohibition (retained — used by load_digest_store auto-migration)
 # ---------------------------------------------------------------------------
 
 class TestToProhibition(unittest.TestCase):
@@ -167,73 +109,6 @@ class TestToProhibition(unittest.TestCase):
     def test_no_prefix(self):
         result = _to_prohibition("No, use Edit instead")
         self.assertEqual(result, "Use Edit instead")
-
-
-# ---------------------------------------------------------------------------
-# extract_corrections
-# ---------------------------------------------------------------------------
-
-class TestExtractCorrections(unittest.TestCase):
-
-    def test_extracts_explicit_correction(self):
-        messages = [
-            make_assistant(0, "I'll add Co-Authored-By"),
-            make_user(1, "don't add Co-Authored-By to commits"),
-        ]
-        rules = extract_corrections(messages)
-        self.assertEqual(len(rules), 1)
-        self.assertEqual(rules[0].priority, "hard")
-        self.assertIn("Co-Authored-By", rules[0].evidence)
-
-    def test_extracts_preference(self):
-        messages = [
-            make_user(0, "always use snake_case for function names"),
-        ]
-        rules = extract_corrections(messages)
-        self.assertEqual(len(rules), 1)
-        self.assertEqual(rules[0].source_reliability, 0.9)
-
-    def test_skips_normal_messages(self):
-        messages = [
-            make_user(0, "can you read the config file?"),
-            make_assistant(1, "sure, let me read it"),
-        ]
-        rules = extract_corrections(messages)
-        self.assertEqual(len(rules), 0)
-
-    def test_respects_since_turn(self):
-        messages = [
-            make_user(0, "don't do that"),  # Before window
-            make_assistant(1, "ok"),
-            make_user(2, "stop using mocks"),  # In window
-        ]
-        rules = extract_corrections(messages, since_turn=2)
-        self.assertEqual(len(rules), 1)
-        self.assertIn("mock", rules[0].evidence.lower())
-
-    def test_infers_git_scope(self):
-        messages = [make_user(0, "don't push to main branch")]
-        rules = extract_corrections(messages)
-        self.assertEqual(rules[0].scope, "git")
-
-    def test_infers_file_scope(self):
-        messages = [make_user(0, "don't use Write on existing files")]
-        rules = extract_corrections(messages)
-        self.assertEqual(rules[0].scope, "file-ops")
-
-    def test_rejects_text_over_200_chars(self):
-        """Long inputs are rejected (BUG-2 hardening) — extract_corrections skips them.
-
-        Previously this test asserted the rule was capped at 500 chars ("don't " + 1000 x chars),
-        but that behavior allowed 500 chars of raw noise to be "Do not "-prefixed and truncated
-        mid-tag — the root cause of the R001 = `Do not <local-command-caveat>...` pollution.
-        After BUG-2 fix, inputs > 200 chars return "" from _to_prohibition and extract_corrections
-        skips the turn.
-        """
-        long_text = "don't " + "x" * 1000
-        messages = [make_user(0, long_text)]
-        rules = extract_corrections(messages)
-        self.assertEqual(len(rules), 0)
 
 
 # ---------------------------------------------------------------------------
@@ -460,7 +335,10 @@ class TestUpdateDigest(unittest.TestCase):
         import shutil
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
-    def test_end_to_end(self):
+    def test_update_digest_is_retired_no_op(self):
+        """The regex extractor is retired: `update_digest` mines no rules and
+        always returns (0, 0, 0), but still stamps/persists session metadata so
+        the flush/hook path's persistence guarantees are unchanged."""
         messages = [
             make_assistant(0, "I'll add the Co-Authored-By line"),
             make_user(1, "don't add Co-Authored-By to commits"),
@@ -474,12 +352,13 @@ class TestUpdateDigest(unittest.TestCase):
         with patch("cozempic.digest.DIGEST_DIR", self.tmpdir), \
              patch("cozempic.digest.DIGEST_FILE", digest_file), \
              patch("cozempic.digest.DIGEST_MD_FILE", digest_md):
-            added, upvoted, rejected = update_digest(messages, project_dir="/test")
-            self.assertGreater(added, 0)
+            result = update_digest(messages, project_dir="/test", session_id="s1")
+            self.assertEqual(result, (0, 0, 0))
 
-            # Verify persisted
+            # No rules mined, but the store is persisted with session metadata.
             data = json.loads(digest_file.read_text())
-            self.assertGreater(len(data["strategy_rules"]), 0)
+            self.assertEqual(data["strategy_rules"], [])
+            self.assertEqual(data["session_id"], "s1")
 
 
 # ---------------------------------------------------------------------------
@@ -551,12 +430,10 @@ class TestDigestStore(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestSystemNoiseFilter(unittest.TestCase):
-    """digest must recognise Claude-Code synthetic noise and skip it.
+    """digest must recognise Claude-Code synthetic noise.
 
-    Current behavior (RED target): every synthetic user turn containing
-    "don't", "never", "no, " etc. becomes a hard active rule.
-    Expected behavior (post-fix): `_is_system_noise(text)` returns True
-    for synthetic wrappers, and `extract_corrections` skips those turns.
+    `_is_system_noise(text)` returns True for synthetic/framework wrappers so
+    `load_digest_store`'s auto-migration can demote inherited noise rules.
     """
 
     # ---- _is_system_noise unit tests ----
@@ -666,46 +543,6 @@ class TestSystemNoiseFilter(unittest.TestCase):
         is_noise = _import_system_noise()
         self.assertFalse(is_noise("stop adding summaries"))
 
-    # ---- extract_corrections must skip noisy turns ----
-
-    def test_extract_skips_local_command_caveat(self):
-        messages = [
-            make_user(0, "<local-command-caveat>The user ran /compact</local-command-caveat>"),
-        ]
-        rules = extract_corrections(messages)
-        self.assertEqual(len(rules), 0,
-                         "extract_corrections must skip synthetic <local-command-caveat> turns")
-
-    def test_extract_skips_system_reminder(self):
-        messages = [
-            make_user(0,
-                "<system-reminder>Please don't forget to run tests</system-reminder>"),
-        ]
-        rules = extract_corrections(messages)
-        self.assertEqual(len(rules), 0,
-                         "extract_corrections must skip <system-reminder> synthetic turns")
-
-    def test_extract_skips_init_prompt(self):
-        messages = [
-            make_user(0,
-                "Please analyze this codebase and create a CLAUDE.md describing it. "
-                "Do not include secrets."),
-        ]
-        rules = extract_corrections(messages)
-        self.assertEqual(len(rules), 0,
-                         "extract_corrections must skip /init synthetic turns")
-
-    def test_extract_keeps_genuine_correction_after_noisy_turn(self):
-        messages = [
-            make_user(0, "<local-command-caveat>The user ran /init</local-command-caveat>"),
-            make_assistant(1, "ok"),
-            make_user(2, "don't add Co-Authored-By to commits"),
-        ]
-        rules = extract_corrections(messages)
-        self.assertEqual(len(rules), 1,
-                         "genuine correction after noise must still be captured")
-        self.assertIn("Co-Authored-By", rules[0].evidence)
-
 
 # ---------------------------------------------------------------------------
 # BUG-2 — _to_prohibition hardening
@@ -767,78 +604,6 @@ class TestToProhibitionHardened(unittest.TestCase):
         text = "<local-command-caveat>foo\nbar</local-command-caveat>"
         self.assertEqual(_to_prohibition(text), "",
                          "combined tag + newlines must be rejected")
-
-
-# ---------------------------------------------------------------------------
-# BUG-4 — EXPLICIT_CORRECTION must not auto-activate
-# ---------------------------------------------------------------------------
-
-class TestAdmissionNoAutoActivate(unittest.TestCase):
-    """New extracted rules must start `pending` regardless of type.
-
-    Current behavior (RED target): EXPLICIT_CORRECTION rules are created
-    with `status="active"` on first sight (digest.py:339).
-    Expected behavior: all new rules start `pending`; promotion to
-    `active` happens only via `admit_rule` upvote path once
-    `occurrence_count >= PROMOTION_COUNT`.
-    """
-
-    def test_explicit_correction_starts_pending(self):
-        messages = [make_user(0, "don't add Co-Authored-By to commits")]
-        rules = extract_corrections(messages)
-        self.assertEqual(len(rules), 1)
-        self.assertEqual(rules[0].status, "pending",
-                         "EXPLICIT_CORRECTION must start pending (no auto-activate)")
-
-    def test_preference_starts_pending(self):
-        messages = [make_user(0, "always use snake_case for variables")]
-        rules = extract_corrections(messages)
-        self.assertEqual(len(rules), 1)
-        self.assertEqual(rules[0].status, "pending")
-
-    def test_explicit_promoted_after_two_occurrences(self):
-        """Seeing the same explicit correction twice promotes it to active."""
-        store = DigestStore()
-        # First admission
-        msgs1 = [make_user(0, "don't add Co-Authored-By")]
-        for r in extract_corrections(msgs1):
-            admit_rule(r, store)
-        self.assertEqual(len(store.strategy_rules), 1)
-        self.assertEqual(store.strategy_rules[0].status, "pending",
-                         "first occurrence must remain pending")
-
-        # Second admission — dedup should upvote and promote
-        msgs2 = [make_user(1, "don't add Co-Authored-By to commits")]
-        for r in extract_corrections(msgs2):
-            admit_rule(r, store)
-        self.assertEqual(store.strategy_rules[0].status, "active",
-                         "after PROMOTION_COUNT occurrences rule becomes active")
-        self.assertGreaterEqual(store.strategy_rules[0].occurrence_count, PROMOTION_COUNT)
-
-    def test_single_explicit_not_in_active_rules(self):
-        store = DigestStore()
-        msgs = [make_user(0, "stop adding summaries")]
-        for r in extract_corrections(msgs):
-            admit_rule(r, store)
-        self.assertEqual(len(store.active_rules()), 0,
-                         "single explicit occurrence must not appear in active_rules()")
-
-    def test_end_to_end_update_digest_keeps_single_occurrence_pending(self):
-        """`update_digest` on a single explicit correction must NOT produce an
-        active rule — the repetition gate must be honoured."""
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            digest_file = tmp_path / "behavioral-digest.json"
-            digest_md = tmp_path / "behavioral-digest.md"
-            messages = [make_user(0, "don't add Co-Authored-By to commits")]
-            with patch("cozempic.digest.DIGEST_DIR", tmp_path), \
-                 patch("cozempic.digest.DIGEST_FILE", digest_file), \
-                 patch("cozempic.digest.DIGEST_MD_FILE", digest_md):
-                update_digest(messages, project_dir="/test")
-                store = load_digest_store("/test")
-                active = store.active_rules()
-                self.assertEqual(len(active), 0,
-                                 "single-occurrence explicit correction must not auto-activate")
 
 
 # ---------------------------------------------------------------------------
@@ -2004,232 +1769,6 @@ class TestPurgePersistsToDisk(unittest.TestCase):
                 self.assertEqual(len(active2), 1)
 
 
-# ---------------------------------------------------------------------------
-# BUG-11 — _infer_scope word-boundary
-# ---------------------------------------------------------------------------
-
-class TestInferScopeWordBoundary(unittest.TestCase):
-    """`_infer_scope` must match keywords as whole words, not substrings.
-
-    Substring match produces silent false-positives that break BUG-7's
-    dedup gate (which requires scope+priority match before text overlap).
-    "make it digital" matching "git" scope makes a GENERAL rule collide
-    with genuine git rules on dedup.
-    """
-
-    def test_digital_is_not_git(self):
-        """'digital' contains 'git' as substring but is not a git scope."""
-        from cozempic.digest import _infer_scope
-        self.assertEqual(_infer_scope("make it more digital"), "general")
-
-    def test_editorial_is_not_file_ops(self):
-        """'editorial' contains 'edit' as substring but is not a file-ops scope."""
-        from cozempic.digest import _infer_scope
-        self.assertEqual(_infer_scope("editorial review of the draft"), "general")
-
-    def test_testimony_is_not_testing(self):
-        """'testimony' contains 'test' as substring but is not a testing scope."""
-        from cozempic.digest import _infer_scope
-        self.assertEqual(_infer_scope("testimony from the witness"), "general")
-
-    def test_merger_is_not_git(self):
-        """'merger' contains 'merge' as substring but is not a git scope."""
-        from cozempic.digest import _infer_scope
-        self.assertEqual(_infer_scope("the merger acquisition"), "general")
-
-    def test_slackline_is_not_communication(self):
-        """'slackline' contains 'slack' as substring but is not a communication scope."""
-        from cozempic.digest import _infer_scope
-        self.assertEqual(_infer_scope("slackline balance practice"), "general")
-
-    def test_write_tests_is_testing_not_file_ops(self):
-        """Order-dependent: `don't write tests` has BOTH 'write' (file-ops)
-        AND 'tests' (testing). Testing intent should win — `tests` is the
-        noun; `write` is the verb operating on tests. Under the old order
-        `file-ops` wins because it appears first in the if/elif chain.
-        Word-boundary fix alone may not resolve this — may need priority
-        ordering adjustment. Documented as part of the fix."""
-        from cozempic.digest import _infer_scope
-        # Prefer testing since the user is explicitly talking about tests
-        self.assertEqual(_infer_scope("don't write tests"), "testing")
-
-    # Positive tests — real matches must still work
-    def test_legit_git_still_matches(self):
-        from cozempic.digest import _infer_scope
-        self.assertEqual(_infer_scope("always push to git main"), "git")
-        self.assertEqual(_infer_scope("never commit secrets"), "git")
-
-    def test_legit_file_ops_still_matches(self):
-        from cozempic.digest import _infer_scope
-        self.assertEqual(_infer_scope("don't edit the config file"), "file-ops")
-
-    def test_legit_testing_still_matches(self):
-        from cozempic.digest import _infer_scope
-        self.assertEqual(_infer_scope("never mock the database in tests"), "testing")
-
-    def test_legit_communication_still_matches(self):
-        from cozempic.digest import _infer_scope
-        self.assertEqual(_infer_scope("reply to the slack message"), "communication")
-
-    def test_case_insensitive_preserved(self):
-        from cozempic.digest import _infer_scope
-        self.assertEqual(_infer_scope("Always PUSH to GIT"), "git")
-
-
-# ---------------------------------------------------------------------------
-# BUG-11 — _infer_scope edge case hardening (PR #85 verification probes)
-# ---------------------------------------------------------------------------
-
-
-class TestInferScopeEdgeCases(unittest.TestCase):
-    """Edge case hardening — empty/whitespace, Unicode, long inputs, mixed scripts,
-    URLs, regex injection, punctuation boundaries, multi-scope priority.
-    Added as part of PR #85 adversarial verification.
-    """
-
-    # -- empty / whitespace / newline-only -----------------------------------
-
-    def test_empty_string_returns_general_no_crash(self):
-        from cozempic.digest import _infer_scope
-        self.assertEqual(_infer_scope(""), "general")
-
-    def test_whitespace_only_returns_general(self):
-        from cozempic.digest import _infer_scope
-        self.assertEqual(_infer_scope("  "), "general")
-        self.assertEqual(_infer_scope("\n\n"), "general")
-        self.assertEqual(_infer_scope("\t"), "general")
-        self.assertEqual(_infer_scope(" \t\n "), "general")
-
-    # -- Unicode / CJK / emoji / zero-width ----------------------------------
-
-    def test_guillemets_wrapped_keyword_still_matches(self):
-        """Guillemets are non-word chars; the GIT token remains intact."""
-        from cozempic.digest import _infer_scope
-        self.assertEqual(_infer_scope("«GIT»"), "git")
-
-    def test_fullwidth_punctuation_around_keyword_still_matches(self):
-        """Fullwidth backticks around `push` do not prevent tokenization."""
-        from cozempic.digest import _infer_scope
-        self.assertEqual(_infer_scope("｀push｀"), "git")
-
-    def test_turkish_dotless_i_does_not_match(self):
-        """U+0131 (dotless i) is distinct from U+0069 (i) after .lower() —
-        `gıt` is not `git`. Fix must not silently coerce."""
-        from cozempic.digest import _infer_scope
-        self.assertEqual(_infer_scope("pısh to gıt"), "general")
-
-    def test_zero_width_space_between_keywords_loses_match(self):
-        """Zero-width space U+200B inside a keyword breaks tokenization.
-        This is acceptable — the user cannot have typed a ZWSP by accident;
-        if present, the token is genuinely not a keyword."""
-        from cozempic.digest import _infer_scope
-        # "don'tZWSPpush" — tokens are ['don', 't​push'] — no match
-        # but the full string contains "push" after zero-width is treated
-        # as part of the token — let's assert the current behavior
-        r = _infer_scope("don't​push")
-        # Result is 'git' because regex r'[\w-]+' with UNICODE splits on ZWSP?
-        # Actually \w matches ZWSP in Python 3, so this stays as one token.
-        # Document the behavior — this is implementation-defined and we
-        # just want to ensure no crash and deterministic output.
-        self.assertIn(r, ("general", "git"))
-
-    def test_cjk_scope_keyword_does_not_match(self):
-        """CJK characters for 'push' (推送) do not match English keywords."""
-        from cozempic.digest import _infer_scope
-        self.assertEqual(_infer_scope("推送 to main"), "general")
-
-    def test_emoji_only_returns_general(self):
-        from cozempic.digest import _infer_scope
-        self.assertEqual(_infer_scope("\U0001f527\U0001f4bb\U0001f680"), "general")
-
-    def test_cjk_plus_english_keyword_still_matches(self):
-        from cozempic.digest import _infer_scope
-        self.assertEqual(_infer_scope("don't 推送 to git"), "git")
-
-    # -- very long input -----------------------------------------------------
-
-    def test_long_input_no_regression(self):
-        """10k-char input with keyword at tail must still match without OOM."""
-        from cozempic.digest import _infer_scope
-        big = ("lorem " * 1000) + " don't push"
-        self.assertEqual(_infer_scope(big), "git")
-
-    # -- URL / path false-positive check -------------------------------------
-
-    def test_url_path_etc_passwords_maps_to_file_ops(self):
-        """`/etc/passwords` tokenizes as etc, passwords. file-ops wins via 'read'."""
-        from cozempic.digest import _infer_scope
-        self.assertEqual(_infer_scope("don't read /etc/passwords"), "file-ops")
-
-    def test_path_with_git_substring_but_no_token_is_general(self):
-        """/usr/local/gitlab/config has 'git' only as substring of 'gitlab'.
-        Post-fix should return general (BUG-11 premise)."""
-        from cozempic.digest import _infer_scope
-        self.assertEqual(_infer_scope("/usr/local/gitlab/config"), "general")
-
-    # -- regex injection safety ---------------------------------------------
-
-    def test_regex_metacharacters_in_input_not_interpreted(self):
-        """User text containing regex metacharacters must not be interpreted
-        as a pattern — tokenizer uses re.findall on the static pattern."""
-        from cozempic.digest import _infer_scope
-        self.assertEqual(_infer_scope("don't (.*?)"), "general")
-        self.assertEqual(_infer_scope(r"don't \b\w+\b"), "general")
-        # [git] contains the token 'git' as whole word
-        self.assertEqual(_infer_scope("[git]"), "git")
-
-    # -- punctuation boundary -----------------------------------------------
-
-    def test_parenthesized_keyword_matches(self):
-        from cozempic.digest import _infer_scope
-        self.assertEqual(_infer_scope("(commit)"), "git")
-        self.assertEqual(_infer_scope("[merge]"), "git")
-
-    def test_dot_notation_keyword_matches(self):
-        """`.push()` tokenizes so that `push` is a standalone token."""
-        from cozempic.digest import _infer_scope
-        self.assertEqual(_infer_scope(".push()"), "git")
-
-    def test_hyphen_compound_keeps_token_intact(self):
-        """`don't-push` tokenizes as ['don', 't-push'] — the fix preserves
-        hyphens in tokens. This means `pre-push` / `force-push` style
-        compounds will NOT match bare `push` keyword. Documented tradeoff."""
-        from cozempic.digest import _infer_scope
-        # don't-push → token 't-push' does not match 'push' whole token
-        self.assertEqual(_infer_scope("don't-push"), "general")
-        # pre-push hook → pre-push is one token, no match
-        self.assertEqual(_infer_scope("pre-push hook"), "general")
-
-    # -- multi-scope priority -----------------------------------------------
-
-    def test_push_tests_resolves_to_testing(self):
-        """BOTH 'push' (git) AND 'tests' (testing) present — testing wins
-        because it is listed FIRST in _SCOPE_KEYWORDS table."""
-        from cozempic.digest import _infer_scope
-        self.assertEqual(_infer_scope("push tests"), "testing")
-
-    def test_write_to_main_branch_resolves_to_git(self):
-        """write (file-ops) + branch (git) — git wins because testing was
-        checked first (no match) and file-ops would normally come before git,
-        but `write` and `branch` are both present; current table order
-        puts testing → git → file-ops so branch/git wins over write/file-ops."""
-        from cozempic.digest import _infer_scope
-        self.assertEqual(_infer_scope("don't write to main branch"), "git")
-
-    def test_merge_and_test_resolves_to_testing(self):
-        from cozempic.digest import _infer_scope
-        self.assertEqual(_infer_scope("merge and test"), "testing")
-
-    # -- co-authored compound stays matched ---------------------------------
-
-    def test_co_authored_by_compound_still_matches(self):
-        """Verify BUG-11 fix keeps hyphenated git keyword `co-authored-by`
-        working (it's explicitly in the keyword set as a single token)."""
-        from cozempic.digest import _infer_scope
-        self.assertEqual(_infer_scope("co-authored-by me"), "git")
-        self.assertEqual(_infer_scope("CO-AUTHORED-BY: ..."), "git")
-
-
 # ===========================================================================
 # RED TESTS — polish v2 (PR-A) — Bugs inventoried in AUDIT_REPORT.md (2026-05-11)
 # ===========================================================================
@@ -2283,11 +1822,8 @@ class TestPolishV2_Bug9PersistOnRejected(unittest.TestCase):
         """
         self._seed_store(session_id="old", updated="2020-01-01T00:00:00+00:00")
 
-        # Messages that pass extract_corrections but are rejected by admit_rule
-        # are hard to fabricate deterministically. Use messages that produce
-        # candidates that admit_rule rejects. An easier RED: zero-candidate
-        # input still mutates store.session_id — verify that too.
-        # Use a noise-only message so extract_corrections returns 0 candidates.
+        # The regex extractor is retired: update_digest mines nothing, but it
+        # must still persist the mutated session_id even on a no-rule run.
         messages = [make_user(0, "<system-reminder>noise</system-reminder>")]
 
         with patch("cozempic.digest.DIGEST_DIR", self.tmpdir), \
@@ -3130,76 +2666,3 @@ class TestDigestInjectMessage(unittest.TestCase):
     def test_synced_count(self):
         out = self._run(Path("/x/memory"), 3, ["rule"])
         self.assertIn("Synced 3", out)
-
-
-# ---------------------------------------------------------------------------
-# L6 — sidechain turns must not be mined as corrections
-# ---------------------------------------------------------------------------
-
-class TestSidechainInjectionGuard(unittest.TestCase):
-    """L6 injection: sub-agent (sidechain) user-turns must NEVER produce a DigestRule.
-
-    Confused-deputy scenario: a sub-agent conversation has isSidechain=True on every
-    message. Its user-side turns (scaffolding prompts) can carry EXPLICIT_CORRECTION
-    phrases. Without an isSidechain guard, extract_corrections mines those as if they
-    were the human's own corrections → untrusted sub-agent scaffolding becomes a
-    learned behavioral rule injected into the main session.
-
-    RED-at-base proof: before the guard, a sidechain user-turn with
-    "don't add Co-Authored-By" yields 1 DigestRule. After the guard: 0 rules.
-
-    Paired positive test: the IDENTICAL turn WITHOUT isSidechain DOES produce a rule
-    (proves the flag is the discriminant, not the phrase).
-    """
-
-    CORRECTION_PHRASE = "don't add Co-Authored-By to commits"
-
-    def test_sidechain_user_turn_produces_no_rule(self):
-        """RED-at-base: a sidechain user-turn carrying an EXPLICIT_CORRECTION phrase
-        must yield 0 rules. Without the guard, extract_corrections mines it and yields
-        1 rule — the confused-deputy injection.
-        """
-        messages = [
-            make_sidechain_user(0, self.CORRECTION_PHRASE),
-        ]
-        rules = extract_corrections(messages)
-        self.assertEqual(
-            len(rules), 0,
-            "sidechain (sub-agent) user-turn must NOT produce a DigestRule — "
-            "isSidechain guard is missing (L6 confused-deputy injection)"
-        )
-
-    def test_main_turn_same_phrase_produces_rule(self):
-        """Positive control: the SAME phrase in a main-session (non-sidechain) turn
-        MUST produce exactly 1 rule. This proves the isSidechain flag is the
-        discriminant, not the phrase itself.
-        """
-        messages = [
-            make_user(0, self.CORRECTION_PHRASE),
-        ]
-        rules = extract_corrections(messages)
-        self.assertEqual(
-            len(rules), 1,
-            "a main-session user-turn with EXPLICIT_CORRECTION must produce a rule"
-        )
-
-    def test_sidechain_assistant_does_not_pollute_prev_assistant_text(self):
-        """A sidechain assistant-turn must NOT set prev_assistant_text.
-
-        Without the guard, a sidechain assistant turn sets prev_assistant_text, so the
-        next main-session user-turn sees a non-empty prev_assistant_text and may be
-        classified differently (e.g. APOLOGY_FOLLOW_UP instead of EXPLICIT_CORRECTION).
-        """
-        # Sidechain assistant turn, then main user correction. The main rule
-        # should have an empty `before` field (prev_assistant_text not polluted).
-        messages = [
-            make_sidechain_assistant(0, "Sub-agent said something here."),
-            make_user(1, self.CORRECTION_PHRASE),
-        ]
-        rules = extract_corrections(messages)
-        self.assertEqual(len(rules), 1, "main-session correction after sidechain assistant must be captured")
-        self.assertEqual(
-            rules[0].before, "",
-            "prev_assistant_text must NOT be set from a sidechain assistant turn — "
-            "sidechain context must not bleed into main-session rule evidence"
-        )

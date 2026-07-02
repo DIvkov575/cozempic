@@ -20,8 +20,6 @@ from pathlib import Path
 from typing import Literal
 
 from ._validation import parse_env_bool
-from .helpers import get_content_blocks, get_msg_type, text_of
-from .tokens import _is_sidechain
 from .types import Message
 
 # ---------------------------------------------------------------------------
@@ -124,20 +122,10 @@ class DigestStore:
 
 
 # ---------------------------------------------------------------------------
-# Classification — FELT taxonomy (heuristic, no LLM)
+# Noise gating — synthetic/framework turn detection (retained for the
+# injector's load-time auto-migration; the regex correction extractor that
+# used the FELT taxonomy was retired, see git history).
 # ---------------------------------------------------------------------------
-
-# Correction signal patterns
-_EXPLICIT_PATTERNS = [
-    re.compile(r"^no[,.\s]", re.IGNORECASE),
-    re.compile(r"\bdon'?t\b", re.IGNORECASE),
-    re.compile(r"\bdo not\b", re.IGNORECASE),
-    re.compile(r"\bstop\s+\w+ing\b", re.IGNORECASE),  # "stop summarizing", "stop adding", etc.
-    re.compile(r"\bnever\b", re.IGNORECASE),
-    re.compile(r"\bplease\s+(don'?t|remove|stop|undo)", re.IGNORECASE),
-    re.compile(r"\bremove\s+that\b", re.IGNORECASE),
-    re.compile(r"\bundo\s+(that|this|the)\b", re.IGNORECASE),
-]
 
 # Synthetic-noise markers — user turns containing any of these are Claude Code
 # framework emissions (hooks, slash commands, tool blocks), not real corrections.
@@ -189,9 +177,9 @@ def _is_system_noise(text: str) -> bool:
     """Return True if `text` is a Claude Code synthetic/framework turn.
 
     Rejects: empty text, tag-wrapped blocks (ASCII `<` or Unicode lookalikes),
-    slash-command lines, and known framework prompt markers. Used to gate
-    `extract_corrections` upstream of `classify_turn` so synthetic turns
-    never become behavioral rules.
+    slash-command lines, and known framework prompt markers. Used by
+    `load_digest_store` to demote synthetic/framework rules inherited from
+    the retired regex extractor.
     """
     if not text:
         return True
@@ -220,130 +208,10 @@ def _is_system_noise(text: str) -> bool:
             return True
     return False
 
-_IMPLICIT_PATTERNS = [
-    re.compile(r"\bactually[,\s]", re.IGNORECASE),
-    re.compile(r"\binstead[,\s]", re.IGNORECASE),
-    re.compile(r"\brather\b", re.IGNORECASE),
-    re.compile(r"\bthat'?s\s+(not|wrong)", re.IGNORECASE),
-    re.compile(r"\bnot\s+what\s+I", re.IGNORECASE),
-    re.compile(r"\buse\s+\w+\s+not\s+\w+", re.IGNORECASE),  # "use Edit not Write"
-    re.compile(r"\bnot\s+\w+[,;]\s*(use|try)", re.IGNORECASE),  # "not Write, use Edit"
-]
-
-_PREFERENCE_PATTERNS = [
-    re.compile(r"\bI\s+prefer\b", re.IGNORECASE),
-    re.compile(r"\balways\s+(use|do|add|include|run|check)", re.IGNORECASE),
-    re.compile(r"\bfrom\s+now\s+on\b", re.IGNORECASE),
-    re.compile(r"\bremember\s+(to|that)\b", re.IGNORECASE),
-    re.compile(r"\bmake\s+sure\s+(to|you)\b", re.IGNORECASE),
-]
-
-_APOLOGY_PATTERNS = [
-    re.compile(r"\bsorry\b", re.IGNORECASE),
-    re.compile(r"\bI\s+apologize\b", re.IGNORECASE),
-    re.compile(r"\bmy\s+(mistake|bad|error)\b", re.IGNORECASE),
-]
-
-TurnClass = Literal[
-    "EXPLICIT_CORRECTION",
-    "IMPLICIT_CORRECTION",
-    "PREFERENCE",
-    "APOLOGY_FOLLOW_UP",
-    "ONE_OFF",
-    "NONE",
-]
-
-
-def classify_turn(user_text: str, prev_assistant_text: str = "") -> TurnClass:
-    """Classify a user turn by correction signal type.
-
-    Content type prior IS the dominant factor (A-MAC ablation).
-    """
-    if not user_text or len(user_text.strip()) < 3:
-        return "NONE"
-
-    # Check if previous assistant apologized → this turn is a follow-up correction
-    if prev_assistant_text:
-        for pat in _APOLOGY_PATTERNS:
-            if pat.search(prev_assistant_text):
-                # User message after apology is likely a correction
-                if len(user_text.strip()) > 10:
-                    return "APOLOGY_FOLLOW_UP"
-
-    # Explicit correction: strongest signal
-    for pat in _EXPLICIT_PATTERNS:
-        if pat.search(user_text):
-            return "EXPLICIT_CORRECTION"
-
-    # Preference: persistent behavioral instruction
-    for pat in _PREFERENCE_PATTERNS:
-        if pat.search(user_text):
-            return "PREFERENCE"
-
-    # Implicit correction: softer signal
-    for pat in _IMPLICIT_PATTERNS:
-        if pat.search(user_text):
-            return "IMPLICIT_CORRECTION"
-
-    return "NONE"
-
-
 # ---------------------------------------------------------------------------
-# Extraction — heuristic rule extraction from classified turns
+# Prohibition framing — retained for `load_digest_store`'s load-time
+# auto-migration (demotes rules that would fail the current admission gate).
 # ---------------------------------------------------------------------------
-
-
-def _get_user_text(msg: dict) -> str:
-    """Extract user text from a message."""
-    inner = msg.get("message", {})
-    content = inner.get("content", "")
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "text":
-                parts.append(block.get("text", ""))
-        return " ".join(parts)
-    return ""
-
-
-def _get_assistant_text(msg: dict) -> str:
-    """Extract assistant text from a message."""
-    blocks = get_content_blocks(msg)
-    parts = []
-    for block in blocks:
-        t = text_of(block)
-        if t and block.get("type") in ("text", None, ""):
-            parts.append(t)
-    return " ".join(parts)
-
-
-_SCOPE_KEYWORDS: tuple[tuple[str, frozenset[str]], ...] = (
-    # Order matters on overlap: `testing` before `file-ops` so that
-    # "write tests" (both write-verb and tests-noun) resolves to testing —
-    # the noun is the subject of the correction, the verb is incidental.
-    ("testing", frozenset({"test", "tests", "pytest", "unittest", "mock", "mocks", "assert", "asserts"})),
-    ("git", frozenset({"git", "commit", "commits", "push", "pushed", "branch", "branches", "merge", "merges", "merged", "co-authored", "co-authored-by"})),
-    ("file-ops", frozenset({"file", "files", "edit", "edits", "write", "writes", "read", "reads", "path", "paths", "directory", "directories"})),
-    ("communication", frozenset({"message", "messages", "comment", "comments", "pr", "prs", "issue", "issues", "slack"})),
-)
-
-
-def _infer_scope(text: str) -> str:
-    """Infer the scope of a correction from its content.
-
-    Tokenizes with `[\\w-]+` so hyphenated compounds like `co-authored-by`
-    stay intact, then matches against keyword sets as whole tokens. This
-    prevents substring false-positives (`digital` → `git`, `testimony` →
-    `test`) that silently broke the dedup gate (which requires scope match
-    before text-overlap merge).
-    """
-    tokens = set(re.findall(r"[\w-]+", text.lower()))
-    for scope, keywords in _SCOPE_KEYWORDS:
-        if tokens & keywords:
-            return scope
-    return "general"
 
 
 def _to_prohibition(text: str) -> str:
@@ -411,107 +279,6 @@ def _to_prohibition(text: str) -> str:
     if len(text) > 5:
         return f"Do not {text[0].lower()}{text[1:]}"
     return text
-
-
-def extract_corrections(
-    messages: list[Message],
-    since_turn: int = 0,
-) -> list[DigestRule]:
-    """Extract behavioral corrections from a message window.
-
-    Scans user turns for correction signals, builds DigestRule for each.
-    Stores verbatim evidence — never paraphrased (arXiv:2603.23013).
-    """
-    now = datetime.now(timezone.utc).isoformat()
-    rules: list[DigestRule] = []
-
-    prev_assistant_text = ""
-    for pos, (idx, msg, _) in enumerate(messages):
-        # Skip sub-agent (sidechain) turns entirely — they are scaffolding/tool
-        # prompts, not the human correcting Claude. Mining them is an L6
-        # injection: untrusted sub-agent content becomes a learned behavioral rule.
-        # Also skip their assistant text from prev_assistant_text so sidechain
-        # context never bleeds into the `before` field of a following main turn.
-        if _is_sidechain(msg):
-            continue
-
-        if pos < since_turn:
-            # Track assistant text even before our window
-            if get_msg_type(msg) == "assistant":
-                prev_assistant_text = _get_assistant_text(msg)
-            continue
-
-        mtype = get_msg_type(msg)
-
-        if mtype == "assistant":
-            prev_assistant_text = _get_assistant_text(msg)
-            continue
-
-        if mtype != "user":
-            continue
-
-        user_text = _get_user_text(msg)
-        if not user_text:
-            continue
-
-        # Skip Claude Code synthetic/framework turns — they are not corrections.
-        if _is_system_noise(user_text):
-            prev_assistant_text = ""
-            continue
-
-        turn_class = classify_turn(user_text, prev_assistant_text)
-        if turn_class == "NONE":
-            prev_assistant_text = ""
-            continue
-
-        # Map classification to scoring
-        reliability_map = {
-            "EXPLICIT_CORRECTION": 1.0,
-            "IMPLICIT_CORRECTION": 0.6,
-            "PREFERENCE": 0.9,
-            "APOLOGY_FOLLOW_UP": 0.8,
-            "ONE_OFF": 0.3,
-        }
-        type_prior_map = {
-            "EXPLICIT_CORRECTION": 0.8,
-            "IMPLICIT_CORRECTION": 0.6,
-            "PREFERENCE": 0.9,
-            "APOLOGY_FOLLOW_UP": 0.7,
-            "ONE_OFF": 0.1,
-        }
-
-        rule_text = _to_prohibition(user_text)
-        if not rule_text:
-            # _to_prohibition rejected the input as structural/non-correction.
-            prev_assistant_text = ""
-            continue
-        scope = _infer_scope(user_text)
-
-        rule = DigestRule(
-            id="",  # Assigned on admission
-            rule=rule_text[:500],  # Cap rule length
-            priority="hard" if turn_class == "EXPLICIT_CORRECTION" else "soft",
-            scope=scope,
-            trigger="",
-            before=prev_assistant_text[:200] if prev_assistant_text else "",
-            after=user_text[:200],
-            signal=turn_class,
-            evidence=user_text[:500],  # Verbatim, never paraphrased
-            importance=1,
-            source_reliability=reliability_map.get(turn_class, 0.5),
-            type_prior=type_prior_map.get(turn_class, 0.5),
-            # All new rules start pending — the repetition gate in admit_rule
-            # promotes them to active after PROMOTION_COUNT occurrences.
-            status="pending",
-            occurrence_count=1,
-            first_seen=now,
-            last_reinforced=now,
-        )
-        rules.append(rule)
-
-        prev_assistant_text = ""
-
-    return rules
 
 
 # ---------------------------------------------------------------------------
@@ -797,42 +564,29 @@ def update_digest(
     project_dir: str = "",
     session_id: str = "",
 ) -> tuple[int, int, int]:
-    """Extract corrections from messages and update the digest store.
+    """Refresh the digest store's session metadata. Always returns (0, 0, 0).
 
-    Returns (new_rules, upvoted, rejected).
+    The regex correction extractor was retired — corrections are now captured
+    by the memory subsystem, not mined heuristically here. This function is
+    kept so the hook/flush path and its persistence guarantees are unchanged:
+    it still stamps `session_id`/`updated` and persists the (possibly
+    load-time auto-migrated) store, so existing on-disk state stays fresh.
     """
     store = load_digest_store(project_dir)
     store.session_id = session_id
 
-    candidates = extract_corrections(messages, since_turn=since_turn)
-
-    added = 0
-    upvoted = 0
-    rejected = 0
-
-    for rule in candidates:
-        result = admit_rule(rule, store)
-        if result == "added":
-            added += 1
-        elif result == "upvoted":
-            upvoted += 1
-        else:
-            rejected += 1
-
-    # Persist unconditionally: `store.session_id` is mutated above regardless
-    # of the admission outcome, and `updated` timestamp must advance even on
-    # rejected-only or zero-candidate runs so downstream consumers can
-    # distinguish stale from fresh state. `save_digest_store` is atomic
-    # (tmp+fsync+rename) and concurrent-merge-safe.
-    # A readonly digest dir (Docker --read-only, hardened systemd, NFS quota
-    # hit) must not crash the hook. Degrade to in-memory only; disk catches
-    # up on the next call when the FS recovers.
+    # Persist unconditionally: `store.session_id` is mutated above and the
+    # `updated` timestamp must advance so downstream consumers can distinguish
+    # stale from fresh state. `save_digest_store` is atomic (tmp+fsync+rename)
+    # and concurrent-merge-safe. A readonly digest dir (Docker --read-only,
+    # hardened systemd, NFS quota hit) must not crash the hook — degrade to
+    # in-memory only; disk catches up on the next call when the FS recovers.
     try:
         save_digest_store(store)
     except (OSError, PermissionError) as e:
         _debug(f"save_digest_store failed (non-fatal): {type(e).__name__}")
 
-    return added, upvoted, rejected
+    return 0, 0, 0
 
 
 # ---------------------------------------------------------------------------
