@@ -6,6 +6,7 @@ Uncaptured messages are untouched — other strategies decide their fate.
 
 from __future__ import annotations
 
+from ..helpers import is_protected
 from ..memory import ledger
 from ..registry import strategy
 from ..types import Message, PruneAction, StrategyResult
@@ -20,6 +21,8 @@ def strategy_recoverability(messages: list[Message], config: dict) -> StrategyRe
 
     if session_id:
         for idx, msg, size in messages:
+            if is_protected(msg):
+                continue
             if ledger.is_captured(session_id, ledger.span_hash([msg])):
                 actions.append(PruneAction(
                     line_index=idx,

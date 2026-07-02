@@ -26,3 +26,17 @@ def test_noop_without_session_id(tmp_path, monkeypatch):
     monkeypatch.setattr(ledger, "BRIDGE_DIR", tmp_path)
     result = recoverability.strategy_recoverability([_msg(0, "x")], {})
     assert result.actions == []
+
+
+def test_skips_protected_even_if_captured(tmp_path, monkeypatch):
+    monkeypatch.setattr(ledger, "BRIDGE_DIR", tmp_path)
+    # A protected message: is_protected() returns True for isVisibleInTranscriptOnly.
+    d = {"role": "user", "content": "protected but captured", "isVisibleInTranscriptOnly": True}
+    import json
+    m0 = (0, d, len(json.dumps(d)))
+    # Record its span as captured — normally this would make it removable.
+    ledger.record("s1", ledger.span_hash([d]), "some-slug")
+
+    result = recoverability.strategy_recoverability([m0], {"session_id": "s1"})
+    assert result.actions == []
+    assert result.messages_removed == 0
