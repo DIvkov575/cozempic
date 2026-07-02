@@ -302,7 +302,8 @@ def cmd_current(args):
         _floor_cfg = load_config().floor
         for rx_name, strategy_names in PRESCRIPTIONS.items():
             try:
-                new_msgs, _ = run_prescription(messages, strategy_names, {},
+                new_msgs, _ = run_prescription(messages, strategy_names,
+                                               {"session_id": sess["session_id"]},
                                                floor_config=_floor_cfg)
             except PruneValidationError as ve:
                 # Dry-run estimation: a structural validation failure means the
@@ -330,7 +331,8 @@ def cmd_diagnose(args):
     _floor_cfg = load_config().floor
     for rx_name, strategy_names in PRESCRIPTIONS.items():
         try:
-            new_msgs, _ = run_prescription(messages, strategy_names, {},
+            new_msgs, _ = run_prescription(messages, strategy_names,
+                                           {"session_id": path.stem},
                                            floor_config=_floor_cfg)
         except PruneValidationError as ve:
             # Dry-run estimation: report structural failure instead of crashing.
@@ -458,7 +460,7 @@ def cmd_treat(args):
         sys.exit(1)
 
     strategy_names = PRESCRIPTIONS[rx_name]
-    config = {}
+    config = {"session_id": path.stem}  # thread session id so recoverability strategy is active
     if args.thinking_mode:
         config["thinking_mode"] = args.thinking_mode
 
@@ -781,7 +783,7 @@ def cmd_reload(args):
         # mid-prune; we need the file state at this exact instant for diff classification).
         messages, snapshot = load_messages_and_snapshot(path)
         strategy_names = PRESCRIPTIONS[rx_name]
-        config = {}
+        config = {"session_id": sess["session_id"]}  # thread session id so recoverability strategy is active
         if args.thinking_mode:
             config["thinking_mode"] = args.thinking_mode
 
@@ -1420,6 +1422,19 @@ def _build_nudge_message(tier_key: int, pct: float, proj: float | None,
             f"{reclaim80}. {tail}")
 
 
+def _maybe_memory_consolidate(session_id: str, messages: list[dict], fraction: float) -> None:
+    """Early/background memory consolidation. Never raises into the hook."""
+    import os
+    from ._validation import parse_env_bool
+    if parse_env_bool("COZEMPIC_MEMORY_OFF", default=False, warn=False):
+        return
+    try:
+        from .memory import schedule
+        schedule.maybe_consolidate(session_id, messages, fraction)
+    except Exception:
+        pass  # memory is best-effort; must never break the nudge hook
+
+
 def cmd_nudge(args):
     """Stop-hook: emit a non-blocking systemMessage nudging the user to
     `/cozempic reload` at 25/55/80% context, ONCE per tier. Takes NO action — no
@@ -1452,6 +1467,10 @@ def cmd_nudge(args):
     if tokens <= 0 or window <= 0:
         return
     pct = tokens / window
+    # Best-effort early memory consolidation: this hook already knows the
+    # session, the loaded transcript, and the context fraction, and runs often.
+    # Guarded + exception-swallowing so it can never break the nudge.
+    _maybe_memory_consolidate(session, [m for _, m, _ in messages], pct)
     # Tiers: prefer the guard's RESOLVED reload-tier fractions (so the nudge fires
     # where the guard actually reloads — tracks a raised --threshold and keeps the
     # FYI aligned with the real SOFT tier); fall back to the defaults. An explicit
