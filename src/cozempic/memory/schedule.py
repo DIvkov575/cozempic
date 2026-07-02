@@ -5,7 +5,6 @@ path, debounced. The hook that calls maybe_consolidate() never blocks on extract
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 import sys
 import time
@@ -72,13 +71,18 @@ def consolidate_worker(session_id: str, span_msgs: list[dict]) -> None:
 
 
 def _spawn(session_id: str, span_msgs: list[dict]) -> None:
-    """Launch a detached worker process; return immediately."""
+    """Launch a detached worker process; return immediately without blocking."""
     payload = json.dumps({"session_id": session_id, "msgs": span_msgs})
-    subprocess.Popen(
+    proc = subprocess.Popen(
         [sys.executable, "-m", "cozempic.memory.schedule", "--worker"],
         stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         start_new_session=True,
-    ).stdin.write(payload.encode())  # fire-and-forget
+    )
+    try:
+        proc.stdin.write(payload.encode())
+        proc.stdin.close()   # deliver EOF so the worker's sys.stdin.read() returns
+    except (BrokenPipeError, OSError):
+        pass
 
 
 def maybe_consolidate(session_id: str, span_msgs: list[dict], fraction: float) -> bool:

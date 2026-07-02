@@ -31,3 +31,21 @@ def test_worker_extracts_and_persists(tmp_path, monkeypatch):
                         lambda sid, items: captured.update(sid=sid, n=len(items)) or ["s"])
     schedule.consolidate_worker("s1", [{"role": "user", "content": "always use uv"}])
     assert captured == {"sid": "s1", "n": 1}
+
+
+def test_spawn_closes_stdin_after_write(monkeypatch):
+    events = []
+
+    class _FakeStdin:
+        def write(self, b):
+            events.append(("write", b))
+
+        def close(self):
+            events.append(("close",))
+
+    class _FakeProc:
+        stdin = _FakeStdin()
+
+    monkeypatch.setattr(schedule.subprocess, "Popen", lambda *a, **k: _FakeProc())
+    schedule._spawn("s1", [{"role": "user", "content": "x"}])
+    assert [e[0] for e in events] == ["write", "close"]
