@@ -1496,7 +1496,11 @@ def cmd_nudge(args):
     if not isinstance(payload, dict):  # valid JSON but wrong shape (list/int/str)
         return
     transcript = payload.get("transcript_path") or ""
-    session = payload.get("session_id") or transcript
+    # Key consolidation by the session UUID. The recoverability strategy reads the
+    # ledger under `path.stem` (the transcript's UUID filename), so fall back to the
+    # transcript stem — NOT the full path — when the hook payload omits session_id,
+    # else the write/read keys diverge and F6 pruning silently never matches.
+    session = payload.get("session_id") or (Path(transcript).stem if transcript else "")
     if not transcript or not os.path.exists(transcript):
         return
     try:
