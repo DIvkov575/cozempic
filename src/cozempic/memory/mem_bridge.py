@@ -1,7 +1,8 @@
-"""Persist Insights to the mymemories repo and record capture in the ledger.
+"""Persist Insights to the mymemories repo.
 
 Standalone stage: `insight -> slug`. Knows nothing about how insights were extracted.
 Partition resolution reuses the mymemories-tool symlink convention. No auto-commit.
+Recording span-capture in the ledger is a separate concern (see ledger.record_span).
 """
 
 from __future__ import annotations
@@ -10,7 +11,6 @@ import os
 import subprocess
 from pathlib import Path
 
-from . import ledger
 from .insight import Insight
 
 TOOL_DIR = Path(os.path.expanduser("~/workplace/mymemories-tool"))
@@ -72,19 +72,20 @@ def _reindex() -> None:
         pass
 
 
-def persist_insights(session_id: str, items: list[tuple[Insight, str]]) -> list[str]:
-    """Write each (insight, span_hash); record ledger; reindex once. Returns slugs written.
+def persist_insights(session_id: str, insights: list[Insight]) -> list[str]:
+    """Write each insight as a fact file + index line; reindex once. Returns slugs written.
 
-    No-op (returns []) if the project isn't partitioned into mymemories.
+    No-op (returns []) if the project isn't partitioned into mymemories. Recording
+    span-capture in the ledger is intentionally NOT done here (different cardinality:
+    insights != messages) — callers use ledger.record_span for that.
     """
     partition = resolve_partition()
     if partition is None:
         return []
     written: list[str] = []
-    for ins, span_h in items:
+    for ins in insights:
         _write_fact_file(partition, ins)
         _append_index_line(partition, ins)
-        ledger.record(session_id, span_h, ins.slug)
         written.append(ins.slug)
     if written:
         _reindex()

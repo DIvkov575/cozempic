@@ -1,5 +1,5 @@
 from pathlib import Path
-from cozempic.memory import mem_bridge, ledger
+from cozempic.memory import mem_bridge
 from cozempic.memory.insight import Insight, TrustClass
 
 
@@ -29,19 +29,18 @@ def test_append_memory_index_line(tmp_path):
 
 def test_persist_noop_when_not_partitioned(tmp_path, monkeypatch):
     monkeypatch.setattr(mem_bridge, "resolve_partition", lambda: None)
-    got = mem_bridge.persist_insights("sess1", [(_mk_insight(), "spanhash0000aaaa")])
+    got = mem_bridge.persist_insights("sess1", [_mk_insight()])
     assert got == []
 
 
-def test_persist_writes_and_records_ledger(tmp_path, monkeypatch):
+def test_persist_writes_fact_file(tmp_path, monkeypatch):
     part = tmp_path / "myproj"
     part.mkdir()
     (part / "MEMORY.md").write_text("# Memories\n")
     monkeypatch.setattr(mem_bridge, "resolve_partition", lambda: part)
     monkeypatch.setattr(mem_bridge, "_reindex", lambda: None)   # no embed.py in test
-    monkeypatch.setattr(ledger, "BRIDGE_DIR", tmp_path / "bridge")
 
-    slugs = mem_bridge.persist_insights("sess1", [(_mk_insight(), "spanhash0000aaaa")])
+    slugs = mem_bridge.persist_insights("sess1", [_mk_insight()])
     assert slugs == ["use-uv"]
     assert (part / "use-uv.md").exists()
-    assert ledger.is_captured("sess1", "spanhash0000aaaa")
+    # persist no longer records the ledger — that is ledger.record_span's job.

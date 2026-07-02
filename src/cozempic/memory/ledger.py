@@ -44,6 +44,17 @@ def record(session_id: str, span_h: str, slug: str) -> None:
     _path(session_id).write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
+def record_span(session_id: str, msgs: list[dict], slug: str) -> None:
+    """Record a per-message ledger entry for every message in the span.
+
+    Recoverability reads per-message (span_hash([msg])), so the write side must
+    record per-message too — a whole-span hash would never match a single-message
+    lookup. Each message maps to the same consolidated `slug`.
+    """
+    for m in msgs:
+        record(session_id, span_hash([m]), slug)
+
+
 def is_captured(session_id: str, span_h: str) -> bool:
     return span_h in _load(session_id)
 

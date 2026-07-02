@@ -22,7 +22,7 @@ def test_migrate_persists_all_active_rules(monkeypatch):
     monkeypatch.setattr(migrate, "load_digest_store", lambda: _Store())
     persisted = {}
     monkeypatch.setattr(migrate, "persist_insights",
-                        lambda sid, items: persisted.update(n=len(items)) or [i.slug for i, _ in items])
+                        lambda sid, insights: persisted.update(n=len(insights)) or [i.slug for i in insights])
     n = migrate.migrate_digest_rules("migration")
     assert n == 2
     assert persisted["n"] == 2

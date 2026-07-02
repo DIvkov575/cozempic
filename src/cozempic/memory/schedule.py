@@ -12,7 +12,6 @@ from pathlib import Path
 
 from . import ledger
 from .extract import extract_insights
-from .ledger import span_hash
 from .mem_bridge import persist_insights
 
 BRIDGE_DIR = ledger.BRIDGE_DIR
@@ -66,8 +65,12 @@ def consolidate_worker(session_id: str, span_msgs: list[dict]) -> None:
     insights = extract_insights(_span_text(span_msgs), _existing_slugs())
     if not insights:
         return
-    items = [(ins, span_hash(span_msgs)) for ins in insights]
-    persist_insights(session_id, items)
+    written = persist_insights(session_id, insights)
+    if not written:
+        return  # unpartitioned / nothing saved — don't record capture
+    # Per-message ledger entries so recoverability's per-message lookups match.
+    slug = written[0]
+    ledger.record_span(session_id, span_msgs, slug)
 
 
 def _spawn(session_id: str, span_msgs: list[dict]) -> None:

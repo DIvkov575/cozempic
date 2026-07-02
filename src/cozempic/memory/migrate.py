@@ -6,7 +6,6 @@ import re
 
 from ..digest import load_digest_store
 from .insight import Insight, TrustClass
-from .ledger import span_hash
 from .mem_bridge import persist_insights
 
 
@@ -32,9 +31,8 @@ def migrate_digest_rules(session_id: str) -> int:
     rules = store.active_rules()
     if not rules:
         return 0
-    items = []
-    for r in rules:
-        ins = _rule_to_insight(r.id, r.rule)
-        items.append((ins, span_hash([{"migrated_rule": r.id, "text": r.rule}])))
-    written = persist_insights(session_id, items)
+    # Migrated rules don't correspond to live transcript messages, so we do NOT
+    # record span-capture for them — only write the fact files.
+    insight_list = [_rule_to_insight(r.id, r.rule) for r in rules]
+    written = persist_insights(session_id, [ins for ins in insight_list])
     return len(written)
