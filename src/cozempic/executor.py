@@ -5,9 +5,11 @@ from __future__ import annotations
 from .helpers import (
     _METADATA_SINGLETON_KEY,
     get_content_blocks,
+    get_msg_type,
     hashable_str,
     msg_bytes,
     set_content_blocks,
+    text_of,
 )
 from ._validation import ConfigError
 from .registry import STRATEGIES
@@ -354,28 +356,38 @@ def run_prescription(
 
 
 def _derive_northstar(messages: list[dict]) -> str:
-    """v1: the first substantive user message is the stated goal."""
-    from .memory.tail import _text_of
+    """v1: the first substantive user message is the stated goal.
+
+    Reads the REAL Claude Code transcript shape: top-level ``type`` via
+    ``get_msg_type`` and text through the nested ``message.content`` blocks via
+    ``get_content_blocks`` + ``text_of`` (a plain top-level ``content`` read
+    would always miss it — records nest under ``message``).
+    """
     for m in messages:
-        if m.get("role") == "user":
-            t = _text_of(m).strip()
+        if get_msg_type(m) == "user":
+            t = " ".join(text_of(b) for b in get_content_blocks(m)).strip()
             if len(t) > 20 and "__cozempic" not in t:
                 return t.splitlines()[0][:200]
     return ""
 
 
 def _derive_todos(messages: list[dict]) -> list[str]:
-    """v1: pull the latest TodoWrite tool input's pending/in-progress items, if present."""
+    """v1: pull the latest TodoWrite tool input's pending/in-progress items, if present.
+
+    TodoWrite ``tool_use`` blocks live inside assistant ``message.content``, so
+    iterate blocks via ``get_content_blocks`` (which reads through the nested
+    ``message`` object) rather than a top-level ``content`` read.
+    """
     todos: list[str] = []
     for m in reversed(messages):
-        content = m.get("content")
-        if not isinstance(content, list):
-            continue
-        for b in content:
+        for b in get_content_blocks(m):
             if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") == "TodoWrite":
-                for item in b.get("input", {}).get("todos", []):
-                    if item.get("status") in ("pending", "in_progress"):
-                        todos.append(item.get("content", "")[:120])
+                inp = b.get("input")
+                if not isinstance(inp, dict):
+                    continue
+                for item in inp.get("todos", []):
+                    if isinstance(item, dict) and item.get("status") in ("pending", "in_progress"):
+                        todos.append(str(item.get("content", ""))[:120])
                 if todos:
                     return todos[:10]
     return todos
