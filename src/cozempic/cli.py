@@ -1471,7 +1471,6 @@ def _build_nudge_message(tier_key: int, pct: float, proj: float | None,
 
 def _maybe_memory_consolidate(session_id: str, messages: list[dict], fraction: float) -> None:
     """Early/background memory consolidation. Never raises into the hook."""
-    import os
     from ._validation import parse_env_bool
     if parse_env_bool("COZEMPIC_MEMORY_OFF", default=False, warn=False):
         return

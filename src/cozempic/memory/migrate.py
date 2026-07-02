@@ -36,5 +36,5 @@ def migrate_digest_rules(session_id: str) -> int:
     for r in rules:
         ins = _rule_to_insight(r.id, r.rule)
         items.append((ins, span_hash([{"migrated_rule": r.id, "text": r.rule}])))
-    persist_insights(session_id, items)
-    return len(items)
+    written = persist_insights(session_id, items)
+    return len(written)

@@ -26,3 +26,18 @@ def test_migrate_persists_all_active_rules(monkeypatch):
     n = migrate.migrate_digest_rules("migration")
     assert n == 2
     assert persisted["n"] == 2
+
+
+def test_migrate_count_reflects_unpartitioned(monkeypatch):
+    class _Rule:
+        def __init__(self, rid, rule):
+            self.id, self.rule = rid, rule
+
+    class _Store:
+        def active_rules(self):
+            return [_Rule("r1", "Never force-push"), _Rule("r2", "Prefer uv")]
+
+    monkeypatch.setattr(migrate, "load_digest_store", lambda: _Store())
+    # Simulate unpartitioned project: persist_insights writes nothing.
+    monkeypatch.setattr(migrate, "persist_insights", lambda sid, items: [])
+    assert migrate.migrate_digest_rules("x") == 0
