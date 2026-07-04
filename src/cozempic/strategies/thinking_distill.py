@@ -3,6 +3,7 @@ else fall back to lossless signature-only. Replaces the old thinking-blocks stra
 
 from __future__ import annotations
 
+from ..digest import _sanitize_for_injection
 from ..helpers import get_content_blocks, get_msg_type, is_protected, msg_bytes, set_content_blocks
 from ..memory import ledger
 from ..registry import strategy
@@ -67,8 +68,9 @@ def strategy_thinking_distill(messages: list[Message], config: dict) -> Strategy
                     slug = ledger.slug_for_block(session_id, block)
                     decision = _load_decision(slug) if slug else None
                     if decision:
+                        safe_decision = _sanitize_for_injection(decision, limit=1000)
                         new_blocks.append({"type": "text",
-                                           "text": f"[distilled reasoning · recall {slug}]\n{decision}"})
+                                           "text": f"[distilled reasoning · recall {slug}]\n{safe_decision}"})
                         changed = True
                         continue
                 # fallback: signature-only (lossless — keep reasoning, drop signature)
