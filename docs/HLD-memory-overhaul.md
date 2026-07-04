@@ -51,6 +51,13 @@ block — the enabling primitive for tail placement.
   its content is captured as a durable memory*. Aggression scales with capture, not clock.
 - **Tail placement**: regenerate a northstar/todo/directives block at the **end** of the
   conversation on every prune.
+- **Inline thinking distillation** (avenue 2): replace a fat reasoning/thinking turn with
+  its distilled *decision-point* text in place, instead of blindly deleting or truncating it.
+- **Lossless blob offload** (avenue 3): move a large **stable text asset** (document, chunked
+  document, big tool-result) out of the window verbatim and leave a retrievable **pointer**,
+  instead of lossy head/tail truncation.
+- **Consolidate the strategy set**: retire/merge the strategies these avenues subsume so
+  there is one owner per concern (no two strategies fighting over the same block).
 
 ## 2. Requirements
 
@@ -107,6 +114,31 @@ slugs). Capture-confirmed spans are eligible for aggressive eviction on the *nex
 cycle regardless of age/threshold. Uncaptured spans fall back to today's conservative
 content-type rules. "Prune early / compact early" is the emergent effect: capture, then
 shed.
+
+**F7 — Inline thinking distillation (avenue 2).** A fat `thinking` block is compacted into
+its **decision points** — the conclusions/choices the reasoning reached — and the block is
+replaced *in place* with that distilled text, rather than deleted (`thinking-blocks`
+`remove`) or blindly cut (`truncate`). Because distillation needs an LLM, it runs in the
+**existing background worker** (F1a), never on the sync prune path: the worker distills the
+thinking span, persists the decision-point text (F2), and records a per-message ledger
+pointer; a sync strategy then swaps the original thinking block for the distilled text
+(with a `→ recall <slug>` pointer to the full reasoning). If a block has not yet been
+distilled, the strategy leaves it for the incumbent lossless `signature-only` handling — it
+never blocks. F7 **replaces** the `thinking-blocks` strategy (see §7), absorbing its
+`signature-only` mode as the not-yet-distilled fallback.
+
+**F8 — Lossless blob offload + pointer (avenue 3).** A large **stable text asset** — a
+document, a chunked document, or a big `tool_result` blob (NOT thinking → F7; NOT binary
+images → `image-strip`) — over a byte threshold is written **verbatim** to the mymemories
+partition and replaced in-window with a compact **pointer stub** (`[cozempic asset: <path>
+— NKB · recall <slug>]`). This is **lossless** (the bytes are recoverable via `/recall`),
+unlike today's head/tail truncation. No LLM needed — it is a pure byte move, so it runs as a
+**synchronous** strategy. The pointer records into the **same bridge ledger** as F2/F6 so
+recoverability treats offloaded assets as capture-confirmed. Offloaded-asset pointers are
+**reinjected into the tail block** (F4) alongside memory stubs so the agent knows the asset
+exists and can `/recall` it. F8 **subsumes** the dead-end (non-retrievable) stub tiers of
+`tool-result-age` (old-age) and `mega-block-trim`, and demotes `tool-output-trim` to a
+small/volatile fallback (see §7).
 
 ### 2.2 Out of Scope
 - No logit-level context steering (no API surface — background rationale only).
@@ -255,6 +287,48 @@ not repositioned for adherence.
   bridge ledger. Provide a one-shot migration: extract existing active rules as
   `user-directive` memories on first run, then retire the JSON.
 
+### 5.8 Inline thinking distillation (F7 — `thinking_distill`, replaces `thinking-blocks`)
+- **Background half (worker, LLM):** when the consolidation worker (F1a) processes a span,
+  for each large `thinking` block it also produces a **decision-point distillation** —
+  the conclusions/choices reached — via the same pluggable extractor backend. The
+  distilled text is persisted (F2) and a per-message ledger entry records
+  `{thinking_span_hash → slug}`.
+- **Ledger namespace:** F7/F8 record under a **block**-hash key (`span_hash([block])`),
+  which is a different namespace from `recoverability`'s whole-**message** hash
+  (`span_hash([msg])`). So a distilled/offloaded block never makes its host message
+  look capture-confirmed to `recoverability` — the pointer survives in-window.
+- **Sync half (strategy):** `thinking_distill` replaces the `thinking-blocks` registration.
+  For each `thinking` block:
+  - If the block is **distilled** (ledger has its *block* hash), `replace` it in-window with the
+    distilled decision-point text + a `→ recall <slug>` pointer to the full reasoning.
+  - Else fall back to the incumbent **`signature-only`** behavior (strip the crypto
+    signature, keep the reasoning) — never a blocking LLM call, never blind deletion.
+- Config: `thinking_mode` retained for back-compat (`distill` default; `signature-only`
+  and `remove` still selectable for users who want the old behavior).
+
+### 5.9 Lossless blob offload (F8 — `asset-offload`, new sync strategy)
+- **Target selection:** content blocks that are large *stable text assets* — `tool_result`
+  blocks and text blocks over `asset_offload_min_bytes` (default 8192) — excluding
+  `thinking` (F7 owns it) and `image` blocks (`image-strip` owns them). "Stable" = not
+  already a cozempic stub/marker.
+- **Offload:** write the blob **verbatim** to the mymemories partition (a fact file whose
+  body is the raw asset, `type: reference`), via `mem_bridge`. Reuses the partition store
+  per the user directive; a `type: reference` tag keeps it distinguishable from semantic
+  insights. Record `{block_span_hash → slug}` in the bridge ledger.
+- **Replace:** swap the block for a compact pointer stub
+  `[cozempic asset: <name> — <N>KB · recall <slug>]` (sanitized). Lossless: `/recall`
+  returns the exact bytes.
+- **Tail reinjection:** offloaded-asset pointers are surfaced in the tail block (F4)
+  alongside memory stubs, so the agent sees the asset is available.
+- **Sync, no LLM:** pure byte move on the prune path — safe to run synchronously.
+- **Ledger interaction (deliberate):** F8 does **not** record into the *recoverability*
+  ledger. That ledger gates whole-**message** removal by hash; F8 mutates a message in
+  place (block → pointer) and the pointer must *survive*. Recording it there could let
+  `recoverability` delete the very message that holds the pointer. Instead the pointer stub
+  is self-describing (`recall <slug>`), and `/recall` resolves the slug directly. Blob
+  provenance (slug → offloading session) may be tracked in a **separate** offload ledger if
+  needed, never the removal-gating one.
+
 ## 6. Design Analysis
 
 ### 6.1 Key Improvements
@@ -277,3 +351,26 @@ not repositioned for adherence.
 | Project not partitioned in `mymemories` | Extraction no-ops with stderr note; no auto-install, no data loss. |
 | Losing the cap-20 adherence property (IFScale: >30 rules degrades) | Tail injects bounded top-K stubs, not all memories; bodies stay out of window. |
 | Regex digest removal breaks existing `~/.cozempic` users | One-shot migration of active rules → `user-directive` memories before retiring the JSON. |
+| F7 distillation drops a reasoning step the agent still needed | Distillation keeps a `→ recall <slug>` pointer to the full thinking; not-yet-distilled blocks fall back to lossless `signature-only`, never blind deletion. |
+| F8 offloads an asset the agent immediately re-reads → churn | Byte threshold (8192) + stable-only selection; pointer reinjected in tail so the agent can `/recall` without a round-trip to disk; ledger-gated so recoverability doesn't double-handle. |
+| Two strategies fighting over the same block after cleanup | §7 consolidation gives exactly one owner per concern: F7 owns `thinking`, F8 owns large stable text assets, `image-strip` owns images; `mega-block-trim` retained only as a post-avenue backstop. |
+
+## 7. Strategy Consolidation (cleanup contract)
+
+Ground truth from an audit of `src/cozempic/strategies/`. One owner per concern; retire the
+redundant/dead-end pieces.
+
+| Strategy | Verdict | Action |
+|---|---|---|
+| `thinking-blocks` | **REPLACE** | Becomes `thinking_distill` (F7); `signature-only` kept as the not-yet-distilled fallback mode. |
+| `tool-result-age` (old-age stub tier) | **MERGE → F8** | The old-age tier already emits a stub but it points nowhere; upgrade it to an `asset-offload` retrievable pointer. Keep the mid-age *lossless* minify tier unchanged. |
+| `mega-block-trim` | **KEEP (backstop)** | Runs after F7/F8 as a last-resort truncation for anything the avenues didn't claim. |
+| `tool-output-trim` | **DEMOTE** | Fires only for blobs below F8's threshold or too volatile to offload (small/unstable fallback). |
+| `image-strip` | **KEEP** | Orthogonal (binary); F8 explicitly excludes images. |
+| `document-dedup` | **KEEP** | Handles multi-occurrence dedup (in-window); complementary to F8's single-large-asset offload. |
+| `tool-use-result-strip`, `envelope-strip`, `stale-reads`, `system-reminder-dedup`, gentle tier | **KEEP** | Orthogonal, cheap, effectively lossless. |
+| `recoverability` | **KEEP** | Stays first in the aggressive tier. Its ledger is keyed by whole-**message** hash. F7 and F8 key their ledger entries by **block** hash (distinct namespace), so neither can trick `recoverability` into deleting a message that still holds a pointer. |
+
+**Prescription changes:** in `standard` and `aggressive`, `thinking-blocks` → `thinking_distill`;
+insert `asset-offload` before `tool-output-trim` (so offload claims large stable assets first,
+and `tool-output-trim` only mops up the small/volatile remainder). `mega-block-trim` stays last.
