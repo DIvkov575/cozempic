@@ -61,3 +61,16 @@ def is_captured(session_id: str, span_h: str) -> bool:
 
 def slug_for(session_id: str, span_h: str) -> str | None:
     return _load(session_id).get(span_h)
+
+
+def record_block(session_id: str, block: dict, slug: str) -> None:
+    """Record a distilled/offloaded content BLOCK (namespace distinct from message spans)."""
+    record(session_id, span_hash([block]), slug)
+
+
+def is_block_captured(session_id: str, block: dict) -> bool:
+    return is_captured(session_id, span_hash([block]))
+
+
+def slug_for_block(session_id: str, block: dict) -> str | None:
+    return slug_for(session_id, span_hash([block]))
