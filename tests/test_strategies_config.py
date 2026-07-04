@@ -185,7 +185,7 @@ class TestStrategyConfigIntegration(unittest.TestCase):
         self.assertEqual(result.strategy_name, "thinking-blocks")
 
     def test_valid_thinking_blocks_all_modes(self):
-        for mode in ("remove", "truncate", "signature-only"):
+        for mode in ("distill", "signature-only", "remove"):
             with self.subTest(mode=mode):
                 result = self._run("thinking-blocks", {"thinking_mode": mode})
                 self.assertEqual(result.strategy_name, "thinking-blocks")
