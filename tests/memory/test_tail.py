@@ -48,6 +48,15 @@ def test_tail_sanitizes_injected_markdown():
     assert text.count(tail.TAIL_MARKER) == 1
 
 
+def test_tail_includes_offloaded_assets():
+    from cozempic.memory import tail
+    msg = tail.build_tail_message(northstar="G", todos=[], directives=[], stubs=[],
+                                  assets=["[cozempic asset: doc — 9KB · recall doc-abc]"])
+    text = tail._text_of(msg)
+    assert "recall doc-abc" in text
+    assert tail.TAIL_MARKER in text
+
+
 def test_text_of_handles_list_content():
     msg = {
         "role": "user",

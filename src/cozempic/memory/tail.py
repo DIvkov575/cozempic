@@ -27,6 +27,7 @@ def build_tail_message(
     todos: list[str],
     directives: list[str],
     stubs: list[str],
+    assets: list[str] | None = None,
 ) -> dict:
     lines = [TAIL_MARKER, "# Current focus (regenerated each prune)"]
     if northstar:
@@ -40,6 +41,9 @@ def build_tail_message(
     if stubs:
         lines += ["", "## Relevant memories (use /recall to load)",
                   *[f"- {_sanitize_for_injection(s, limit=200)}" for s in stubs]]
+    if assets:
+        lines += ["", "## Offloaded assets (recall to load)",
+                  *[f"- {_sanitize_for_injection(a, limit=200)}" for a in assets]]
     return {"role": "user", "content": "\n".join(lines)}
 
 
@@ -53,6 +57,7 @@ def compose_tail(
     todos: list[str],
     directives: list[str],
     stubs: list[str],
+    assets: list[str] | None = None,
 ) -> list[dict]:
     cleaned = strip_prior_tail(messages)
-    return cleaned + [build_tail_message(northstar, todos, directives, stubs)]
+    return cleaned + [build_tail_message(northstar, todos, directives, stubs, assets)]
