@@ -38,6 +38,13 @@ DEFAULT_HARD1_TOKEN_PCT = 0.55  # 55% — standard prune + reload
 DEFAULT_HARD2_TOKEN_PCT = 0.80  # 80% — aggressive prune + reload (emergency)
 DEFAULT_HARD_TOKEN_PCT = 0.55   # Alias for backward compat (guard uses this)
 
+# Fixed early-checkpoint tier (absolute tokens, not a % of the window). Fires a
+# gentle prune before the soft tier to shed cheap bloat early on large windows.
+# Only activates when it sits strictly below the soft tier (i.e. large windows);
+# on small windows (e.g. 200K) 150K is already past hard1, so it's disabled.
+# Override with COZEMPIC_CHECKPOINT_TOKENS; set to 0 to disable.
+DEFAULT_CHECKPOINT_TOKENS = 150_000
+
 
 def get_system_overhead_tokens() -> int:
     """Get system overhead token estimate, checking env var override.
