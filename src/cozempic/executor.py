@@ -5,9 +5,11 @@ from __future__ import annotations
 from .helpers import (
     _METADATA_SINGLETON_KEY,
     get_content_blocks,
+    get_msg_type,
     hashable_str,
     msg_bytes,
     set_content_blocks,
+    text_of,
 )
 from ._validation import ConfigError
 from .registry import STRATEGIES
@@ -341,3 +343,96 @@ def run_prescription(
         _strip_metadata_singleton_tags(messages)
 
     return current, results
+
+
+# ─── Memory tail block (northstar / todos / directives / stubs) ─────────────
+#
+# After a prune, the surviving window loses the stated goal, open todos, and
+# standing directives that scrolled out. apply_memory_tail regenerates a single
+# marker-tagged block and appends it LAST (highest-adherence position). The block
+# is idempotent — memory.tail.compose_tail strips any prior tail before appending,
+# so repeated prunes replace rather than accumulate. Guarded by COZEMPIC_MEMORY_OFF
+# and fully exception-swallowing: memory features MUST NEVER abort a prune.
+
+
+def _derive_northstar(messages: list[dict]) -> str:
+    """v1: the first substantive user message is the stated goal.
+
+    Reads the REAL Claude Code transcript shape: top-level ``type`` via
+    ``get_msg_type`` and text through the nested ``message.content`` blocks via
+    ``get_content_blocks`` + ``text_of`` (a plain top-level ``content`` read
+    would always miss it — records nest under ``message``).
+    """
+    for m in messages:
+        if get_msg_type(m) == "user":
+            t = " ".join(text_of(b) for b in get_content_blocks(m)).strip()
+            if len(t) > 20 and "__cozempic" not in t:
+                return t.splitlines()[0][:200]
+    return ""
+
+
+def _derive_todos(messages: list[dict]) -> list[str]:
+    """v1: pull the latest TodoWrite tool input's pending/in-progress items, if present.
+
+    TodoWrite ``tool_use`` blocks live inside assistant ``message.content``, so
+    iterate blocks via ``get_content_blocks`` (which reads through the nested
+    ``message`` object) rather than a top-level ``content`` read.
+    """
+    todos: list[str] = []
+    for m in reversed(messages):
+        for b in get_content_blocks(m):
+            if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") == "TodoWrite":
+                inp = b.get("input")
+                if not isinstance(inp, dict):
+                    continue
+                for item in inp.get("todos", []):
+                    if isinstance(item, dict) and item.get("status") in ("pending", "in_progress"):
+                        todos.append(str(item.get("content", ""))[:120])
+                if todos:
+                    return todos[:10]
+    return todos
+
+
+def _derive_directives(messages: list[dict]) -> list[str]:
+    """v1: user-directive memories aren't in-window; use CLAUDE.md critical lines.
+
+    Reuse the same enforcement-marker scan the digest injection already uses.
+    """
+    from pathlib import Path
+    out: list[str] = []
+    for candidate in ("CLAUDE.md", ".claude/CLAUDE.md"):
+        p = Path(candidate)
+        if not p.exists():
+            continue
+        try:
+            for line in p.read_text(encoding="utf-8").splitlines():
+                s = line.strip()
+                if any(kw in s.upper() for kw in
+                       ("MUST NEVER", "NEVER ", "MUST ALWAYS", "CRITICAL:", "IMPORTANT:")):
+                    if len(s) > 10 and not s.startswith("#"):
+                        out.append(s[:120])
+                        if len(out) >= 8:
+                            return out
+        except OSError:
+            pass
+    return out
+
+
+def apply_memory_tail(messages: list[dict]) -> list[dict]:
+    """Append the regenerated northstar/todo/directives/stubs tail block.
+
+    Best-effort and guarded by COZEMPIC_MEMORY_OFF. Returns messages unchanged on opt-out
+    or any error.
+    """
+    from ._validation import parse_env_bool
+    if parse_env_bool("COZEMPIC_MEMORY_OFF", default=False, warn=False):
+        return messages
+    try:
+        from .memory import tail, stubs
+        northstar = _derive_northstar(messages)
+        todos = _derive_todos(messages)
+        directives = _derive_directives(messages)
+        stub_list = stubs.relevant_stubs(northstar or "current session", k=7)
+        return tail.compose_tail(messages, northstar, todos, directives, stub_list)
+    except Exception:
+        return messages

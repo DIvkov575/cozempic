@@ -13,7 +13,7 @@ from pathlib import Path
 from .config import load_config
 from .diagnosis import diagnose_session
 from .doctor import run_doctor
-from .executor import execute_actions, run_prescription
+from .executor import apply_memory_tail, execute_actions, run_prescription
 from .guard import checkpoint_team, start_guard, start_guard_daemon
 from .helpers import (
     is_ssh_session, shell_quote,
@@ -29,6 +29,47 @@ from .types import PrescriptionResult, StrategyResult
 
 # Ensure all strategies are registered
 import cozempic.strategies  # noqa: F401
+
+
+def _append_memory_tail_tuples(new_messages):
+    """Bridge the Message-tuple write path to the plain-dict apply_memory_tail.
+
+    ``run_prescription`` returns ``list[Message]`` (``(line_index, dict, byte_size)``
+    tuples over full JSONL records), but ``apply_memory_tail`` operates on plain
+    ``list[dict]`` and only APPENDS a marker-tagged tail dict at the end (via
+    ``compose_tail``, which strips any prior tail block first). We therefore:
+
+      1. Unwrap the tuples to their message dicts.
+      2. Run ``apply_memory_tail`` — returns the (tail-stripped) dicts plus one
+         appended tail dict, all by identity for the surviving ones.
+      3. Re-pair the surviving dicts back with their ORIGINAL tuples (preserving
+         line_index + byte_size), dropping any that a prior-tail strip removed.
+      4. Wrap each NEWLY-appended tail dict with a fresh, monotonic line_index
+         (max existing + 1...) and a freshly-computed byte size.
+
+    The tail lands LAST in the written JSONL. Best-effort: on any mismatch or
+    error we return ``new_messages`` unchanged so a memory glitch never corrupts
+    the prune output.
+    """
+    from .helpers import msg_bytes
+    try:
+        dict_to_tuple = {id(m): t for t, m in ((t, t[1]) for t in new_messages)}
+        dicts = [t[1] for t in new_messages]
+        out_dicts = apply_memory_tail(dicts)
+        if out_dicts is dicts or out_dicts == dicts:
+            return new_messages  # opt-out or no change
+        max_idx = max((t[0] for t in new_messages), default=-1)
+        rebuilt = []
+        for d in out_dicts:
+            existing = dict_to_tuple.get(id(d))
+            if existing is not None:
+                rebuilt.append(existing)
+            else:
+                max_idx += 1
+                rebuilt.append((max_idx, d, msg_bytes(d)))
+        return rebuilt
+    except Exception:
+        return new_messages
 
 
 # ─── argparse type= validators ────────────────────────────────────────────
@@ -302,7 +343,8 @@ def cmd_current(args):
         _floor_cfg = load_config().floor
         for rx_name, strategy_names in PRESCRIPTIONS.items():
             try:
-                new_msgs, _ = run_prescription(messages, strategy_names, {},
+                new_msgs, _ = run_prescription(messages, strategy_names,
+                                               {"session_id": sess["session_id"]},
                                                floor_config=_floor_cfg)
             except PruneValidationError as ve:
                 # Dry-run estimation: a structural validation failure means the
@@ -330,7 +372,8 @@ def cmd_diagnose(args):
     _floor_cfg = load_config().floor
     for rx_name, strategy_names in PRESCRIPTIONS.items():
         try:
-            new_msgs, _ = run_prescription(messages, strategy_names, {},
+            new_msgs, _ = run_prescription(messages, strategy_names,
+                                           {"session_id": path.stem},
                                            floor_config=_floor_cfg)
         except PruneValidationError as ve:
             # Dry-run estimation: report structural failure instead of crashing.
@@ -458,7 +501,7 @@ def cmd_treat(args):
         sys.exit(1)
 
     strategy_names = PRESCRIPTIONS[rx_name]
-    config = {}
+    config = {"session_id": path.stem}  # thread session id so recoverability strategy is active
     if args.thinking_mode:
         config["thinking_mode"] = args.thinking_mode
 
@@ -781,7 +824,7 @@ def cmd_reload(args):
         # mid-prune; we need the file state at this exact instant for diff classification).
         messages, snapshot = load_messages_and_snapshot(path)
         strategy_names = PRESCRIPTIONS[rx_name]
-        config = {}
+        config = {"session_id": sess["session_id"]}  # thread session id so recoverability strategy is active
         if args.thinking_mode:
             config["thinking_mode"] = args.thinking_mode
 
@@ -819,6 +862,12 @@ def cmd_reload(args):
                 strip_pattern_tags(messages)
         if protect_patterns:
             strip_pattern_tags(new_messages)
+
+        # Regenerate the northstar/todo/directives/stubs tail block and append it
+        # as the LAST message(s) before writing. Runs on the real prune+resume
+        # path so the resumed window carries the goal/todos/directives that
+        # scrolled out. Best-effort + COZEMPIC_MEMORY_OFF-guarded inside.
+        new_messages = _append_memory_tail_tuples(new_messages)
 
         final_bytes = sum(b for _, _, b in new_messages)
         final_count = len(new_messages)
@@ -1420,6 +1469,18 @@ def _build_nudge_message(tier_key: int, pct: float, proj: float | None,
             f"{reclaim80}. {tail}")
 
 
+def _maybe_memory_consolidate(session_id: str, messages: list[dict], fraction: float) -> None:
+    """Early/background memory consolidation. Never raises into the hook."""
+    from ._validation import parse_env_bool
+    if parse_env_bool("COZEMPIC_MEMORY_OFF", default=False, warn=False):
+        return
+    try:
+        from .memory import schedule
+        schedule.maybe_consolidate(session_id, messages, fraction)
+    except Exception:
+        pass  # memory is best-effort; must never break the nudge hook
+
+
 def cmd_nudge(args):
     """Stop-hook: emit a non-blocking systemMessage nudging the user to
     `/cozempic reload` at 25/55/80% context, ONCE per tier. Takes NO action — no
@@ -1435,7 +1496,11 @@ def cmd_nudge(args):
     if not isinstance(payload, dict):  # valid JSON but wrong shape (list/int/str)
         return
     transcript = payload.get("transcript_path") or ""
-    session = payload.get("session_id") or transcript
+    # Key consolidation by the session UUID. The recoverability strategy reads the
+    # ledger under `path.stem` (the transcript's UUID filename), so fall back to the
+    # transcript stem — NOT the full path — when the hook payload omits session_id,
+    # else the write/read keys diverge and F6 pruning silently never matches.
+    session = payload.get("session_id") or (Path(transcript).stem if transcript else "")
     if not transcript or not os.path.exists(transcript):
         return
     try:
@@ -1452,6 +1517,10 @@ def cmd_nudge(args):
     if tokens <= 0 or window <= 0:
         return
     pct = tokens / window
+    # Best-effort early memory consolidation: this hook already knows the
+    # session, the loaded transcript, and the context fraction, and runs often.
+    # Guarded + exception-swallowing so it can never break the nudge.
+    _maybe_memory_consolidate(session, [m for _, m, _ in messages], pct)
     # Tiers: prefer the guard's RESOLVED reload-tier fractions (so the nudge fires
     # where the guard actually reloads — tracks a raised --threshold and keeps the
     # FYI aligned with the real SOFT tier); fall back to the defaults. An explicit
@@ -1690,9 +1759,9 @@ def cmd_digest(args):
     from .digest import (
         clear_digest_store, flush_digest,
         load_digest_store, recover_digest,
-        save_digest_store, show_digest, update_digest,
+        save_digest_store, show_digest,
     )
-    from .session import load_messages, save_messages
+    from .session import load_messages
 
     action = getattr(args, "digest_action", "show") or "show"
 
@@ -1700,12 +1769,13 @@ def cmd_digest(args):
         print(show_digest())
 
     elif action == "update":
-        session_path, session_id, cwd = _digest_session(args)
-        messages = load_messages(session_path)
-        added, upvoted, rejected = update_digest(
-            messages, project_dir=cwd, session_id=session_id,
-        )
-        print(f"Digest updated: {added} new, {upvoted} reinforced, {rejected} rejected.")
+        print("digest update is retired; memory is now extracted via the memory subsystem")
+
+    elif action == "migrate":
+        from .memory.migrate import migrate_digest_rules
+        session_id = getattr(args, "session", None) or "digest-migration"
+        n = migrate_digest_rules(session_id)
+        print(f"Migrated {n} active digest rule(s) to memories.")
 
     elif action == "clear":
         clear_digest_store()
@@ -1899,8 +1969,8 @@ def build_parser() -> argparse.ArgumentParser:
     # digest
     p_digest = sub.add_parser("digest", help="Manage behavioral correction rules")
     p_digest.add_argument("digest_action", nargs="?", default="show",
-                          choices=["show", "update", "clear", "flush", "recover", "inject"],
-                          help="Action: show (default), update, clear, flush, recover, inject")
+                          choices=["show", "update", "migrate", "clear", "flush", "recover", "inject"],
+                          help="Action: show (default), update (retired), migrate, clear, flush, recover, inject")
     p_digest.add_argument("--session", help=session_help)
     p_digest.add_argument("--cwd", help="Working directory (default: current)")
 

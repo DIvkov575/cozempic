@@ -6,90 +6,10 @@ import hashlib
 import json
 import re
 
-from ..helpers import get_content_blocks, get_msg_type, hashable_str, is_protected, msg_bytes, set_content_blocks, text_of
+from ..helpers import get_content_blocks, get_msg_type, hashable_str, is_protected, msg_bytes, set_content_blocks
 from ..registry import strategy
 from ..types import Message, PruneAction, StrategyResult
-from ._config import coerce_choice, coerce_non_negative_int, coerce_ordered_pair
-
-_THINKING_MODES: tuple[str, ...] = ("remove", "truncate", "signature-only")
-
-
-@strategy("thinking-blocks", "Truncate or remove thinking/signature blocks", "standard", "2-5%")
-def strategy_thinking_blocks(messages: list[Message], config: dict) -> StrategyResult:
-    """Remove or truncate thinking blocks and signatures from assistant messages.
-
-    Modes (via config['thinking_mode']):
-        'remove'         - Remove thinking blocks entirely (default)
-        'truncate'       - Keep first 200 chars of thinking
-        'signature-only' - Only strip signature fields
-    """
-    mode = coerce_choice(config, "thinking_mode", _THINKING_MODES, default="remove")
-    actions: list[PruneAction] = []
-    total_orig = sum(b for _, _, b in messages)
-    total_pruned = 0
-    replaced = 0
-
-    for pos, (idx, msg, size) in enumerate(messages):
-        if is_protected(msg):
-            continue
-        if get_msg_type(msg) != "assistant":
-            continue
-
-        blocks = get_content_blocks(msg)
-        if not blocks:
-            continue
-
-        new_blocks = []
-        changed = False
-        for block in blocks:
-            btype = block.get("type", "")
-            if btype == "thinking":
-                changed = True
-                if mode == "remove":
-                    continue
-                elif mode == "truncate":
-                    thinking = block.get("thinking", "")
-                    new_block = {k: v for k, v in block.items() if k != "signature"}
-                    if len(thinking) > 200:
-                        new_block["thinking"] = thinking[:200] + "...[truncated]"
-                    new_blocks.append(new_block)
-                elif mode == "signature-only":
-                    new_block = {k: v for k, v in block.items() if k != "signature"}
-                    new_blocks.append(new_block)
-                    changed = new_block != block
-            else:
-                if "signature" in block:
-                    changed = True
-                    new_blocks.append({k: v for k, v in block.items() if k != "signature"})
-                else:
-                    new_blocks.append(block)
-
-        if changed:
-            new_msg = set_content_blocks(msg, new_blocks)
-            new_size = msg_bytes(new_msg)
-            saved = size - new_size
-            if saved > 0:
-                actions.append(PruneAction(
-                    line_index=idx,
-                    action="replace",
-                    reason=f"thinking-blocks ({mode})",
-                    original_bytes=size,
-                    pruned_bytes=new_size,
-                    replacement=new_msg,
-                ))
-                total_pruned += saved
-                replaced += 1
-
-    return StrategyResult(
-        strategy_name="thinking-blocks",
-        actions=actions,
-        original_bytes=total_orig,
-        pruned_bytes=total_pruned,
-        messages_affected=replaced,
-        messages_removed=0,
-        messages_replaced=replaced,
-        summary=f"Processed {replaced} thinking blocks (mode={mode})",
-    )
+from ._config import coerce_non_negative_int, coerce_ordered_pair
 
 
 @strategy("tool-output-trim", "Trim large tool_result blocks (>8KB or >100 lines)", "standard", "1-8%")

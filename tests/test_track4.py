@@ -165,8 +165,11 @@ class TestFlushRecover(unittest.TestCase):
         import shutil
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
-    def test_flush_extracts_and_syncs(self):
-        """Post-BUG-4 fix: rules start as pending. Two occurrences → promote to active → memdir synced."""
+    def test_flush_is_extraction_free_noop(self):
+        """The regex extractor is retired: flush mines no rules from raw
+        corrections (returns (0,0,0)) but still persists the store and syncs
+        any pre-existing active rules to the memdir. With no active rules there
+        is nothing to sync, so no memory file is written."""
         messages = [
             make_assistant(0, "I'll add the Co-Authored-By"),
             make_user(1, "don't add Co-Authored-By"),
@@ -181,11 +184,10 @@ class TestFlushRecover(unittest.TestCase):
              patch("cozempic.digest.DIGEST_MD_FILE", digest_md), \
              patch("cozempic.digest._get_memdir", return_value=self.mem_dir):
             added, upvoted, rejected = flush_digest(messages, project_dir="/test")
-            self.assertGreater(added + upvoted, 0)
+            self.assertEqual((added, upvoted, rejected), (0, 0, 0))
             self.assertTrue(digest_file.exists())
-            # Memdir should have been synced too (rule promoted to active via 2nd occurrence)
-            digest_mem = self.mem_dir / "cozempic_digest.md"
-            self.assertTrue(digest_mem.exists())
+            # No rules mined → no active rules → nothing synced to memdir.
+            self.assertFalse((self.mem_dir / "cozempic_digest.md").exists())
 
     def test_recover_syncs_to_memdir(self):
         digest_file = self.tmpdir / "behavioral-digest.json"
@@ -203,10 +205,12 @@ class TestFlushRecover(unittest.TestCase):
             self.assertIn("Co-Authored-By", content)
 
     def test_full_cycle(self):
-        """flush → compaction (memdir survives) → recover re-syncs.
+        """flush (persist) → compaction (memdir survives) → recover re-syncs.
 
-        Post-BUG-4 fix: rules start pending, promoted to active via PROMOTION_COUNT=2.
-        Test uses 2 occurrences of the same correction to trigger promotion.
+        The regex extractor is retired, so flush no longer mines rules from the
+        transcript. Existing active rules (e.g. migrated from the old digest)
+        are seeded directly; flush persists them, syncs the memdir, and recover
+        re-syncs idempotently.
         """
         digest_file = self.tmpdir / "behavioral-digest.json"
         digest_md = self.tmpdir / "behavioral-digest.md"
@@ -216,16 +220,14 @@ class TestFlushRecover(unittest.TestCase):
              patch("cozempic.digest.DIGEST_MD_FILE", digest_md), \
              patch("cozempic.digest._get_memdir", return_value=self.mem_dir):
 
-            # Flush: extract corrections (2 occurrences → promote via upvote)
-            messages = [
-                make_assistant(0, "I'll add Co-Authored-By"),
-                make_user(1, "don't add Co-Authored-By"),
-                make_assistant(2, "adding Co-Authored-By again"),
-                make_user(3, "don't add Co-Authored-By to commits"),
-            ]
-            flush_digest(messages, project_dir="/test")
+            # Seed a pre-existing active rule (extraction is retired).
+            save_digest_store(_make_store_with_rules())
 
-            # Verify active after 2nd occurrence (PROMOTION_COUNT=2 threshold met)
+            # Flush is a no-op on extraction but still syncs active rules.
+            self.assertEqual(
+                flush_digest([], project_dir="/test"), (0, 0, 0)
+            )
+
             store = load_digest_store("/test")
             self.assertGreater(len(store.active_rules()), 0)
 

@@ -138,15 +138,17 @@ class TestThinkingBlocks(unittest.TestCase):
         types = [b["type"] for b in content]
         self.assertNotIn("thinking", types)
 
-    def test_truncate_mode(self):
+    def test_default_distill_falls_back_to_signature_only(self):
+        # Default mode is now 'distill'; with no ledger entry it falls back to
+        # lossless signature-only — reasoning kept verbatim, signature stripped.
         long_thinking = "x" * 500
         messages = [make_assistant(0, text="hi", thinking=long_thinking)]
-        sr = STRATEGIES["thinking-blocks"].func(messages, {"thinking_mode": "truncate"})
+        sr = STRATEGIES["thinking-blocks"].func(messages, {"session_id": "no-such-session"})
         self.assertEqual(sr.messages_replaced, 1)
         replacement = sr.actions[0].replacement
         thinking_blocks = [b for b in replacement["message"]["content"] if b["type"] == "thinking"]
         self.assertEqual(len(thinking_blocks), 1)
-        self.assertIn("truncated", thinking_blocks[0]["thinking"])
+        self.assertEqual(thinking_blocks[0]["thinking"], long_thinking)  # reasoning kept (lossless)
         self.assertNotIn("signature", thinking_blocks[0])
 
 
