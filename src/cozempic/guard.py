@@ -104,6 +104,57 @@ def _read_hard_exit_threshold() -> int:
 
 HARD_LOOP_HARD_EXIT_THRESHOLD = _read_hard_exit_threshold()
 
+
+# ── Orphan deadman backstop ──────────────────────────────────────────────────
+# The daemon's only self-termination anchor is the watchdog, gated on a live
+# claude_pid. A detached daemon (start_new_session=True) is reparented to init,
+# so a child that never resolved claude_pid re-runs find_claude_pid() against its
+# own anchorless tree → None forever → the watchdog block is skipped every cycle.
+# With no other liveness check, a below-threshold idle session then loops
+# immortally (observed: guards alive 4–10h after their session died). The deadman
+# is the backstop: when there is NO live Claude anchor, exit once the transcript
+# has stayed idle past this many seconds. A session with a live claude_pid is
+# never affected (the watchdog owns that exit), so idle time alone never kills a
+# healthy guard. Default 30min; 0 disables. Read at import — restart to apply.
+_DEFAULT_ORPHAN_DEADMAN_SECONDS = 1800
+
+
+def _read_orphan_deadman_seconds() -> int:
+    """Read COZEMPIC_GUARD_ORPHAN_DEADMAN_SECONDS. Default 1800, 0 = disabled.
+
+    Invalid (non-numeric, negative) values fall back to the default. Read at
+    module import time only — restart the daemon to apply a new value.
+    """
+    raw = os.environ.get("COZEMPIC_GUARD_ORPHAN_DEADMAN_SECONDS")
+    if raw is None:
+        return _DEFAULT_ORPHAN_DEADMAN_SECONDS
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_ORPHAN_DEADMAN_SECONDS
+    if val < 0:
+        return _DEFAULT_ORPHAN_DEADMAN_SECONDS
+    return val  # 0 = explicitly disabled
+
+
+ORPHAN_DEADMAN_SECONDS = _read_orphan_deadman_seconds()
+
+
+def _orphan_deadman_tripped(has_live_anchor: bool, idle_elapsed: float, deadman_s: int) -> bool:
+    """True iff the guard is anchorless AND has idled past the deadman window.
+
+    Pure decision helper (mirrors _hard_loop_backoff_sleep's testable-seam style).
+      - has_live_anchor: a claude_pid we've confirmed alive this session.
+      - idle_elapsed: seconds since the transcript last grew.
+      - deadman_s: the window; 0 disables the backstop entirely.
+    """
+    if deadman_s <= 0:
+        return False
+    if has_live_anchor:
+        return False
+    return idle_elapsed >= deadman_s
+
+
 # ── Watcher poll constants (GAP-B) ───────────────────────────────────────────
 # After osascript fires, the watcher polls for a new claude process for up to
 # RELOAD_WATCHER_POLL_TIMEOUT_SECONDS. 30s matches acquire_with_wait default.
@@ -975,6 +1026,7 @@ def start_guard(
     poll_interval = interval          # F: current idle-adjusted top-of-loop sleep
     prev_size = -1                    # last cycle's transcript size (idle detection)
     idle_cycles = 0                   # F: consecutive stable-size cycles
+    idle_elapsed = 0.0                # orphan-deadman: seconds since transcript last grew
     noop_cycles = 0                   # G: cycles where a fire was skipped as a no-op
     consecutive_cycle_errors = 0      # C2: deterministic per-cycle error -> escalate, not silent-inert
     last_agents_active = False        # C2: don't escalate-exit while a subagent team is live
@@ -1044,8 +1096,27 @@ def start_guard(
                 idle = (prev_size >= 0 and current_size == prev_size)
                 if idle:
                     idle_cycles += 1
+                    # Accrue idle wall-time (we already slept poll_interval at the top
+                    # of this cycle). Any transcript growth resets it below.
+                    idle_elapsed += poll_interval
                 else:
                     idle_cycles = 0
+                    idle_elapsed = 0.0
+
+                # ── Orphan deadman backstop ───────────────────────────────
+                # Anchorless daemons (no live claude_pid — the watchdog above never
+                # fires) have no other exit. If such a guard idles past the deadman
+                # window, self-terminate so it can't outlive its dead session for
+                # hours. A guard WITH a live anchor is exempt (watchdog owns exit),
+                # so a healthy long-idle session is never killed here.
+                has_live_anchor = bool(claude_pid and claude_alive)
+                if _orphan_deadman_tripped(has_live_anchor, idle_elapsed, ORPHAN_DEADMAN_SECONDS):
+                    print(f"  [{_now()}] Orphan deadman: no live Claude anchor and idle "
+                          f"{int(idle_elapsed)}s >= {ORPHAN_DEADMAN_SECONDS}s. Final checkpoint...")
+                    _safe_unlink_session_pidfile(sess.get("session_id"))
+                    checkpoint_team(session_path=session_path, quiet=False)
+                    print(f"  Guard stopping (orphan deadman — session anchor gone).")
+                    break
                 # NB: poll_interval (F back-off) is decided at the END of the cycle,
                 # once we know whether a HARD tier fired — over a hard tier the reload
                 # (E) or the HARD circuit-breaker owns the cadence, so F stands down.
