@@ -1,3 +1,6 @@
+import subprocess
+import types
+
 from cozempic.memory import blobref, mem_bridge
 from cozempic.memory.insight import Insight, TrustClass
 
@@ -27,16 +30,25 @@ def test_build_pointer_stub_shape():
 
 
 def test_offload_block_writes_reference_and_returns_slug(tmp_path, monkeypatch):
-    part = tmp_path / "proj"; part.mkdir(); (part / "MEMORY.md").write_text("# Memories\n")
+    part = tmp_path / "proj"; part.mkdir()
     monkeypatch.setattr(mem_bridge, "resolve_partition", lambda: part)
-    monkeypatch.setattr(mem_bridge, "_reindex", lambda: None)
+    monkeypatch.setattr(mem_bridge, "_mymem_cmd", lambda: ["python3", "/x/mymem"])
+    calls: list[list[str]] = []
+
+    def _run(cmd, *a, **kw):
+        calls.append(cmd)
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+    monkeypatch.setattr(subprocess, "run", _run)
+
     block = {"type": "text", "text": "y" * 9000}
     slug = blobref.offload_block(block, name="doc")
     assert slug is not None
-    files = list(part.glob("*.md"))
-    body = next(f for f in files if f.name != "MEMORY.md").read_text()
-    assert "y" * 9000 in body           # verbatim
-    assert "type: reference" in body
+    # the offload persisted as a `reference` insight, verbatim, via mymem save
+    assert len(calls) == 1
+    cmd = calls[0]
+    assert cmd[:3] == ["python3", "/x/mymem", "save"]
+    assert cmd[cmd.index("--type") + 1] == "reference"
+    assert "y" * 9000 in cmd[cmd.index("--content") + 1]   # verbatim
 
 
 def test_offload_block_noop_when_unpartitioned(monkeypatch):
