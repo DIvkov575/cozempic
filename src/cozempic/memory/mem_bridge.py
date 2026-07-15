@@ -83,7 +83,13 @@ def _save_one(insight: Insight, partition: str, session_id: str) -> bool:
         "--content", insight.body.rstrip() + "\n",
         "--evidence", session_id or "cozempic",
         "--origin", "cozempic",
-        "--no-push",  # cozempic runs on the prune hot path; don't block on a network push.
+        # cozempic persists on the prune hot path — suppress BOTH network git ops.
+        # --no-pull matters most: `mymem save` pulls before writing by default, a
+        # ~590ms network round-trip that dominated the call (850ms -> 200ms without
+        # it, measured). --no-push avoids the push round-trip; a later dream/save
+        # syncs the local commits.
+        "--no-pull",
+        "--no-push",
     ]
     try:
         cp = subprocess.run(cmd, capture_output=True, text=True, timeout=_SAVE_TIMEOUT)

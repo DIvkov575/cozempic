@@ -49,6 +49,9 @@ def test_persist_invokes_mymem_save_with_expected_args(tmp_path, monkeypatch):
     assert cmd[cmd.index("--partition") + 1] == "myproj"
     assert cmd[cmd.index("--type") + 1] == "feedback"
     assert cmd[cmd.index("--evidence") + 1] == "sess1"
+    # BOTH network git ops suppressed — persist runs on the prune hot path.
+    # --no-pull is the critical one (default pull is a ~590ms network round-trip).
+    assert "--no-pull" in cmd
     assert "--no-push" in cmd
     assert "Always `uv pip install`." in cmd[cmd.index("--content") + 1]
 
