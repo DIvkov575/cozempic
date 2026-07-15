@@ -19,3 +19,8 @@ env/
 reddit-post.txt
 docs/outreach-list.md
 .cozempic-init.lock
+
+# transient benchmark run artifacts (archived under docs/bench-results/)
+preds_*.json
+*.3arm_*.json
+logs/run_evaluation/
