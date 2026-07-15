@@ -166,6 +166,49 @@ its own build (none=∅, ruya=1.8.39, mine=fork), with distinct config dirs — 
 gate that the comparison is valid before any token spend. Live smoke confirmed all
 three arms complete the run→grade loop on a trivial task.
 
+## Tier 4 — Jitter sweep (curve tuning on real growth curves)
+
+Objective: **stability**, not maximum compression — keep usage under a ~700K
+effective ceiling while reloading as rarely as possible. Only a *reload* rewrites
+the model's live context (gentle tiers are read-only, #106), so **jitter == reload
+count**.
+
+`cozempic.bench.jitter` reconstructs each session's **real** token-growth curve
+from the per-turn `usage` blocks (the API-reported cumulative context size — the
+same total cozempic's exact estimator uses; NOT a char estimate, and NOT summable
+across messages since usage is cumulative). It then replays that curve against
+candidate policies: a single reload threshold + a depth target the reload drops to.
+
+### How to run
+
+```bash
+PYTHONPATH=src python -m cozempic.bench.run_jitter --corpus ~/.claude/projects \
+    --reload-at 680000 --depths 350000 450000 550000
+```
+
+### Results — sweep over all real sessions (reload at 680K)
+
+| Prune depth | Sessions that reload | Total reloads | Reloads / session | Peak | >700K |
+|---|---|---|---|---|---|
+| → 350K (deep) | 5 | **8** | **1.60** | 682K | 0 |
+| → 450K (moderate) | 5 | 9 | 1.80 | 685K | 0 |
+| → 550K (shallow) | 5 | 15 | 3.00 | 708K | 1 |
+
+**Finding:** deeper pruning = less jitter, empirically. Pruning to 350K nearly
+halves reloads vs 550K (1.60 vs 3.00/session) and holds peak under 700K; the
+shallow 550K target re-triggers near the threshold (one session still peaked at
+708K). Only 5 sessions in the whole history ever grow large enough to reload —
+jitter is rare regardless, but deep pruning minimizes it among those.
+
+**Applied curve** (`DEFAULT_HARD*_TOKEN_PCT` in `tokens.py`): hard1 = hard2 = 68%
+(~680K on a 1M window), colocated so the deep **aggressive** reload leads (no
+shallow standard precursor to thrash). Aggressive reclaims ~48% → drops to ~350K.
+Checkpoint (150K) and soft (250K) gentle tiers unchanged; force at 88%.
+
+> Caveat: a saved session is one realized transcript; a real reload changes what
+> the agent does next, so replayed counts compare policies rather than predict
+> absolutes. Good enough to pick the lowest-jitter curve from your own history.
+
 ## Test coverage
 
 - `tests/bench/test_compression.py` — 7 tests (reclaim monotonicity, safety,

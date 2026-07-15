@@ -1,0 +1,8 @@
+Cozempic jitter sweep — reloads vs peak usage per candidate curve
+==================================================================
+policy            reload@   depth reloaders  reloads mean/rl      peak  >700k
+reload680k-depth350k  680,000 350,000         5        8    1.60   682,779      0
+reload680k-depth450k  680,000 450,000         5        9    1.80   684,590      0
+reload680k-depth550k  680,000 550,000         5       15    3.00   707,792      1
+
+Lower reloads = less jitter. peak/>700k show whether the curve holds the target.
