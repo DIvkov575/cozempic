@@ -13,7 +13,7 @@ from pathlib import Path
 from .config import load_config
 from .diagnosis import diagnose_session
 from .doctor import run_doctor
-from .executor import apply_memory_tail, execute_actions, run_prescription
+from .executor import execute_actions, run_prescription
 from .guard import checkpoint_team, start_guard, start_guard_daemon
 from .helpers import (
     is_ssh_session, shell_quote,
@@ -29,47 +29,6 @@ from .types import PrescriptionResult, StrategyResult
 
 # Ensure all strategies are registered
 import cozempic.strategies  # noqa: F401
-
-
-def _append_memory_tail_tuples(new_messages):
-    """Bridge the Message-tuple write path to the plain-dict apply_memory_tail.
-
-    ``run_prescription`` returns ``list[Message]`` (``(line_index, dict, byte_size)``
-    tuples over full JSONL records), but ``apply_memory_tail`` operates on plain
-    ``list[dict]`` and only APPENDS a marker-tagged tail dict at the end (via
-    ``compose_tail``, which strips any prior tail block first). We therefore:
-
-      1. Unwrap the tuples to their message dicts.
-      2. Run ``apply_memory_tail`` — returns the (tail-stripped) dicts plus one
-         appended tail dict, all by identity for the surviving ones.
-      3. Re-pair the surviving dicts back with their ORIGINAL tuples (preserving
-         line_index + byte_size), dropping any that a prior-tail strip removed.
-      4. Wrap each NEWLY-appended tail dict with a fresh, monotonic line_index
-         (max existing + 1...) and a freshly-computed byte size.
-
-    The tail lands LAST in the written JSONL. Best-effort: on any mismatch or
-    error we return ``new_messages`` unchanged so a memory glitch never corrupts
-    the prune output.
-    """
-    from .helpers import msg_bytes
-    try:
-        dict_to_tuple = {id(m): t for t, m in ((t, t[1]) for t in new_messages)}
-        dicts = [t[1] for t in new_messages]
-        out_dicts = apply_memory_tail(dicts)
-        if out_dicts is dicts or out_dicts == dicts:
-            return new_messages  # opt-out or no change
-        max_idx = max((t[0] for t in new_messages), default=-1)
-        rebuilt = []
-        for d in out_dicts:
-            existing = dict_to_tuple.get(id(d))
-            if existing is not None:
-                rebuilt.append(existing)
-            else:
-                max_idx += 1
-                rebuilt.append((max_idx, d, msg_bytes(d)))
-        return rebuilt
-    except Exception:
-        return new_messages
 
 
 # ─── argparse type= validators ────────────────────────────────────────────
@@ -862,12 +821,6 @@ def cmd_reload(args):
                 strip_pattern_tags(messages)
         if protect_patterns:
             strip_pattern_tags(new_messages)
-
-        # Regenerate the northstar/todo/directives/stubs tail block and append it
-        # as the LAST message(s) before writing. Runs on the real prune+resume
-        # path so the resumed window carries the goal/todos/directives that
-        # scrolled out. Best-effort + COZEMPIC_MEMORY_OFF-guarded inside.
-        new_messages = _append_memory_tail_tuples(new_messages)
 
         final_bytes = sum(b for _, _, b in new_messages)
         final_count = len(new_messages)
