@@ -82,6 +82,8 @@ def run_sweep(instance_ids: list[str], dataset: str, live: bool,
         print(f"[arm] {arm.name}: cozempic={p.cozempic_version or 'none'} "
               f"config={p.config_dir}")
 
+    from cozempic.bench.jitter import probe_peak_tokens
+    usage_rows = []  # (arm, iid, peak_tokens)
     for arm in arms:
         prepared = prepared_arms[arm.name]
         preds = []
@@ -98,11 +100,23 @@ def run_sweep(instance_ids: list[str], dataset: str, live: bool,
                 _run_agent(repo_dir, prepared, inst["problem_statement"])
                 patch = capture_diff(repo_dir)
                 preds.append(make_prediction(iid, arm.name, patch))
-                print(f"[{arm.name}] {iid}: patch {len(patch)} bytes")
+                # peak context the agent accumulated under this arm — shows whether
+                # the task stressed context and whether cozempic held it lower.
+                peak = probe_peak_tokens(prepared.config_dir)
+                usage_rows.append((arm.name, iid, peak))
+                print(f"[{arm.name}] {iid}: patch {len(patch)} bytes  "
+                      f"peak_ctx={peak:,} tok" if peak else
+                      f"[{arm.name}] {iid}: patch {len(patch)} bytes  peak_ctx=n/a")
         if live:
             out = REPO / f"preds_{arm.name}.json"
             out.write_text(json.dumps(preds))
             print(f"[{arm.name}] wrote {out} ({len(preds)} preds)")
+
+    if live and usage_rows:
+        print("\n=== peak context per (arm, instance) — did tasks stress context? ===")
+        for arm_name, iid, peak in usage_rows:
+            print(f"  {arm_name:<5} {iid:<40} {peak:,} tok" if peak
+                  else f"  {arm_name:<5} {iid:<40} n/a")
 
     if live:
         print("\n=== grade each arm (in the grading venv, Finch running) ===")

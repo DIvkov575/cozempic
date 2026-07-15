@@ -5,6 +5,7 @@ from pathlib import Path
 
 from cozempic.bench.jitter import (
     Policy, replay_session, summarize_policy, _usage_total, _growth_curve,
+    probe_peak_tokens, probe_reload_count,
 )
 
 
@@ -83,3 +84,24 @@ def test_summarize_counts_reloaders_and_over_700k(tmp_path):
 def test_missing_or_curveless_session_is_none(tmp_path):
     empty = tmp_path / "e.jsonl"; empty.write_text("")
     assert replay_session(empty, Policy("p", 680_000, 350_000)) is None
+
+
+def test_probe_peak_tokens_reads_max_across_transcripts(tmp_path):
+    proj = tmp_path / "projects" / "p"; proj.mkdir(parents=True)
+    _write_session(proj / "a.jsonl", [100_000, 450_000, 300_000])
+    _write_session(proj / "b.jsonl", [200_000, 610_000])
+    assert probe_peak_tokens(tmp_path) == 610_000
+
+
+def test_probe_peak_tokens_none_without_projects(tmp_path):
+    assert probe_peak_tokens(tmp_path) is None
+
+
+def test_probe_reload_count_zero_without_logs(tmp_path):
+    assert probe_reload_count(tmp_path) == 0
+
+
+def test_probe_reload_count_counts_threshold_lines(tmp_path):
+    (tmp_path / "cozempic_guard_abc.log").write_text(
+        "HARD2 THRESHOLD (68%): ...\nsome line\nHARD2 THRESHOLD (68%): ...\n")
+    assert probe_reload_count(tmp_path) == 2

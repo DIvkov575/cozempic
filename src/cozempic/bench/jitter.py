@@ -76,6 +76,38 @@ def _growth_curve(path: Path) -> list[int]:
     return curve
 
 
+def probe_peak_tokens(config_dir: Path) -> int | None:
+    """Peak context tokens across ALL transcripts under an arm's CLAUDE_CONFIG_DIR.
+
+    After a headless `claude -p` run, the session JSONL(s) live under
+    ``<config_dir>/projects/**/*.jsonl``. Read each one's growth curve and return
+    the max cumulative-usage level any turn reached — how much context the agent
+    actually accumulated. None if no transcript / no usage. This is what shows
+    WHETHER a task stressed context and whether a cozempic arm held it lower.
+    """
+    projects = config_dir / "projects"
+    if not projects.is_dir():
+        return None
+    peak = 0
+    for jsonl in projects.rglob("*.jsonl"):
+        curve = _growth_curve(jsonl)
+        if curve:
+            peak = max(peak, max(curve))
+    return peak or None
+
+
+def probe_reload_count(tmp_dir: Path) -> int:
+    """Count guard THRESHOLD firings from /tmp guard logs. 0 if none (e.g. 'none' arm)."""
+    import glob
+    total = 0
+    for log in glob.glob(str(tmp_dir / "cozempic_guard_*.log")):
+        try:
+            total += Path(log).read_text(encoding="utf-8", errors="replace").count("THRESHOLD")
+        except OSError:
+            continue
+    return total
+
+
 @dataclass
 class Policy:
     """A single-reload prune policy to evaluate against real growth curves.
