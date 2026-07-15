@@ -107,9 +107,64 @@ in the driver, so CI never spends tokens.
 
 Harness is **functional and unit-tested** (21 tests, 1 live-skip): grading,
 per-arm resolve-rate aggregation, agent-crash isolation, custom arms, N-run
-statistics (mean + 95% CI). A full live SWE-bench sweep is a separate, costly
-run — the harness is ready for it; the resolve-rate table will be filled in once
-a sweep is executed on Finch.
+statistics (mean + 95% CI).
+
+## Tier 3 — 3-arm build comparison (none / ruya / mine)
+
+The env-overlay A/B above compares *configs of one build*. The 3-arm comparison
+compares three **different cozempic builds** driving the same tasks, each in an
+isolated venv + `CLAUDE_CONFIG_DIR` (see `cozempic.bench.arms`):
+
+- **none** — plain Claude Code, cozempic not wired
+- **ruya** — upstream `cozempic==1.8.39`
+- **mine** — this fork (150K checkpoint + memory-overhaul + tail removal)
+
+**Isolation correctness (critical):** each arm's subprocess has `PYTHONPATH`
+stripped so a harness run under `PYTHONPATH=src` can't leak the working-tree build
+into every arm and shadow its venv. Verified: the ruya arm resolves to a clean
+`1.8.39`, mine to `1.8.39+divkov.checkpoint`, none to no install.
+
+### How to run
+
+```bash
+# isolation smoke (builds 3 venvs, asserts distinct builds; no tokens)
+PYTHONPATH=src python scripts/smoke_3arm.py
+PYTHONPATH=src python scripts/smoke_3arm.py --live      # + real claude -p per arm
+
+# full sweep: run claude -p per (instance, arm), capture predictions
+PYTHONPATH=src DOCKER_HOST=... python scripts/swebench_3arm.py \
+    --instances astropy__astropy-12907 --live
+# then grade each preds_<arm>.json with the official harness on Finch:
+python -m swebench.harness.run_evaluation --dataset_name SWE-bench/SWE-bench_Lite \
+    --predictions_path preds_mine.json --run_id 3arm_mine --max_workers 2
+```
+
+### Results — first live sweep (2026-07-15)
+
+Instance `astropy__astropy-12907` (SWE-bench_Lite), real `claude -p` per arm,
+graded in Finch (x86 emulation via QEMU):
+
+| Arm | cozempic build | resolved | patch |
+|---|---|---|---|
+| none | (none) | **1 / 1** | 506 B |
+| ruya | 1.8.39 | **1 / 1** | 506 B |
+| mine | 1.8.39+divkov.checkpoint | **1 / 1** | 506 B |
+
+**Reading:** all three arms resolved the instance with an identical patch. For a
+single, non-context-stressing task, pruning strategy is expected to make no
+difference — the meaningful finding is a **negative result**: enabling cozempic
+(ruya *or* mine) did **not** regress task success vs no pruning, and mine did not
+regress vs ruya. Pruning's value shows on *long, context-heavy* tasks where the
+`none` arm hits the autocompact wall; distinguishing the arms on resolve rate
+requires a larger, longer-context instance set. The harness + isolation are
+proven end-to-end; scaling the instance count is the next step.
+
+### Smoke (isolation proof)
+
+`scripts/smoke_3arm.py` builds all three arm venvs and asserts each imports only
+its own build (none=∅, ruya=1.8.39, mine=fork), with distinct config dirs — the
+gate that the comparison is valid before any token spend. Live smoke confirmed all
+three arms complete the run→grade loop on a trivial task.
 
 ## Test coverage
 
@@ -119,3 +174,5 @@ a sweep is executed on Finch.
 - `tests/test_swebench_predict.py` — prediction capture
 - `tests/test_bench_stats.py` — N-run mean/CI
 - `tests/test_checkpoint_tier.py` — 150K tier resolution/gating (7 tests)
+- `tests/bench/test_arms.py` — 3-arm specs, prepare_arm isolation, PYTHONPATH-strip,
+  sweep + crash isolation (6 tests + 1 opt-in real-install)
