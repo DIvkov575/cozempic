@@ -209,6 +209,55 @@ Checkpoint (150K) and soft (250K) gentle tiers unchanged; force at 88%.
 > the agent does next, so replayed counts compare policies rather than predict
 > absolutes. Good enough to pick the lowest-jitter curve from your own history.
 
+## Tier 5 — Long-horizon attempt (negative result: SWE-bench can't reach the curve)
+
+Attempted to extend the Tier-3 3-arm comparison (none/ruya/mine) with tasks big
+enough to actually *trigger* pruning — the open question after Tier-3's single
+easy instance (astropy-12907) resolved 1/1 on all arms without exercising any
+tier. Added `probe_peak_tokens`/`probe_reload_count` to `cozempic.bench.jitter`
+and `swebench_3arm.py` (records peak context per (arm, instance) — see commit
+`e96ba99`) specifically to measure whether a task stressed context at all before
+trusting a resolve-rate comparison.
+
+**Selection:** 5 instances from the largest SWE-bench_Lite repos by instance count
+(django 114, sympy 77, matplotlib/sklearn 23 each), ranked by problem-statement
+length + gold-patch complexity as a proxy for task difficulty: `django__django-14672`,
+`sympy__sympy-21171`, `scikit-learn__scikit-learn-25747`, `matplotlib__matplotlib-23563`,
+`django__django-13448`.
+
+**Result — peak context per instance (none arm, real `claude -p` runs):**
+
+| Instance | Peak context |
+|---|---|
+| django-14672 | 60,987 |
+| sympy-21171 | 42,645 |
+| sklearn-25747 | 37,207 |
+| matplotlib-23563 | 33,207 |
+| django-13448 | 30,246 |
+
+**Max: 60,987 tokens. Reload threshold: 680,000. ~11× short.** No prune fires on
+any of these — cozempic-on and cozempic-off are running byte-identical unpruned
+sessions. Generating the ruya/mine arms would have re-confirmed this at real
+cost (2 more repo clones + agent runs per instance) with no new information, so
+the sweep was stopped after the none arm once the peak-context data made the
+outcome certain; grading (Finch + swebench harness, also needed rebuilding after
+an environment restart) was skipped as not worth the setup for an already-decided
+question.
+
+**Why bigger repos didn't help:** the bottleneck isn't repo size, it's *task
+shape*. A SWE-bench instance is one atomic, well-scoped bug — the agent reads a
+handful of files and makes a focused fix in well under 100 turns, regardless of
+whether the repo is 50 files or 5,000. Repo size affects how much code *exists*,
+not how much of it a focused fix needs to hold in context.
+
+**Conclusion:** SWE-bench (Lite or Verified, any repo) structurally cannot
+exercise this pruning curve — every instance is too short by construction. The
+jitter sweep (Tier 4) is the right instrument for *this* question because it
+replays real long sessions from actual usage; a task-quality proof under real
+pruning load needs a genuinely long-horizon agentic benchmark (many-hour,
+many-file, iterate-through-failures sessions) — a different benchmark design,
+not larger SWE-bench repos.
+
 ## Test coverage
 
 - `tests/bench/test_compression.py` — 7 tests (reclaim monotonicity, safety,
