@@ -31,7 +31,6 @@ PRESCRIPTIONS: dict[str, list[str]] = {
         "tool-use-result-strip",
     ],
     "aggressive": [
-        "recoverability",
         "compact-summary-collapse",
         "attribution-snapshot-strip",
         "progress-collapse",

@@ -279,11 +279,8 @@ class TestRegistryPrescriptions(unittest.TestCase):
 
     def test_compact_summary_collapse_is_first(self):
         for name, strategies in PRESCRIPTIONS.items():
-            # aggressive intentionally runs "recoverability" first (drop
-            # capture-confirmed spans before other strategies see them).
-            expected = "recoverability" if name == "aggressive" else "compact-summary-collapse"
-            self.assertEqual(strategies[0], expected,
-                             f"{expected} must be first in {name}")
+            self.assertEqual(strategies[0], "compact-summary-collapse",
+                             f"compact-summary-collapse must be first in {name}")
 
     def test_attribution_snapshot_strip_in_all(self):
         for name, strategies in PRESCRIPTIONS.items():
@@ -300,7 +297,7 @@ class TestRegistryPrescriptions(unittest.TestCase):
         """Verify expected strategy counts per tier."""
         self.assertEqual(len(PRESCRIPTIONS["gentle"]), 5)
         self.assertEqual(len(PRESCRIPTIONS["standard"]), 12)
-        self.assertEqual(len(PRESCRIPTIONS["aggressive"]), 20)
+        self.assertEqual(len(PRESCRIPTIONS["aggressive"]), 19)
 
 
 # ---------------------------------------------------------------------------

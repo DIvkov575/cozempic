@@ -460,7 +460,7 @@ def cmd_treat(args):
         sys.exit(1)
 
     strategy_names = PRESCRIPTIONS[rx_name]
-    config = {"session_id": path.stem}  # thread session id so recoverability strategy is active
+    config = {"session_id": path.stem}  # thread session id so ledger-backed strategies (thinking-distill) are active
     if args.thinking_mode:
         config["thinking_mode"] = args.thinking_mode
 
@@ -783,7 +783,7 @@ def cmd_reload(args):
         # mid-prune; we need the file state at this exact instant for diff classification).
         messages, snapshot = load_messages_and_snapshot(path)
         strategy_names = PRESCRIPTIONS[rx_name]
-        config = {"session_id": sess["session_id"]}  # thread session id so recoverability strategy is active
+        config = {"session_id": sess["session_id"]}  # thread session id so ledger-backed strategies (thinking-distill) are active
         if args.thinking_mode:
             config["thinking_mode"] = args.thinking_mode
 
@@ -1025,6 +1025,19 @@ def cmd_guard(args):
     session_id = args.session or None
     claude_pid = args.claude_pid or find_claude_pid()
     protect_patterns = _compile_protect_patterns_or_exit(args)  # #122
+
+    # The SessionStart hook invokes `guard --daemon --session "$TRANSCRIPT"` as a
+    # child of the live Claude process — the one moment we can learn CC's own
+    # active session. Record it so find_current_session()'s active-session
+    # detection (used by the manual CLI path) follows the real transcript
+    # instead of guessing from cwd. Path-shaped args.session only; a bare
+    # session ID/UUID prefix has no transcript path to record.
+    if session_id and session_id != "current" and session_id.endswith(".jsonl"):
+        try:
+            from .session import record_active_transcript
+            record_active_transcript(session_id, claude_pid=claude_pid)
+        except Exception:
+            pass
 
     _apply_token_env_overrides(args)
 
@@ -1449,10 +1462,10 @@ def cmd_nudge(args):
     if not isinstance(payload, dict):  # valid JSON but wrong shape (list/int/str)
         return
     transcript = payload.get("transcript_path") or ""
-    # Key consolidation by the session UUID. The recoverability strategy reads the
-    # ledger under `path.stem` (the transcript's UUID filename), so fall back to the
+    # Key consolidation by the session UUID. thinking-distill reads the ledger
+    # under `path.stem` (the transcript's UUID filename), so fall back to the
     # transcript stem — NOT the full path — when the hook payload omits session_id,
-    # else the write/read keys diverge and F6 pruning silently never matches.
+    # else the write/read keys diverge and distillation silently never matches.
     session = payload.get("session_id") or (Path(transcript).stem if transcript else "")
     if not transcript or not os.path.exists(transcript):
         return
@@ -1579,7 +1592,7 @@ def cmd_nudge(args):
 
 
 def cmd_remind(args):
-    """Periodic rule reinforcement — outputs active digest rules to stderr.
+    """Periodic rule reinforcement — outputs critical CLAUDE.md rules to stderr.
 
     Designed for PostToolUse hook. Counts tool calls via a counter file,
     outputs rules every N calls (default 25). Stderr output appears in
@@ -1603,21 +1616,9 @@ def cmd_remind(args):
     if count % interval != 0:
         return
 
-    # Collect rules: digest active rules + CLAUDE.md critical rules
     lines = []
 
-    # 1. Active digest rules. Sanitize r.rule — it is untrusted transcript-derived
-    # text and this is emitted into Claude's context via the PostToolUse hook, so a
-    # multi-line / markdown-structured rule could inject instructions (sibling of
-    # the digest injection fix; the #123 fix-one-miss-the-sibling lesson).
-    from .digest import load_digest_store, _sanitize_for_injection
-    store = load_digest_store()
-    active = store.active_rules()
-    if active:
-        for r in active[:5]:
-            lines.append(f"  [{r.id}|{r.scope}] {_sanitize_for_injection(r.rule)}")
-
-    # 2. Critical CLAUDE.md rules (grep for enforcement markers)
+    # Critical CLAUDE.md rules (grep for enforcement markers)
     for candidate in ["CLAUDE.md", ".claude/CLAUDE.md"]:
         p = Path(candidate)
         if p.exists():
@@ -1672,114 +1673,6 @@ def cmd_formulary(args):
     print("    cozempic treat <session> -rx aggressive   # Maximum savings")
     print("    cozempic treat <session> --execute        # Apply (default is dry-run)")
     print()
-
-
-def _digest_session(args):
-    """Resolve session path and ID from args.
-
-    Resolution strategy:
-      - absent / "current"  → cwd-based auto-detect via find_current_session(cwd);
-                              exits 1 with a stderr message if none found.
-      - explicit UUID / UUID prefix / file path → resolve_session(session_arg);
-                              session_id recovered from resolved path stem.
-
-    Returns (path, session_id, cwd).
-    """
-    from .session import find_current_session, resolve_session
-    cwd = getattr(args, "cwd", None) or os.getcwd()
-    session_arg = getattr(args, "session", None)
-    if not session_arg or session_arg == "current":
-        # Both absent and explicit "current" use cwd-based auto-detection,
-        # consistent with how the rest of cli.py resolves the current session.
-        # Routing "current" through resolve_session() would invoke process-detection
-        # (a different strategy from slug-match) — not what we want here.
-        # strict=True: digest flush/inject are write operations — injecting rules
-        # into an unrelated session's JSONL is a context-contamination risk.
-        sess = find_current_session(cwd, strict=True)
-        if not sess:
-            # Changed to stderr: consistent with resolve_session error output
-            # and all other error paths in cli.py.
-            print("No active session found.", file=sys.stderr)
-            sys.exit(1)
-        return sess["path"], sess.get("session_id", ""), cwd
-    # resolve_session handles: explicit path, UUID, UUID prefix
-    resolved = resolve_session(session_arg)
-    session_id = resolved.stem  # filename stem IS the session UUID
-    return resolved, session_id, cwd
-
-
-def cmd_digest(args):
-    from .digest import (
-        clear_digest_store, flush_digest,
-        load_digest_store, recover_digest,
-        save_digest_store, show_digest,
-    )
-    from .session import load_messages
-
-    action = getattr(args, "digest_action", "show") or "show"
-
-    if action == "show":
-        print(show_digest())
-
-    elif action == "update":
-        print("digest update is retired; memory is now extracted via the memory subsystem")
-
-    elif action == "migrate":
-        from .memory.migrate import migrate_digest_rules
-        session_id = getattr(args, "session", None) or "digest-migration"
-        n = migrate_digest_rules(session_id)
-        print(f"Migrated {n} active digest rule(s) to memories.")
-
-    elif action == "clear":
-        clear_digest_store()
-        print("Behavioral digest cleared.")
-
-    elif action == "flush":
-        session_path, session_id, cwd = _digest_session(args)
-        messages = load_messages(session_path)
-        added, upvoted, rejected = flush_digest(
-            messages, project_dir=cwd, session_id=session_id,
-        )
-        print(f"Digest flushed: {added} new, {upvoted} reinforced, {rejected} rejected.")
-
-    elif action == "recover":
-        cwd = getattr(args, "cwd", None) or os.getcwd()
-        synced = recover_digest(project_dir=cwd)
-        print(f"Synced {synced} rules to Claude Code memory.")
-
-    elif action == "inject":
-        cwd = getattr(args, "cwd", None) or os.getcwd()
-        # The SessionStart hook calls `digest inject --session "$TRANSCRIPT"`, and
-        # runs as a child of the live Claude process — the one moment we can learn
-        # CC's own active session. Record it (keyed by the live Claude PID) so the
-        # manual CLI path follows the real transcript instead of guessing from cwd.
-        _transcript = getattr(args, "session", None)
-        if _transcript and _transcript != "current":
-            try:
-                from .session import record_active_transcript
-                record_active_transcript(_transcript)
-            except Exception:
-                pass
-        store = load_digest_store(cwd)
-        if store.is_empty():
-            print("No rules to inject.")
-            return
-        from .digest import sync_to_memdir, _get_memdir
-        synced = sync_to_memdir(store, cwd=cwd)
-        if synced > 0:
-            save_digest_store(store)
-            print(f"Synced {synced} active rules to Claude Code memory.")
-        elif not store.active_rules():
-            # Nothing ACTIVE to write yet (rules activate after 2 occurrences) — the
-            # memory-dir state is irrelevant here. The old code mislabeled this as
-            # "Could not find Claude Code memory directory".
-            print("No active rules to sync yet.")
-        elif _get_memdir(cwd) is None:
-            # We DO have active rules, but Claude Code hasn't created the memory dir
-            # for this project yet — it syncs automatically once the dir exists.
-            print("Memory directory not created by Claude Code yet — will sync once it exists.")
-        else:
-            print("Nothing to sync.")
 
 
 # ─── Parser ───────────────────────────────────────────────────────────────────
@@ -1913,19 +1806,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("self-update", help="Upgrade cozempic to the latest version from PyPI")
 
     # remind
-    p_remind = sub.add_parser("remind", help="Output active behavioral rules (for PostToolUse hook)")
+    p_remind = sub.add_parser("remind", help="Output critical CLAUDE.md rules (for PostToolUse hook)")
     p_remind.add_argument("--interval", type=_positive_int, default=25, help="Output every N tool calls (default: 25)")
 
     # nudge (Stop hook — non-blocking context nudge, no action)
     sub.add_parser("nudge", help="Stop-hook: non-blocking 'prune now?' nudge at 25/55/80%% (no action)")
-
-    # digest
-    p_digest = sub.add_parser("digest", help="Manage behavioral correction rules")
-    p_digest.add_argument("digest_action", nargs="?", default="show",
-                          choices=["show", "update", "migrate", "clear", "flush", "recover", "inject"],
-                          help="Action: show (default), update (retired), migrate, clear, flush, recover, inject")
-    p_digest.add_argument("--session", help=session_help)
-    p_digest.add_argument("--cwd", help="Working directory (default: current)")
 
     p_dash = sub.add_parser("dashboard", help="Generate + open the prune-value dashboard (HTML)")
     p_dash.add_argument("--no-open", action="store_true",
@@ -1938,7 +1823,7 @@ def build_parser() -> argparse.ArgumentParser:
 _SUBCOMMANDS = {
     "list", "current", "diagnose", "treat", "strategy", "reload",
     "checkpoint", "post-compact", "guard", "init", "doctor", "formulary", "completions",
-    "digest", "self-update", "remind", "guard-watchdog", "dashboard", "uninstall",
+    "self-update", "remind", "guard-watchdog", "dashboard", "uninstall",
 }
 
 
@@ -2449,7 +2334,6 @@ def main():
         "guard-watchdog": cmd_guard_watchdog,
         "formulary": cmd_formulary,
         "completions": cmd_completions,
-        "digest": cmd_digest,
         "self-update": cmd_self_update,
         "remind": cmd_remind,
         "nudge": cmd_nudge,

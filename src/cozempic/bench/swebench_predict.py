@@ -52,8 +52,7 @@ def claude_repo_agent(repo_dir: Path, arm_env: dict, problem: str,
                       timeout: float = 600.0) -> None:
     """Live agent: run `claude -p` in the repo checkout to fix the issue.
 
-    ``arm_env`` is the per-arm environment overlay (e.g. the real, honored
-    ``COZEMPIC_CHECKPOINT_TOKENS`` to A/B the fixed early tier). Non-deterministic —
+    ``arm_env`` is the per-arm environment overlay. Non-deterministic —
     used only in real sweeps, not unit tests.
     """
     import os

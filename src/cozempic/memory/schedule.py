@@ -69,10 +69,7 @@ def consolidate_worker(session_id: str, span_msgs: list[dict]) -> None:
         return
     written = persist_insights(session_id, insights)
     if not written:
-        return  # unpartitioned / nothing saved — don't record capture
-    # Per-message ledger entries so recoverability's per-message lookups match.
-    slug = written[0]
-    ledger.record_span(session_id, span_msgs, slug)
+        return  # unpartitioned / nothing saved
     _distill_thinking_blocks(session_id, span_msgs)
 
 

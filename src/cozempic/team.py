@@ -139,15 +139,13 @@ class TeamState:
     @staticmethod
     def _san(text) -> str:
         """Sanitize untrusted team-derived text before it lands in a Claude-readable
-        checkpoint/recovery surface — the sibling of the digest _sanitize_for_injection
-        fix (result_summary/lead_summary/subject/description/name come from tool
-        results and team messages and were embedded verbatim, so a multi-line /
-        markdown-structured value could inject into CC memory). Lazy import avoids
-        any import-order coupling with digest."""
+        checkpoint/recovery surface (result_summary/lead_summary/subject/description/
+        name come from tool results and team messages and were embedded verbatim, so
+        a multi-line / markdown-structured value could inject into CC memory)."""
         if not text:
             return ""
         try:
-            from .digest import _sanitize_for_injection
+            from .helpers import _sanitize_for_injection
             s = _sanitize_for_injection(str(text))
         except Exception:
             # Fail safe: at minimum collapse newlines so injection can't add lines.

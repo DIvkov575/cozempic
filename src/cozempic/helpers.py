@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json as _json
 import os
+import re as _re
 import tempfile as _tempfile
 from pathlib import Path as _Path
 
@@ -414,8 +415,6 @@ def is_protected(msg: dict) -> bool:
     if t == "system" and msg.get("subtype") in ("compact_boundary", "microcompact_boundary"):
         return True
     if msg.get("isVisibleInTranscriptOnly"):
-        return True
-    if msg.get("__cozempic_behavioral_digest__"):
         return True
     if msg.get("__cozempic_team_protected__"):
         return True
@@ -1040,3 +1039,30 @@ def text_of(block: dict) -> str:
     if not isinstance(result, str):
         return ""
     return result
+
+
+def _sanitize_for_injection(text: str, limit: int = 300) -> str:
+    """Neutralize untrusted text before it is embedded into a Claude-readable
+    markdown file or injected block (e.g. a distilled thinking decision).
+
+    Text comes from the user's transcript and is otherwise interpolated
+    verbatim — so a value containing a newline + a fake `## header`, a list
+    item, a `>` quote, or a ``` code fence could inject structure/instructions
+    into CC's context (prompt-injection). Defenses: collapse ALL newlines and
+    control chars to spaces (stays one line — cannot add markdown lines),
+    neutralize a leading markdown-control char, and cap length.
+    """
+    if not isinstance(text, str):
+        text = str(text)
+    # Newlines + other C0 control chars -> space (single-line guarantee).
+    text = _re.sub(r"[\x00-\x1f\x7f]+", " ", text)
+    text = _re.sub(r"\s+", " ", text).strip()
+    # Defang a leading markdown-structural char so the value can't render as a
+    # header/quote/list/fence at the start of its line. Guard on a non-empty
+    # first char: `"" in "#>-*`|"` is True (empty str is a substring of every
+    # str), which would prepend a stray backslash to an emptied value.
+    if text and text[0] in "#>-*`|":
+        text = "\\" + text
+    if len(text) > limit:
+        text = text[:limit] + "…"
+    return text

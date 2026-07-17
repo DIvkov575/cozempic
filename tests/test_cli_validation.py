@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from cozempic.cli import _prescan_argv, _positive_float, build_parser, _digest_session
+from cozempic.cli import _prescan_argv, _positive_float, build_parser
 
 
 class TestPositiveFloatArgparseHelper:
@@ -618,105 +618,4 @@ class TestValueErrorDispatch:
                 pass
         assert "session_id malformed: @@" in stderr_buf.getvalue(), (
             f"error text missing from stderr: {stderr_buf.getvalue()!r}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# CLI bug: _digest_session must resolve UUID via resolve_session (F4)
-# ---------------------------------------------------------------------------
-
-class TestDigestSessionResolution:
-    """_digest_session(args) must call resolve_session() when args.session
-    is provided, not return the string verbatim.
-
-    Before fix: `return session_path, "", cwd` → passes UUID as a file path.
-    After fix:  calls resolve_session(session_arg) → returns Path + stem ID.
-    """
-
-    def _make_args(self, session=None):
-        args = MagicMock()
-        args.session = session
-        args.cwd = None
-        return args
-
-    def test_uuid_arg_resolves_to_path(self):
-        """UUID string → resolve_session called, returned path is a Path object."""
-        fake_path = Path("/fake/abc123.jsonl")
-        # _digest_session does `from .session import ..., resolve_session` locally,
-        # so patch the source module (cozempic.session) not the cli top-level binding.
-        with patch("cozempic.session.resolve_session", return_value=fake_path) as mock_rs:
-            path, session_id, cwd = _digest_session(self._make_args(session="abc123"))
-        mock_rs.assert_called_once_with("abc123")
-        assert path == fake_path
-
-    def test_uuid_arg_session_id_from_stem(self):
-        """session_id must be derived from path.stem (the UUID)."""
-        fake_path = Path("/fake/abc123.jsonl")
-        with patch("cozempic.session.resolve_session", return_value=fake_path):
-            path, session_id, cwd = _digest_session(self._make_args(session="abc123"))
-        assert session_id == "abc123", f"expected 'abc123', got {session_id!r}"
-
-    def test_path_arg_resolves_correctly(self):
-        """Explicit file path → resolve_session returns it, stem extracted."""
-        fake_path = Path("/real/path/uuid-val.jsonl")
-        with patch("cozempic.session.resolve_session", return_value=fake_path):
-            path, session_id, cwd = _digest_session(
-                self._make_args(session="/real/path/uuid-val.jsonl")
-            )
-        assert path == fake_path
-        assert session_id == "uuid-val"
-
-    def test_no_session_arg_uses_find_current(self):
-        """args.session=None → find_current_session called; returns its path + id."""
-        fake_sess = {"path": Path("/x/sess.jsonl"), "session_id": "sess"}
-        # _digest_session does a local `from .session import find_current_session`,
-        # so patch the source module (cozempic.session) not the cli binding.
-        with patch("cozempic.session.find_current_session", return_value=fake_sess):
-            path, session_id, cwd = _digest_session(self._make_args(session=None))
-        assert path == Path("/x/sess.jsonl")
-        assert session_id == "sess"
-
-    def test_no_session_arg_no_current_exits_1(self):
-        """args.session=None + no current session → SystemExit(1)."""
-        with patch("cozempic.session.find_current_session", return_value=None):
-            try:
-                _digest_session(self._make_args(session=None))
-                assert False, "expected SystemExit(1)"
-            except SystemExit as exc:
-                assert exc.code == 1, f"expected exit 1, got {exc.code}"
-
-    def test_current_literal_uses_cwd_find_current(self):
-        """args.session='current' → uses cwd-based find_current_session (same as
-        no-session path), NOT resolve_session('current') which uses process-detection.
-        C3: keeps both paths consistent."""
-        fake_sess = {"path": Path("/y/curr.jsonl"), "session_id": "curr"}
-        with patch("cozempic.session.find_current_session", return_value=fake_sess) as mock_fc, \
-             patch("cozempic.session.resolve_session") as mock_rs:
-            path, session_id, cwd = _digest_session(self._make_args(session="current"))
-        # Must use find_current_session (cwd-based), NOT resolve_session
-        mock_fc.assert_called_once()
-        mock_rs.assert_not_called()
-        assert path == Path("/y/curr.jsonl")
-        assert session_id == "curr"
-
-    def test_no_session_arg_calls_find_current_with_strict_true(self):
-        """_digest_session calls find_current_session(cwd, strict=True) — not the
-        non-strict default.
-
-        digest flush/inject are write operations. Without strict=True, a user running
-        `cozempic digest flush` in a project whose Strategy-3 lookup fails would
-        silently inject rules into another project's session (Strategy-4 fallback).
-
-        Spy asserts keyword `strict=True` is passed; no behavior gap if omitted.
-        """
-        fake_sess = {"path": Path("/z/strict.jsonl"), "session_id": "strict-sess"}
-        with patch("cozempic.session.find_current_session", return_value=fake_sess) as mock_fc:
-            _digest_session(self._make_args(session=None))
-
-        mock_fc.assert_called_once()
-        _, kwargs = mock_fc.call_args
-        assert kwargs.get("strict") is True, (
-            f"find_current_session was called with strict={kwargs.get('strict')!r}, "
-            "expected strict=True. Without this, digest writes can cross-contaminate "
-            "when Strategy-3 fails and Strategy-4 picks a newer unrelated session."
         )

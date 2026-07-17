@@ -1,5 +1,14 @@
 # Cozempic Benchmarks
 
+> **2026-07-16 revert notice:** the 150K early-checkpoint tier, the 68%/68%
+> low-jitter curve, and the `recoverability` strategy described in Tiers 1/3/4
+> below were **reverted** to move the fork's gates/harnesses back toward
+> upstream (see the revert commit). The historical results and A/B tooling are
+> kept here as a record of what was measured — they no longer describe the
+> current default behavior. Tier 4 (jitter) and the checkpoint A/B in Tier 1
+> refer to a removed feature; current defaults are upstream's soft 25% / hard1
+> 55% / hard2 80% curve, no checkpoint tier.
+
 Two independent benchmark tiers validate the changes on this branch (the fixed
 150K early-checkpoint tier and the removal of memory tail placement):
 

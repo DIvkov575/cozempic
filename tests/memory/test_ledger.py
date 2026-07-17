@@ -18,20 +18,6 @@ def test_record_and_confirm(tmp_path, monkeypatch):
     assert ledger.slug_for("sess1", h) == "use-uv-not-pip"
 
 
-def test_record_span_is_per_message(tmp_path, monkeypatch):
-    monkeypatch.setattr(ledger, "BRIDGE_DIR", tmp_path)
-    span = [
-        {"role": "user", "content": "always use uv"},
-        {"role": "assistant", "content": "got it, uv it is"},
-    ]
-    ledger.record_span("s", span, "slug")
-    # Each message individually is captured...
-    assert ledger.is_captured("s", ledger.span_hash([span[0]])) is True
-    assert ledger.is_captured("s", ledger.span_hash([span[1]])) is True
-    # ...but the whole-span hash (the old, broken write granularity) is NOT.
-    assert ledger.is_captured("s", ledger.span_hash(span)) is False
-
-
 def test_ledger_isolated_per_session(tmp_path, monkeypatch):
     monkeypatch.setattr(ledger, "BRIDGE_DIR", tmp_path)
     ledger.record("sessA", "deadbeefdeadbeef", "slug-a")

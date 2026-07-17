@@ -33,9 +33,9 @@ def test_prepare_none_arm_no_install(tmp_path):
 def test_prepare_arm_applies_env_overlay(tmp_path):
     prepared = prepare_arm(
         Arm("none", install=None, wire_guard=False,
-            env={"COZEMPIC_CHECKPOINT_TOKENS": "0"}),
+            env={"COZEMPIC_SOME_TEST_VAR": "0"}),
         tmp_path)
-    assert prepared.env["COZEMPIC_CHECKPOINT_TOKENS"] == "0"
+    assert prepared.env["COZEMPIC_SOME_TEST_VAR"] == "0"
 
 
 def test_arms_get_isolated_config_dirs(tmp_path):

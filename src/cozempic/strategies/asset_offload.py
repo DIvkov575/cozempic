@@ -4,8 +4,10 @@ leave a retrievable pointer stub in-window. Sync, no LLM."""
 
 from __future__ import annotations
 
-from ..digest import _sanitize_for_injection
-from ..helpers import get_content_blocks, get_msg_type, is_protected, msg_bytes, set_content_blocks
+from ..helpers import (
+    _sanitize_for_injection, get_content_blocks, get_msg_type, is_protected,
+    msg_bytes, set_content_blocks,
+)
 from ..memory import blobref
 from ..registry import strategy
 from ..types import Message, PruneAction, StrategyResult

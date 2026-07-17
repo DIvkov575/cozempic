@@ -38,17 +38,17 @@ def test_grade_passes_after_fix(tmp_path):
 def test_run_ab_reports_resolve_rate_per_arm(tmp_path):
     from cozempic.bench.swebench import run_ab
 
-    # Fake agent that "fixes" the file only under the no-checkpoint arm (to prove
+    # Fake agent that "fixes" the file only under the no-guard arm (to prove
     # the harness distinguishes arms by their env overlay), writing a correct sol.py.
     def fake_agent(task_dir, arm_env):
         _make_task(task_dir)
-        if arm_env.get("COZEMPIC_CHECKPOINT_TOKENS") == "0":
+        if arm_env.get("COZEMPIC_NO_AUTO_INIT") == "1":
             (task_dir / "sol.py").write_text("def add(a,b):\n    return a+b\n")
 
     result = run_ab([tmp_path], agent=fake_agent, test_file="test_sol.py")
     assert result["baseline"]["resolved"] == 0
-    assert result["no-checkpoint"]["resolved"] == 1
-    assert result["baseline"]["total"] == result["no-checkpoint"]["total"] == 1
+    assert result["no-guard"]["resolved"] == 1
+    assert result["baseline"]["total"] == result["no-guard"]["total"] == 1
 
 
 def test_run_ab_custom_arms(tmp_path):
