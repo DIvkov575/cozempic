@@ -732,7 +732,7 @@ def start_guard(
     # Detect context window from session data (used for display + overflow scaling)
     from .tokens import (
         detect_context_window, default_token_thresholds_4tier,
-        DEFAULT_HARD2_TOKEN_PCT, DEFAULT_CHECKPOINT_TOKENS,
+        DEFAULT_HARD2_TOKEN_PCT,
     )
     messages_for_model = load_messages(session_path)
     context_window = detect_context_window(messages_for_model)
@@ -744,16 +744,6 @@ def start_guard(
         hard2_threshold_tokens = int(context_window * DEFAULT_HARD2_TOKEN_PCT)
         if soft_threshold_tokens is None:
             soft_threshold_tokens = int(threshold_tokens * 0.45)
-
-    # Fixed early-checkpoint tier (absolute tokens). Fires a gentle prune before
-    # the soft tier. Only meaningful when strictly below soft — on small windows
-    # 150K already exceeds hard1, so disable it there. Env override / 0 disables.
-    checkpoint_threshold_tokens = _checkpoint_threshold_tokens()
-    if checkpoint_threshold_tokens is None:
-        checkpoint_threshold_tokens = DEFAULT_CHECKPOINT_TOKENS
-    if not (checkpoint_threshold_tokens and soft_threshold_tokens
-            and checkpoint_threshold_tokens < soft_threshold_tokens):
-        checkpoint_threshold_tokens = None
 
     # Persist cwd + context_window to the sidecar so reload and guard resume
     # can resolve the project directory without relying on slug reversal. Also
@@ -787,13 +777,8 @@ def start_guard(
     hard1_pct = int(threshold_tokens / context_window * 100) if threshold_tokens and context_window else 55
     hard2_pct = int(hard2_threshold_tokens / context_window * 100) if hard2_threshold_tokens and context_window else 80
 
-    _checkpoint_line = (
-        f"    Check ({checkpoint_threshold_tokens:,} tok): gentle prune, no reload (early)\n"
-        if checkpoint_threshold_tokens else ""
-    )
     print(
-        f"\n  {'5' if checkpoint_threshold_tokens else '4'}-tier guard protecting context ({ctx_str} window):\n"
-        f"{_checkpoint_line}"
+        f"\n  4-tier guard protecting context ({ctx_str} window):\n"
         f"    Soft  ({soft_pct}%): read-only checkpoint, no live-file write (#106)\n"
         f"    Hard1 ({hard1_pct}%): {rx_name} prune + reload (terminate-first)\n"
         f"    Hard2 ({hard2_pct}%): aggressive prune + reload (emergency)\n"
@@ -1367,32 +1352,17 @@ def start_guard(
                         and current_tokens is not None
                         and current_tokens >= soft_threshold_tokens
                     )
-                    # Fixed early-CHECKPOINT tier (absolute tokens, below soft). Same
-                    # action as SOFT (gentle prune, no reload) — sheds cheap bloat early
-                    # on large windows. Disabled unless it sits below soft (see resolution).
-                    checkpoint_tokens_hit = (
-                        not soft_tokens_hit
-                        and checkpoint_threshold_tokens is not None
-                        and current_tokens is not None
-                        and current_tokens >= checkpoint_threshold_tokens
-                    )
-                    early_hit = soft_bytes_hit or soft_tokens_hit or checkpoint_tokens_hit
-                    if early_hit and idle:
+                    if (soft_bytes_hit or soft_tokens_hit) and idle:
                         # G (no-op accounting): the transcript hasn't grown since last
                         # cycle, so a gentle recompute would reproduce the identical
                         # read-only result. Skip it — the Phase-1 checkpoint above
                         # already refreshed team state — and do NOT count it as a SOFT
                         # "fire" (the 1056-no-op problem from issue #115).
                         noop_cycles += 1
-                    elif early_hit:
+                    elif soft_bytes_hit or soft_tokens_hit:
                         soft_prune_count += 1
-                        if soft_bytes_hit or soft_tokens_hit:
-                            label = "SOFT THRESHOLD (25%)"
-                            reason = f"{current_tokens:,} tokens >= {soft_threshold_tokens:,} (25%)" if soft_tokens_hit else f"{current_size / 1024 / 1024:.1f}MB"
-                        else:
-                            label = "CHECKPOINT"
-                            reason = f"{current_tokens:,} tokens >= {checkpoint_threshold_tokens:,} (early)"
-                        print(f"  [{_now()}] {label}: {reason}")
+                        reason = f"{current_tokens:,} tokens >= {soft_threshold_tokens:,} (25%)" if soft_tokens_hit else f"{current_size / 1024 / 1024:.1f}MB"
+                        print(f"  [{_now()}] SOFT THRESHOLD (25%): {reason}")
                         print(f"  Read-only checkpoint — live prune deferred to reload tier (#106) (cycle #{soft_prune_count})...")
 
                         result = guard_prune_cycle(
@@ -1584,20 +1554,6 @@ def _force_reload_pct() -> float:
         return v if 0.0 < v <= 1.0 else 0.0
     except (TypeError, ValueError):
         return 0.88
-
-
-def _checkpoint_threshold_tokens() -> int | None:
-    """Fixed early-checkpoint tier in absolute tokens (COZEMPIC_CHECKPOINT_TOKENS).
-    Returns None when unset (caller falls back to DEFAULT_CHECKPOINT_TOKENS) and 0
-    when explicitly disabled. Rejects non-positive/garbage → None (use default)."""
-    raw = os.environ.get("COZEMPIC_CHECKPOINT_TOKENS")
-    if raw is None:
-        return None
-    try:
-        v = int(raw)
-    except (TypeError, ValueError):
-        return None
-    return v if v >= 0 else None
 
 
 def _arm_nudge_from_result(session_id, session_path, tier, result):

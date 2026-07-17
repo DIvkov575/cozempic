@@ -3,14 +3,9 @@
 import json
 from pathlib import Path
 
-import pytest
-
 from cozempic.bench.compression import (
     benchmark_session, run_corpus, summarize, format_summary, as_json,
-    _checkpoint_ab,
 )
-from cozempic.session import load_messages
-from cozempic.tokens import calibrate_ratio
 
 FIXT = Path(__file__).resolve().parents[1] / "fixtures" / "sessions"
 
@@ -42,32 +37,6 @@ def test_reclaim_is_safe_on_fixtures():
         assert unsafe == 0, f"{rx} produced unsafe prunes on clean fixtures"
 
 
-def test_checkpoint_inactive_on_small_window():
-    """On a 200K window, the fixed 150K tier sits above soft → inactive."""
-    msgs = load_messages(_fixtures()[0])
-    active, delta = _checkpoint_ab(msgs, context_window=200_000,
-                                   pre_ratio=calibrate_ratio(msgs))
-    assert active is False
-    assert delta is None
-
-
-def test_checkpoint_active_but_unfired_on_small_session():
-    """1M window → tier active; but a tiny fixture never reaches 150K → no fire."""
-    msgs = load_messages(_fixtures()[0])
-    active, delta = _checkpoint_ab(msgs, context_window=1_000_000,
-                                   pre_ratio=calibrate_ratio(msgs))
-    assert active is True
-    assert delta is None  # fixtures are far below 150K tokens
-
-
-def test_checkpoint_disabled_by_zero():
-    msgs = load_messages(_fixtures()[0])
-    active, delta = _checkpoint_ab(msgs, context_window=1_000_000,
-                                   pre_ratio=None, checkpoint_tokens=0)
-    assert active is False
-    assert delta is None
-
-
 def test_summary_and_json_roundtrip():
     _results, summary = run_corpus(_fixtures())
     text = format_summary(summary)
@@ -76,7 +45,6 @@ def test_summary_and_json_roundtrip():
     payload = json.loads(as_json(summary))
     assert payload["sessions"] == summary.sessions
     assert set(payload["by_prescription"]) == {"gentle", "standard", "aggressive"}
-    assert "checkpoint" in payload
 
 
 def test_empty_and_missing_paths_are_skipped(tmp_path):

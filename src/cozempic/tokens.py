@@ -33,26 +33,10 @@ MAX_CONTEXT_WINDOW = 4_000_000
 MAX_SYSTEM_OVERHEAD_TOKENS = DEFAULT_CONTEXT_WINDOW
 
 # 4-tier pruning thresholds as fractions of context window
-# Low-jitter curve (tuned 2026-07-15 from the jitter sweep over real sessions):
-# the goal is stability — stay under a ~700K effective ceiling while reloading as
-# rarely as possible. Empirically, ONE deep reload beats several shallow ones:
-# reloading at 68% and pruning aggressively (~48% reclaim → ~350K) gave the fewest
-# reloads (1.6/session vs 3.0 for a shallow 550K target) with peak held under 700K.
-# hard1 and hard2 are colocated at 68% so the FIRST reload to fire is the deep
-# (aggressive) one — no shallow standard precursor 20K below that would re-trigger
-# almost immediately (the thrash the sweep showed at shallow depths). See
-# cozempic.bench.jitter + docs/BENCHMARKS.md.
 DEFAULT_SOFT_TOKEN_PCT = 0.25   # 25% — gentle file maintenance, no reload
-DEFAULT_HARD1_TOKEN_PCT = 0.68  # 68% (~680K) — colocated with hard2 so the deep reload leads
-DEFAULT_HARD2_TOKEN_PCT = 0.68  # 68% (~680K) — aggressive prune + reload → deep drop (~350K)
-DEFAULT_HARD_TOKEN_PCT = 0.68   # Alias for backward compat (guard uses this)
-
-# Fixed early-checkpoint tier (absolute tokens, not a % of the window). Fires a
-# gentle prune before the soft tier to shed cheap bloat early on large windows.
-# Only activates when it sits strictly below the soft tier (i.e. large windows);
-# on small windows (e.g. 200K) 150K is already past hard1, so it's disabled.
-# Override with COZEMPIC_CHECKPOINT_TOKENS; set to 0 to disable.
-DEFAULT_CHECKPOINT_TOKENS = 150_000
+DEFAULT_HARD1_TOKEN_PCT = 0.55  # 55% — standard prune + reload
+DEFAULT_HARD2_TOKEN_PCT = 0.80  # 80% — aggressive prune + reload (emergency)
+DEFAULT_HARD_TOKEN_PCT = 0.55   # Alias for backward compat (guard uses this)
 
 
 def get_system_overhead_tokens() -> int:

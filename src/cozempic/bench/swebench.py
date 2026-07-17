@@ -23,16 +23,14 @@ from pathlib import Path
 from typing import Callable
 
 # agent(task_dir: Path, arm_env: dict) -> None   (edits files in task_dir; arm_env
-# is the per-arm environment overlay, e.g. {"COZEMPIC_CHECKPOINT_TOKENS": "0"}).
+# is the per-arm environment overlay applied before running the agent).
 Agent = Callable[[Path, dict], None]
 
-# Default A/B arms for the changes on this branch. Each maps an arm name to the
-# environment overlay applied for that arm. "baseline" is full cozempic (all
-# defaults on); "no-checkpoint" disables the fixed 150K early tier via the real,
-# honored env var (see guard._checkpoint_threshold_tokens). Extend freely.
+# Default A/B arms: "baseline" is full cozempic (all defaults on); "no-guard"
+# disables the guard entirely (COZEMPIC_NO_AUTO_INIT=1). Extend freely.
 DEFAULT_ARMS: dict[str, dict] = {
     "baseline": {},
-    "no-checkpoint": {"COZEMPIC_CHECKPOINT_TOKENS": "0"},
+    "no-guard": {"COZEMPIC_NO_AUTO_INIT": "1"},
 }
 
 
@@ -63,7 +61,7 @@ def run_ab(task_dirs: list[Path], agent: Agent, test_file: str,
     """Run each task under each arm; report resolve-rate per arm.
 
     ``arms`` maps arm name → per-arm environment overlay passed to the agent
-    (defaults to ``DEFAULT_ARMS`` — baseline vs. no-checkpoint). Each (task, arm)
+    (defaults to ``DEFAULT_ARMS`` — baseline vs. no-guard). Each (task, arm)
     runs on the task dir as prepared by the agent. A crashing agent counts as
     unresolved and never aborts the sweep.
     """
@@ -92,8 +90,7 @@ _AGENT_PROMPT = ("Fix the code in this directory so the tests pass. Edit the "
 def claude_agent(task_dir: Path, arm_env: dict, timeout: float = 300.0) -> None:
     """Live agent: run `claude -p` inside the task dir to fix the code.
 
-    ``arm_env`` is the per-arm environment overlay (e.g. the real, honored
-    ``COZEMPIC_CHECKPOINT_TOKENS`` to A/B the fixed early tier). Non-deterministic —
+    ``arm_env`` is the per-arm environment overlay. Non-deterministic —
     exercised only by the opt-in live test / real sweeps.
     """
     import os

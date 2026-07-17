@@ -30,16 +30,11 @@ def test_worker_extracts_and_persists(tmp_path, monkeypatch):
     # New signature: persist takes a list of Insights and returns written slugs.
     monkeypatch.setattr(schedule, "persist_insights",
                         lambda sid, insights: captured.update(sid=sid, n=len(insights)) or ["s"])
-    recorded = {}
-    monkeypatch.setattr(schedule.ledger, "record_span",
-                        lambda sid, msgs, slug: recorded.update(sid=sid, msgs=msgs, slug=slug))
 
     span = [{"role": "user", "content": "always use uv"}]
     schedule.consolidate_worker("s1", span)
 
     assert captured == {"sid": "s1", "n": 1}
-    # Successful persist must record per-message span-capture for recoverability.
-    assert recorded == {"sid": "s1", "msgs": span, "slug": "s"}
 
 
 def test_spawn_closes_stdin_after_write(monkeypatch):

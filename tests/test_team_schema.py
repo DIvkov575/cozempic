@@ -311,7 +311,7 @@ class TestExtractTeamState(unittest.TestCase):
 class TestTeamCheckpointInjectionSanitized(unittest.TestCase):
     """Untrusted team-derived text (result_summary/lead_summary/subject/description)
     must be sanitized before it lands in the Claude-readable checkpoint/recovery
-    surfaces — sibling of the digest injection fix (mission-critical C5)."""
+    surfaces (mission-critical C5)."""
 
     def test_lead_summary_and_result_summary_cannot_inject_lines(self):
         from cozempic.team import TeamState, SubagentInfo

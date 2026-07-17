@@ -21,7 +21,8 @@ def test_nudge_consolidation_off_switch(monkeypatch):
 
 def test_treat_threads_session_id_into_prune_config(monkeypatch, tmp_path):
     """Part B: cmd_treat must pass a config containing the session_id into
-    run_prescription so the recoverability strategy is not inert."""
+    run_prescription so session-scoped strategies (e.g. thinking-distill's
+    ledger lookup) are not inert."""
     import argparse
 
     session_path = tmp_path / "abc123.jsonl"

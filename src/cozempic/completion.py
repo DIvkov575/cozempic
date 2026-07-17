@@ -10,7 +10,7 @@ def bash_completion() -> str:
 
     subcommands = (
         "list current diagnose treat strategy reload checkpoint "
-        "post-compact guard init doctor formulary completions digest self-update remind"
+        "post-compact guard init doctor formulary completions self-update remind"
     )
     prescriptions = " ".join(PRESCRIPTIONS.keys())
     strategies = " ".join(STRATEGIES.keys())
@@ -45,7 +45,7 @@ def zsh_completion() -> str:
 
     subcommands = (
         "list current diagnose treat strategy reload checkpoint "
-        "post-compact guard init doctor formulary completions digest self-update remind"
+        "post-compact guard init doctor formulary completions self-update remind"
     )
     prescriptions = " ".join(PRESCRIPTIONS.keys())
     strategies = " ".join(STRATEGIES.keys())

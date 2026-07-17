@@ -43,7 +43,9 @@ def _c(args: str) -> str:
 # POSIX-safe `SLUG=$(printf '%.12s' "$SESSION_ID")` so the SessionStart hook no
 # longer aborts with "Bad substitution" under dash (/bin/sh on Debian/Ubuntu),
 # which silently killed the guard-daemon spawn on those systems (#168).
-HOOK_SCHEMA_VERSION = "v14"
+# v15: drop the `digest inject`/`digest flush` calls from SessionStart, PreCompact,
+# PostCompact, and Stop — the behavioral-digest re-injection system was retired.
+HOOK_SCHEMA_VERSION = "v15"
 HOOK_SCHEMA_MARKER = f"cozempic-hook-schema={HOOK_SCHEMA_VERSION}"
 
 
